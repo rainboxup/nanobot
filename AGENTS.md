@@ -47,3 +47,14 @@
   5. `git push origin upstream-main saas-main`
 - Helper script: `scripts/sync_upstream.sh` (add `--push` to push automatically).
 - Keep the tree clean before sync to avoid accidental conflict with local uncommitted work.
+
+## Rollback Playbook
+- Baseline tag: `v1.0-sync-workflow` (known-good sync workflow checkpoint).
+- Safe rollback (non-destructive): `git switch -c rollback/v1.0-sync-workflow v1.0-sync-workflow`.
+- Restore `saas-main` to the tag (destructive):
+  1. `git switch saas-main`
+  2. `git branch backup/saas-main-$(date +%Y%m%d-%H%M%S)`
+  3. `git reset --hard v1.0-sync-workflow`
+  4. `git push --force-with-lease origin saas-main`
+- Verify after rollback: `pytest -q` and `git log --oneline -n 5`.
+- If remote was rolled back by mistake, recover from backup branch and push again.

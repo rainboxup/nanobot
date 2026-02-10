@@ -1,0 +1,50 @@
+name: nanobot
+
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rainboxup/nanobot:saas-main
+    container_name: nanobot-gateway
+    command: ["gateway"]
+    restart: unless-stopped
+    init: true
+
+    ports:
+      - "${NANOBOT_PORT:-18790}:18790"
+
+    environment:
+      TZ: "${TZ:-UTC}"
+      NANOBOT_PROFILE: "${NANOBOT_PROFILE:-small}"
+      NANOBOT_GATEWAY__HOST: "0.0.0.0"
+      NANOBOT_GATEWAY__PORT: "18790"
+      NANOBOT_TRAFFIC__INBOUND_QUEUE_SIZE: "${NANOBOT_TRAFFIC__INBOUND_QUEUE_SIZE:-50}"
+      NANOBOT_TRAFFIC__OUTBOUND_QUEUE_SIZE: "${NANOBOT_TRAFFIC__OUTBOUND_QUEUE_SIZE:-50}"
+      NANOBOT_TRAFFIC__TENANT_BURST_LIMIT: "${NANOBOT_TRAFFIC__TENANT_BURST_LIMIT:-5}"
+      NANOBOT_TRAFFIC__WORKER_CONCURRENCY: "${NANOBOT_TRAFFIC__WORKER_CONCURRENCY:-2}"
+      # Keep host mode as default for compatibility. Switch to docker when
+      # /var/run/docker.sock and docker CLI are mounted and validated.
+      NANOBOT_TOOLS__EXEC__MODE: "${NANOBOT_TOOLS__EXEC__MODE:-host}"
+
+    volumes:
+      - "${NANOBOT_DATA_DIR:-/opt/nanobot/data}:/root/.nanobot"
+      # Optional mounts for docker-mode exec sandbox:
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # - /usr/bin/docker:/usr/bin/docker:ro
+
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+
+    mem_limit: "${NANOBOT_MEM_LIMIT:-1024m}"
+    cpus: "${NANOBOT_CPUS:-1.0}"
+    pids_limit: 256
+
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

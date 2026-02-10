@@ -64,8 +64,10 @@ jobs:
 
             if [ -n "$DEPLOY_COMMAND" ]; then
               echo "[deploy] running DEPLOY_COMMAND"
-              eval "$DEPLOY_COMMAND"
-              exit 0
+              if eval "$DEPLOY_COMMAND"; then
+                exit 0
+              fi
+              echo "[deploy] DEPLOY_COMMAND failed, falling back to compose auto-detection"
             fi
 
             if [ -n "$DEPLOY_COMPOSE_FILE" ]; then

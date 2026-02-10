@@ -1,0 +1,83 @@
+# nanobot deployment template (documentation only)
+# Runtime config file is still ~/.nanobot/config.json.
+# Use NANOBOT_PROFILE in .env to select a preset, then override specific values.
+
+profile: small
+
+traffic:
+  # SMALL preset (1 vCPU / 2 GB)
+  # inbound_queue_size: 50
+  # outbound_queue_size: 50
+  # tenant_burst_limit: 5
+  # worker_concurrency: 2
+  # max_total_tenants: 500
+  # new_tenants_per_window: 10
+  # new_tenant_window_seconds: 60
+  # runtime_cache_ttl_seconds: 1200
+  # tenant_lock_ttl_seconds: 1800
+  # max_cached_tenant_runtimes: 64
+  # link_attempt_window_seconds: 60
+  # link_max_attempts_per_window: 5
+  # link_failures_before_cooldown: 5
+  # link_cooldown_seconds: 300
+  # link_state_ttl_seconds: 3600
+  # link_state_max_entries: 5000
+  # link_state_gc_every_calls: 64
+
+  # MEDIUM preset (2 vCPU / 4 GB+)
+  # inbound_queue_size: 200
+  # outbound_queue_size: 200
+  # tenant_burst_limit: 20
+  # worker_concurrency: 10
+  # max_total_tenants: 2000
+  # new_tenants_per_window: 40
+  # new_tenant_window_seconds: 60
+  # runtime_cache_ttl_seconds: 1800
+  # tenant_lock_ttl_seconds: 3600
+  # max_cached_tenant_runtimes: 256
+  # link_attempt_window_seconds: 60
+  # link_max_attempts_per_window: 5
+  # link_failures_before_cooldown: 5
+  # link_cooldown_seconds: 300
+  # link_state_ttl_seconds: 3600
+  # link_state_max_entries: 20000
+  # link_state_gc_every_calls: 64
+
+  inbound_queue_size: 50
+  outbound_queue_size: 50
+  tenant_burst_limit: 5
+  worker_concurrency: 2
+  max_total_tenants: 500
+  new_tenants_per_window: 10
+  new_tenant_window_seconds: 60
+  runtime_cache_ttl_seconds: 1200
+  tenant_lock_ttl_seconds: 1800
+  max_cached_tenant_runtimes: 64
+  link_attempt_window_seconds: 60
+  link_max_attempts_per_window: 5
+  link_failures_before_cooldown: 5
+  link_cooldown_seconds: 300
+  link_state_ttl_seconds: 3600
+  link_state_max_entries: 5000
+  link_state_gc_every_calls: 64
+
+tools:
+  exec:
+    docker_runtime: runsc
+    # Keep false for local dev if runsc is not installed.
+    # In public multi-tenant prod, set true to fail-closed.
+    require_runtime: true
+
+providers:
+  # Provider health-check hint:
+  # If apiBase points to local/private endpoints (localhost, 127.0.0.1, 10.x, 172.16-31.x, 192.168.x),
+  # do NOT keep provider as openai by default. Prefer vllm (or your openai-compatible provider alias).
+  # Otherwise request routing/protocol assumptions may mismatch.
+  #
+  # vllm:
+  #   apiKey: local-dev-key
+  #   apiBase: http://127.0.0.1:8000/v1
+  #
+  # openai:
+  #   apiKey: sk-...
+  #   apiBase: https://api.openai.com/v1

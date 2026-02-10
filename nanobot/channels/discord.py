@@ -14,9 +14,18 @@ from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import DiscordConfig
 
-
 DISCORD_API_BASE = "https://discord.com/api/v10"
 MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
+DISCORD_MAX_UPLOAD_BYTES = 8 * 1024 * 1024  # 8MB (default Discord upload limit)
+
+
+class AttachmentUploadError(Exception):
+    """Raised when Discord rejects multipart attachments with a user-visible error."""
+
+    def __init__(self, status_code: int, message: str = "") -> None:
+        self.status_code = int(status_code)
+        self.message = message
+        super().__init__(f"status={status_code} {message}".strip())
 
 
 class DiscordChannel(BaseChannel):
@@ -79,33 +88,163 @@ class DiscordChannel(BaseChannel):
             return
 
         url = f"{DISCORD_API_BASE}/channels/{msg.chat_id}/messages"
-        payload: dict[str, Any] = {"content": msg.content}
+        payload: dict[str, Any] = {"content": msg.content or ""}
 
         if msg.reply_to:
             payload["message_reference"] = {"message_id": msg.reply_to}
             payload["allowed_mentions"] = {"replied_user": False}
 
         headers = {"Authorization": f"Bot {self.config.token}"}
+        fallback_notice = "[System: Attachment upload failed/too large]"
 
         try:
-            for attempt in range(3):
+            attachments = list(getattr(msg, "attachments", []) or [])
+            paths: list[Path] = []
+            warnings: list[str] = []
+
+            for p in attachments:
                 try:
-                    response = await self._http.post(url, headers=headers, json=payload)
-                    if response.status_code == 429:
-                        data = response.json()
-                        retry_after = float(data.get("retry_after", 1.0))
-                        logger.warning(f"Discord rate limited, retrying in {retry_after}s")
-                        await asyncio.sleep(retry_after)
+                    path = Path(p)
+                    if not path.exists() or not path.is_file():
+                        warnings.append(f"附件不存在，无法发送：{path.name}")
                         continue
-                    response.raise_for_status()
-                    return
-                except Exception as e:
-                    if attempt == 2:
-                        logger.error(f"Error sending Discord message: {e}")
+
+                    try:
+                        size = int(path.stat().st_size)
+                    except Exception:
+                        size = 0
+
+                    if size and size > DISCORD_MAX_UPLOAD_BYTES:
+                        mb = size / (1024 * 1024)
+                        warnings.append(f"文件过大 ({mb:.1f} MB)，无法发送：{path.name}")
+                        continue
+
+                    paths.append(path)
+                except Exception:
+                    continue
+
+            if warnings:
+                warn_text = "\n".join(warnings)
+                if payload["content"]:
+                    payload["content"] = payload["content"].rstrip() + "\n\n" + warn_text
+                else:
+                    payload["content"] = warn_text
+
+            if not paths:
+                await self._post_with_retries(url, headers, json_payload=payload)
+                return
+
+            max_files = 10
+            first = True
+            for i in range(0, len(paths), max_files):
+                batch = paths[i : i + max_files]
+                batch_payload = dict(payload)
+                if not first:
+                    batch_payload["content"] = ""
+                try:
+                    await self._post_multipart_with_retries(
+                        url, headers, payload=batch_payload, files=batch
+                    )
+                except AttachmentUploadError as e:
+                    logger.warning(
+                        f"Discord attachment upload failed with status {e.status_code}; fallback to text-only"
+                    )
+                    fallback_payload = {"content": batch_payload.get("content", "") or ""}
+                    if fallback_payload["content"]:
+                        fallback_payload["content"] = (
+                            fallback_payload["content"].rstrip() + "\n\n" + fallback_notice
+                        )
                     else:
-                        await asyncio.sleep(1)
+                        fallback_payload["content"] = fallback_notice
+                    await self._post_with_retries(url, headers, json_payload=fallback_payload)
+                    return
+                first = False
+            return
         finally:
             await self._stop_typing(msg.chat_id)
+
+    async def _post_with_retries(
+        self,
+        url: str,
+        headers: dict[str, str],
+        *,
+        json_payload: dict[str, Any],
+    ) -> None:
+        """POST JSON payload with simple retry + 429 handling."""
+        assert self._http is not None
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await self._http.post(url, headers=headers, json=json_payload)
+                if response.status_code == 429:
+                    data = response.json()
+                    retry_after = float(data.get("retry_after", 1.0))
+                    logger.warning(f"Discord rate limited, retrying in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                return
+            except Exception as e:
+                last_error = e
+                if attempt == 2:
+                    logger.error(f"Error sending Discord message: {e}")
+                else:
+                    await asyncio.sleep(1)
+        raise RuntimeError("Discord message send failed after retries") from last_error
+
+    async def _post_multipart_with_retries(
+        self,
+        url: str,
+        headers: dict[str, str],
+        *,
+        payload: dict[str, Any],
+        files: list[Path],
+    ) -> None:
+        """POST multipart payload with file uploads, with retry + 429 handling."""
+        assert self._http is not None
+        last_error: Exception | None = None
+        for attempt in range(3):
+            opened: list[Any] = []
+            try:
+                multipart: list[tuple[str, tuple[str, Any, str]]] = []
+                for idx, path in enumerate(files):
+                    f = open(path, "rb")
+                    opened.append(f)
+                    multipart.append((f"files[{idx}]", (path.name, f, "application/octet-stream")))
+
+                # Discord expects attachments metadata when using multipart.
+                payload2 = dict(payload)
+                payload2["attachments"] = [
+                    {"id": i, "filename": p.name} for i, p in enumerate(files)
+                ]
+                data = {"payload_json": json.dumps(payload2, ensure_ascii=False)}
+
+                response = await self._http.post(url, headers=headers, data=data, files=multipart)
+                if response.status_code in {400, 413}:
+                    raise AttachmentUploadError(response.status_code, response.text[:200])
+                if response.status_code == 429:
+                    data_json = response.json()
+                    retry_after = float(data_json.get("retry_after", 1.0))
+                    logger.warning(f"Discord rate limited (multipart), retrying in {retry_after}s")
+                    await asyncio.sleep(retry_after)
+                    continue
+                response.raise_for_status()
+                return
+            except AttachmentUploadError:
+                raise
+            except Exception as e:
+                last_error = e
+                if attempt == 2:
+                    logger.error(f"Error sending Discord attachments: {e}")
+                else:
+                    await asyncio.sleep(1)
+            finally:
+                for f in opened:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
+        raise RuntimeError("Discord attachment upload failed after retries") from last_error
 
     async def _gateway_loop(self) -> None:
         """Main gateway loop: identify, heartbeat, dispatch events."""
@@ -212,7 +351,9 @@ class DiscordChannel(BaseChannel):
                 continue
             try:
                 media_dir.mkdir(parents=True, exist_ok=True)
-                file_path = media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                file_path = (
+                    media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
+                )
                 resp = await self._http.get(url)
                 resp.raise_for_status()
                 file_path.write_bytes(resp.content)

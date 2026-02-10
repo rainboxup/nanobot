@@ -17,5 +17,14 @@ docs/
 __pycache__/
 poetry.lock
 .pytest_cache/
-tests/
 botpy.log
+node_modules/
+bridge/node_modules/
+
+# Claude Code 配置目录
+.claude/
+
+# 工作目录
+_bmad/
+_bmad-output/
+.spec-workflow/

@@ -1,0 +1,20 @@
+name: Line Endings
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-lf-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Validate shell line endings
+        run: python scripts/check_line_endings.py

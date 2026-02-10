@@ -1,10 +1,41 @@
 """Configuration loading utilities."""
 
+from __future__ import annotations
+
 import json
+import os
 from pathlib import Path
 from typing import Any
 
-from nanobot.config.schema import Config
+from nanobot.config.profiles import apply_profile_defaults
+from nanobot.config.schema import (
+    AgentsConfig,
+    ChannelsConfig,
+    Config,
+    GatewayConfig,
+    ProvidersConfig,
+    ToolsConfig,
+    TrafficConfig,
+)
+
+
+def _build_config_without_env(data: dict[str, Any]) -> Config:
+    """Build Config from dict/defaults without reading process env vars."""
+
+    def _section(name: str, model_cls):
+        raw = data.get(name, {})
+        if not isinstance(raw, dict):
+            raw = {}
+        return model_cls.model_validate(raw)
+
+    return Config.model_construct(
+        agents=_section("agents", AgentsConfig),
+        channels=_section("channels", ChannelsConfig),
+        providers=_section("providers", ProvidersConfig),
+        gateway=_section("gateway", GatewayConfig),
+        tools=_section("tools", ToolsConfig),
+        traffic=_section("traffic", TrafficConfig),
+    )
 
 
 def get_config_path() -> Path:
@@ -15,56 +46,79 @@ def get_config_path() -> Path:
 def get_data_dir() -> Path:
     """Get the nanobot data directory."""
     from nanobot.utils.helpers import get_data_path
+
     return get_data_path()
 
 
-def load_config(config_path: Path | None = None) -> Config:
-    """
-    Load configuration from file or create default.
-    
-    Args:
-        config_path: Optional path to config file. Uses default if not provided.
-    
-    Returns:
-        Loaded configuration object.
-    """
+def load_config(
+    config_path: Path | None = None,
+    *,
+    allow_env_override: bool = True,
+    strict: bool = False,
+) -> Config:
+    """Load configuration from file + profile defaults + optional env overrides."""
     path = config_path or get_config_path()
-    
+    profile_name = os.getenv("NANOBOT_PROFILE") if allow_env_override else None
+
+    data: dict[str, Any] = {}
     if path.exists():
         try:
-            with open(path) as f:
-                data = json.load(f)
+            with open(path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                data = loaded
+            else:
+                raise ValueError("config root must be an object")
             data = _migrate_config(data)
-            return Config.model_validate(convert_keys(data))
         except (json.JSONDecodeError, ValueError) as e:
+            if strict:
+                raise ValueError(f"Failed to load config from {path}: {e}") from e
             print(f"Warning: Failed to load config from {path}: {e}")
-            print("Using default configuration.")
-    
-    return Config()
+            print(
+                "Using profile/default configuration."
+                if not allow_env_override
+                else "Using profile/default configuration with env overrides."
+            )
+
+    merged = apply_profile_defaults(convert_keys(data), profile_name)
+
+    if allow_env_override:
+        # Use BaseSettings init so NANOBOT_* env vars can override file/profile values.
+        return Config(**merged)
+
+    # Strict isolation mode: use only file + code defaults, never process env.
+    return _build_config_without_env(merged)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
     """
     Save configuration to file.
-    
+
     Args:
         config: Configuration to save.
         config_path: Optional path to save to. Uses default if not provided.
     """
     path = config_path or get_config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    
+
     # Convert to camelCase format
     data = config.model_dump()
     data = convert_to_camel(data)
-    
-    with open(path, "w") as f:
+
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+
+    # Best-effort hardening: config contains API keys; keep it user-readable only.
+    try:
+        os.chmod(path.parent, 0o700)
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
 
 
 def _migrate_config(data: dict) -> dict:
     """Migrate old config formats to current."""
-    # Move tools.exec.restrictToWorkspace → tools.restrictToWorkspace
+    # Move tools.exec.restrictToWorkspace -> tools.restrictToWorkspace
     tools = data.get("tools", {})
     exec_cfg = tools.get("exec", {})
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:

@@ -41,6 +41,13 @@ exec(command: str, working_dir: str = None) -> str
 - Dangerous commands are blocked (rm -rf, format, dd, shutdown, etc.)
 - Output is truncated at 10,000 characters
 - Optional `restrictToWorkspace` config to limit paths
+- In multi-tenant mode, exec is typically run inside a hardened Docker sandbox (no network, read-only workspace)
+- To export artifacts (charts/CSV/etc.) from sandboxed exec, write files to `/out/` inside the container:
+  - `/out` is a tmpfs with a hard size limit (32MiB)
+  - On success (exit code 0), the gateway copies only safe formats: `.png .jpg .csv .txt .md .json .pdf`
+  - Files are saved to `<workspace>/exports/<task_id>/` and uploaded back to chat as attachments (direct upload)
+  - Symlinks and non-allowlisted extensions are skipped
+  - Exports are cleaned up automatically after 24 hours to avoid filling the VPS disk
 
 ## Web Access
 
@@ -62,6 +69,8 @@ web_fetch(url: str, extractMode: str = "markdown", maxChars: int = 50000) -> str
 - Content is extracted using readability
 - Supports markdown or plain text extraction
 - Output is truncated at 50,000 characters by default
+- By default, localhost/private network targets are blocked (SSRF mitigation)
+- Download size is capped (default 2,000,000 bytes) to reduce DoS risk
 
 ## Communication
 

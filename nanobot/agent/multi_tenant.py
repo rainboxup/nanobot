@@ -1,0 +1,390 @@
+"""Multi-tenant gateway agent loop.
+
+This loop consumes inbound channel messages and routes them to a per-tenant AgentLoop,
+ensuring each user has isolated:
+  - workspace (memory + custom skills)
+  - sessions (chat history)
+  - config (API keys / model preferences)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from loguru import logger
+
+from nanobot.agent.loop import AgentLoop
+from nanobot.bus.broker import get_tenant_id_from_metadata
+from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import Config
+from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.session.manager import SessionManager
+from nanobot.tenants.commands import configure_link_throttle, try_handle
+from nanobot.tenants.store import TenantStore
+from nanobot.tenants.types import TenantContext
+from nanobot.utils.helpers import get_data_path
+from nanobot.utils.whitelist import parse_str_list, to_set
+
+
+@dataclass
+class _TenantRuntime:
+    tenant_id: str
+    config_mtime_ns: int
+    enable_exec: bool
+    agent: AgentLoop
+    last_used_monotonic: float
+
+
+def _canonical_sender_id(msg: InboundMessage) -> str:
+    # Prefer stable numeric IDs when channels provide it.
+    if "user_id" in msg.metadata:
+        try:
+            return str(int(msg.metadata["user_id"]))
+        except Exception:
+            return str(msg.metadata["user_id"])
+    # Telegram sender_id may be "id|username" for allowlist compat.
+    sender = str(msg.sender_id or "")
+    return sender.split("|", 1)[0] if sender else ""
+
+
+def _tenant_session_id(msg: InboundMessage, canonical_sender: str) -> str:
+    # Default: per-identity session within a tenant (long-term memory is shared).
+    return f"{msg.channel}:{canonical_sender}"
+
+
+class MultiTenantAgentLoop:
+    """Consumes bus inbound messages and routes them to tenant-specific AgentLoops."""
+
+    def __init__(
+        self,
+        bus: MessageBus,
+        system_config: Config,
+        store: TenantStore | None = None,
+        skill_store_dir: Path | None = None,
+        max_inflight: int = 4,
+        store_lock: asyncio.Lock | None = None,
+        ingress: Any | None = None,
+        runtime_cache_ttl_seconds: int = 1800,
+        tenant_lock_ttl_seconds: int = 3600,
+        max_cached_runtimes: int = 256,
+    ):
+        self.bus = bus
+        self.system_config = system_config
+        self.store = store or TenantStore()
+        self.skill_store_dir = skill_store_dir or (get_data_path() / "store" / "skills")
+        self.max_inflight = max(1, int(max_inflight))
+        self.ingress = ingress
+
+        # Exec is intentionally opt-in (paid/whitelist) in multi-tenant mode.
+        env_wl = to_set(parse_str_list(os.getenv("EXEC_WHITELIST")))
+        cfg_wl = to_set(getattr(system_config.tools.exec, "whitelist", None))
+        self._exec_whitelist = env_wl | cfg_wl
+
+        configure_link_throttle(
+            attempt_window_seconds=system_config.traffic.link_attempt_window_seconds,
+            max_attempts_per_window=system_config.traffic.link_max_attempts_per_window,
+            failures_before_cooldown=system_config.traffic.link_failures_before_cooldown,
+            cooldown_seconds=system_config.traffic.link_cooldown_seconds,
+            state_ttl_seconds=system_config.traffic.link_state_ttl_seconds,
+            state_max_entries=system_config.traffic.link_state_max_entries,
+            state_gc_every_calls=system_config.traffic.link_state_gc_every_calls,
+        )
+
+        self.runtime_cache_ttl_seconds = max(60, int(runtime_cache_ttl_seconds))
+        self.tenant_lock_ttl_seconds = max(60, int(tenant_lock_ttl_seconds))
+        self.max_cached_runtimes = max(1, int(max_cached_runtimes))
+
+        self._running = False
+        # Global concurrency limiter (do not create unbounded tasks).
+        self._sem = asyncio.Semaphore(self.max_inflight)
+        # Shared lock to protect the file-based tenant store from concurrent writes.
+        self._store_lock = store_lock or asyncio.Lock()
+        self._tenant_locks: dict[str, asyncio.Lock] = {}
+        self._tenant_last_seen: dict[str, float] = {}
+        self._runtimes: dict[str, _TenantRuntime] = {}
+        self._handled_messages = 0
+        self._cache_sweep_every = 32
+
+    async def run(self) -> None:
+        self._running = True
+        logger.info("Multi-tenant agent loop started")
+
+        while self._running:
+            try:
+                msg = await asyncio.wait_for(self.bus.consume_inbound(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+
+            # Process messages concurrently (bounded). Acquire BEFORE scheduling so tasks can't pile up.
+            await self._sem.acquire()
+            asyncio.create_task(self._handle_one(msg))
+
+    def stop(self) -> None:
+        self._running = False
+        logger.info("Multi-tenant agent loop stopping")
+
+    async def _handle_one(self, msg: InboundMessage) -> None:
+        tenant_id = get_tenant_id_from_metadata(msg.metadata)
+        try:
+            response = await self._process_inbound(msg)
+            if response:
+                await self.bus.publish_outbound(response)
+        except Exception as e:
+            logger.error(f"Multi-tenant processing error: {e}")
+            await self.bus.publish_outbound(
+                OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="Sorry, I encountered an error while handling your request.",
+                )
+            )
+        finally:
+            # Release per-tenant pending slot first; this prevents sticky busy states
+            # even when message handling fails unexpectedly.
+            if self.ingress:
+                resolved_tenant_id = tenant_id or get_tenant_id_from_metadata(msg.metadata)
+                if resolved_tenant_id:
+                    try:
+                        await self.ingress.task_done(resolved_tenant_id)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to release tenant pending slot "
+                            f"tenant_id={resolved_tenant_id}: {e}"
+                        )
+
+            # Release global inflight slot independently from ingress bookkeeping.
+            try:
+                self._sem.release()
+            except Exception as e:
+                logger.warning(f"Failed to release inflight semaphore: {e}")
+
+            self._handled_messages += 1
+            if self._handled_messages % self._cache_sweep_every == 0:
+                self._prune_idle_caches()
+
+    async def _process_inbound(self, msg: InboundMessage) -> OutboundMessage | None:
+        # Spawn is disabled in multi-tenant runtimes, so system messages should not occur.
+        if msg.channel == "system":
+            logger.warning("Ignoring system message in multi-tenant mode")
+            return None
+
+        canonical_sender = ""
+        if isinstance(msg.metadata, dict) and msg.metadata.get("canonical_sender_id"):
+            canonical_sender = str(msg.metadata.get("canonical_sender_id") or "")
+        if not canonical_sender:
+            canonical_sender = _canonical_sender_id(msg)
+        if not canonical_sender:
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content="Sorry, I couldn't identify you (missing sender_id).",
+            )
+
+        tenant_id = get_tenant_id_from_metadata(msg.metadata)
+        async with self._store_lock:
+            if not tenant_id:
+                tenant_id = self.store.resolve_tenant(
+                    msg.channel, canonical_sender
+                ) or self.store.ensure_tenant(msg.channel, canonical_sender)
+            tenant = self.store.ensure_tenant_files(tenant_id)
+
+        self._touch_tenant(tenant_id)
+        lock = self._tenant_locks.setdefault(tenant_id, asyncio.Lock())
+        async with lock:
+            return await self._process_for_tenant(msg, canonical_sender, tenant_id, tenant)
+
+    async def _process_for_tenant(
+        self, msg: InboundMessage, canonical_sender: str, tenant_id: str, tenant: TenantContext
+    ) -> OutboundMessage | None:
+        # Route session per identity within tenant
+        msg.session_id = _tenant_session_id(msg, canonical_sender)
+
+        # Command handling (deterministic; no LLM)
+        session_manager = self._get_session_manager(tenant)
+
+        def clear_session() -> None:
+            session = session_manager.get_or_create(msg.session_key)
+            session.clear()
+            session_manager.save(session)
+
+        cmd = await asyncio.to_thread(
+            try_handle,
+            msg_text=msg.content,
+            channel=msg.channel,
+            sender_id=canonical_sender,
+            metadata=msg.metadata,
+            tenant=tenant,
+            store=self.store,
+            skill_store_dir=self.skill_store_dir,
+            workspace_quota_mib=self.system_config.tools.filesystem.workspace_quota_mib,
+            session_clear=clear_session,
+        )
+        if cmd.handled:
+            return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=cmd.reply)
+
+        # Require tenant API key before invoking the LLM
+        tenant_cfg = self.store.load_tenant_config(tenant_id)
+        p = tenant_cfg.get_provider()
+        api_key = p.api_key if p else None
+        if not api_key and not tenant_cfg.agents.defaults.model.startswith("bedrock/"):
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=(
+                    "👋 你好！这是你的独立 nanobot 助理。\n\n"
+                    "请先设置你的 API Key（建议私聊/DM）：\n"
+                    "!apikey set openrouter sk-or-v1-xxx\n\n"
+                    "需要帮助：!help"
+                ),
+            )
+
+        enable_exec = False
+        if self._exec_whitelist:
+            async with self._store_lock:
+                identities = self.store.list_identities(tenant_id)
+            enable_exec = self._is_exec_allowed(tenant_id, identities)
+
+        runtime = self._get_or_create_runtime(tenant, tenant_cfg, enable_exec=enable_exec)
+        return await runtime.agent._process_message(msg)  # reuse AgentLoop implementation
+
+    def _touch_tenant(self, tenant_id: str) -> None:
+        now = time.monotonic()
+        self._tenant_last_seen[tenant_id] = now
+        rt = self._runtimes.get(tenant_id)
+        if rt:
+            rt.last_used_monotonic = now
+
+    def _prune_idle_caches(self) -> None:
+        now = time.monotonic()
+
+        # 1) Prune idle runtimes by TTL (skip active tenants currently locked).
+        for tenant_id, rt in list(self._runtimes.items()):
+            lock = self._tenant_locks.get(tenant_id)
+            if lock and lock.locked():
+                continue
+            if (now - rt.last_used_monotonic) >= self.runtime_cache_ttl_seconds:
+                self._runtimes.pop(tenant_id, None)
+
+        # 2) Hard-cap runtime cache size with LRU eviction.
+        if len(self._runtimes) > self.max_cached_runtimes:
+            candidates: list[tuple[str, float]] = []
+            for tenant_id, rt in self._runtimes.items():
+                lock = self._tenant_locks.get(tenant_id)
+                if lock and lock.locked():
+                    continue
+                candidates.append((tenant_id, rt.last_used_monotonic))
+
+            candidates.sort(key=lambda x: x[1])
+            to_evict = max(0, len(self._runtimes) - self.max_cached_runtimes)
+            for tenant_id, _ in candidates[:to_evict]:
+                self._runtimes.pop(tenant_id, None)
+
+        # 3) Prune idle per-tenant locks.
+        for tenant_id, lock in list(self._tenant_locks.items()):
+            if lock.locked():
+                continue
+            last_seen = self._tenant_last_seen.get(tenant_id, 0.0)
+            if (now - last_seen) < self.tenant_lock_ttl_seconds:
+                continue
+            self._tenant_locks.pop(tenant_id, None)
+            if tenant_id not in self._runtimes:
+                self._tenant_last_seen.pop(tenant_id, None)
+
+    def _get_session_manager(self, tenant: TenantContext) -> SessionManager:
+        # Keep one session manager per tenant runtime to reuse in-memory cache.
+        rt = self._runtimes.get(tenant.tenant_id)
+        if rt:
+            return rt.agent.sessions
+        return SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+
+    def _is_exec_allowed(self, tenant_id: str, identities: list[str]) -> bool:
+        wl = self._exec_whitelist
+        if not wl:
+            return False
+        if tenant_id in wl:
+            return True
+        for ident in identities or []:
+            s = str(ident)
+            if s in wl:
+                return True
+            # Allow bare sender_id entries as a convenience for MVP.
+            if ":" in s:
+                _, sender = s.split(":", 1)
+                if sender in wl:
+                    return True
+        return False
+
+    def _get_or_create_runtime(
+        self, tenant: TenantContext, tenant_cfg: Config, *, enable_exec: bool
+    ) -> _TenantRuntime:
+        config_mtime_ns = 0
+        try:
+            config_mtime_ns = tenant.config_path.stat().st_mtime_ns
+        except Exception:
+            config_mtime_ns = 0
+
+        existing = self._runtimes.get(tenant.tenant_id)
+        if (
+            existing
+            and existing.config_mtime_ns == config_mtime_ns
+            and existing.enable_exec == enable_exec
+        ):
+            existing.last_used_monotonic = time.monotonic()
+            self._tenant_last_seen[tenant.tenant_id] = existing.last_used_monotonic
+            return existing
+
+        # Per-tenant session store
+        sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+
+        # Create provider from tenant config (operator/system config is only for channels + web search)
+        provider_name = tenant_cfg.get_provider_name(tenant_cfg.agents.defaults.model)
+        provider_cfg = tenant_cfg.get_provider(tenant_cfg.agents.defaults.model)
+        extra_headers = provider_cfg.extra_headers if provider_cfg else None
+        provider = LiteLLMProvider(
+            api_key=(provider_cfg.api_key if provider_cfg else None),
+            api_base=tenant_cfg.get_api_base(tenant_cfg.agents.defaults.model),
+            default_model=tenant_cfg.agents.defaults.model,
+            extra_headers=extra_headers,
+            provider_name=provider_name,
+        )
+
+        # Multi-tenant exec runs in a sandbox container by default.
+        exec_cfg = self.system_config.tools.exec.model_copy()
+        exec_cfg.mode = "docker"
+        exec_cfg.timeout = 30
+        exec_cfg.require_runtime = True
+
+        agent = AgentLoop(
+            bus=self.bus,
+            provider=provider,
+            workspace=tenant.workspace,
+            model=tenant_cfg.agents.defaults.model,
+            max_iterations=tenant_cfg.agents.defaults.max_tool_iterations,
+            brave_api_key=self.system_config.tools.web.search.api_key or None,
+            web_config=self.system_config.tools.web,
+            exec_config=exec_cfg,
+            filesystem_config=self.system_config.tools.filesystem,
+            cron_service=None,
+            restrict_to_workspace=True,
+            session_manager=sessions,
+            enable_spawn=False,
+            enable_exec=enable_exec,
+        )
+
+        now = time.monotonic()
+        rt = _TenantRuntime(
+            tenant_id=tenant.tenant_id,
+            config_mtime_ns=config_mtime_ns,
+            enable_exec=enable_exec,
+            agent=agent,
+            last_used_monotonic=now,
+        )
+        self._runtimes[tenant.tenant_id] = rt
+        self._tenant_last_seen[tenant.tenant_id] = now
+        return rt

@@ -58,3 +58,19 @@
   4. `git push --force-with-lease origin saas-main`
 - Verify after rollback: `pytest -q` and `git log --oneline -n 5`.
 - If remote was rolled back by mistake, recover from backup branch and push again.
+
+## Auto Deploy (1Panel)
+- Workflow file: `.github/workflows/deploy-1panel.yml`.
+- Trigger: push to `saas-main` or manual `workflow_dispatch`.
+- Required GitHub Secrets:
+  - `DEPLOY_HOST`: server IP/domain
+  - `DEPLOY_USER`: SSH user
+  - `DEPLOY_SSH_KEY`: private key (PEM)
+  - `DEPLOY_PATH`: repo path on server (example: `/opt/nanobot`)
+- Optional Secrets:
+  - `DEPLOY_BRANCH`: defaults to `saas-main`
+  - `DEPLOY_COMMAND`: custom restart command for 1Panel/docker (example: `docker compose up -d --build`)
+- Recommended server prep:
+  1. Clone your fork on server once.
+  2. Ensure SSH user can run Docker/1Panel commands.
+  3. Keep server working tree clean for `git pull --ff-only`.

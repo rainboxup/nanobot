@@ -4,43 +4,46 @@ from pathlib import Path
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
+from nanobot.utils.fs import dir_size_bytes
 
 
 def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
     """Resolve path and optionally enforce directory restriction."""
     resolved = Path(path).expanduser().resolve()
-    if allowed_dir and not str(resolved).startswith(str(allowed_dir.resolve())):
-        raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+    if allowed_dir:
+        allowed = allowed_dir.expanduser().resolve()
+        try:
+            ok = resolved == allowed or resolved.is_relative_to(allowed)
+        except Exception:
+            ok = False
+        if not ok:
+            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
     return resolved
 
 
 class ReadFileTool(Tool):
     """Tool to read file contents."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
+
+    def __init__(self, allowed_dir: Path | None = None, max_read_bytes: int = 200_000):
         self._allowed_dir = allowed_dir
+        self._max_read_bytes = max(1, int(max_read_bytes))
 
     @property
     def name(self) -> str:
         return "read_file"
-    
+
     @property
     def description(self) -> str:
         return "Read the contents of a file at the given path."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to read"
-                }
-            },
-            "required": ["path"]
+            "properties": {"path": {"type": "string", "description": "The file path to read"}},
+            "required": ["path"],
         }
-    
+
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
@@ -48,8 +51,20 @@ class ReadFileTool(Tool):
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
                 return f"Error: Not a file: {path}"
-            
-            content = file_path.read_text(encoding="utf-8")
+
+            # Read at most N bytes to avoid huge payloads in LLM context.
+            max_bytes = self._max_read_bytes
+            raw = b""
+            truncated = False
+            with open(file_path, "rb") as f:
+                raw = f.read(max_bytes + 1)
+            if len(raw) > max_bytes:
+                raw = raw[:max_bytes]
+                truncated = True
+
+            content = raw.decode("utf-8", errors="replace")
+            if truncated:
+                content += f"\n\n... (truncated; max_read_bytes={max_bytes})"
             return content
         except PermissionError as e:
             return f"Error: {e}"
@@ -59,41 +74,66 @@ class ReadFileTool(Tool):
 
 class WriteFileTool(Tool):
     """Tool to write content to a file."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
+
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        max_write_bytes: int = 200_000,
+        workspace_quota_mib: int = 50,
+    ):
         self._allowed_dir = allowed_dir
+        self._max_write_bytes = max(1, int(max_write_bytes))
+        self._workspace_quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
 
     @property
     def name(self) -> str:
         return "write_file"
-    
+
     @property
     def description(self) -> str:
         return "Write content to a file at the given path. Creates parent directories if needed."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to write to"
-                },
-                "content": {
-                    "type": "string",
-                    "description": "The content to write"
-                }
+                "path": {"type": "string", "description": "The file path to write to"},
+                "content": {"type": "string", "description": "The content to write"},
             },
-            "required": ["path", "content"]
+            "required": ["path", "content"],
         }
-    
+
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
+            data = (content or "").encode("utf-8")
+            if len(data) > self._max_write_bytes:
+                return (
+                    "Error: Content too large for write_file "
+                    f"(bytes={len(data)}, max_write_bytes={self._max_write_bytes})"
+                )
+
+            # Enforce per-workspace quota (best effort).
+            if self._allowed_dir and self._workspace_quota_bytes > 0:
+                root = self._allowed_dir.expanduser().resolve()
+                current = dir_size_bytes(root)
+                old = 0
+                if file_path.exists() and file_path.is_file():
+                    try:
+                        old = int(file_path.stat().st_size)
+                    except Exception:
+                        old = 0
+                predicted = current - old + len(data)
+                if predicted > self._workspace_quota_bytes:
+                    return (
+                        "Error: Workspace quota exceeded "
+                        f"(current={current} bytes, predicted={predicted} bytes, "
+                        f"quota={self._workspace_quota_bytes} bytes)"
+                    )
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            file_path.write_text(content, encoding="utf-8")
-            return f"Successfully wrote {len(content)} bytes to {path}"
+            file_path.write_bytes(data)
+            return f"Successfully wrote {len(data)} bytes to {path}"
         except PermissionError as e:
             return f"Error: {e}"
         except Exception as e:
@@ -102,58 +142,88 @@ class WriteFileTool(Tool):
 
 class EditFileTool(Tool):
     """Tool to edit a file by replacing text."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
+
+    def __init__(
+        self,
+        allowed_dir: Path | None = None,
+        max_edit_bytes: int = 500_000,
+        max_write_bytes: int = 200_000,
+        workspace_quota_mib: int = 50,
+    ):
         self._allowed_dir = allowed_dir
+        self._max_edit_bytes = max(1, int(max_edit_bytes))
+        self._max_write_bytes = max(1, int(max_write_bytes))
+        # Allow edits up to the edit limit by default, even if write_file is stricter.
+        self._max_result_bytes = max(self._max_edit_bytes, self._max_write_bytes)
+        self._workspace_quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
 
     @property
     def name(self) -> str:
         return "edit_file"
-    
+
     @property
     def description(self) -> str:
         return "Edit a file by replacing old_text with new_text. The old_text must exist exactly in the file."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
             "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The file path to edit"
-                },
-                "old_text": {
-                    "type": "string",
-                    "description": "The exact text to find and replace"
-                },
-                "new_text": {
-                    "type": "string",
-                    "description": "The text to replace with"
-                }
+                "path": {"type": "string", "description": "The file path to edit"},
+                "old_text": {"type": "string", "description": "The exact text to find and replace"},
+                "new_text": {"type": "string", "description": "The text to replace with"},
             },
-            "required": ["path", "old_text", "new_text"]
+            "required": ["path", "old_text", "new_text"],
         }
-    
+
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
             file_path = _resolve_path(path, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
-            
+
+            try:
+                size = int(file_path.stat().st_size)
+            except Exception:
+                size = 0
+            if size > self._max_edit_bytes:
+                return (
+                    "Error: File too large to edit safely "
+                    f"(bytes={size}, max_edit_bytes={self._max_edit_bytes})"
+                )
+
             content = file_path.read_text(encoding="utf-8")
-            
+
             if old_text not in content:
-                return f"Error: old_text not found in file. Make sure it matches exactly."
-            
+                return "Error: old_text not found in file. Make sure it matches exactly."
+
             # Count occurrences
             count = content.count(old_text)
             if count > 1:
                 return f"Warning: old_text appears {count} times. Please provide more context to make it unique."
-            
+
             new_content = content.replace(old_text, new_text, 1)
-            file_path.write_text(new_content, encoding="utf-8")
-            
+            data = new_content.encode("utf-8")
+            if len(data) > self._max_result_bytes:
+                return (
+                    "Error: Edited content too large "
+                    f"(bytes={len(data)}, max_edit_bytes={self._max_result_bytes})"
+                )
+
+            if self._allowed_dir and self._workspace_quota_bytes > 0:
+                root = self._allowed_dir.expanduser().resolve()
+                current = dir_size_bytes(root)
+                predicted = current - size + len(data)
+                if predicted > self._workspace_quota_bytes:
+                    return (
+                        "Error: Workspace quota exceeded "
+                        f"(current={current} bytes, predicted={predicted} bytes, "
+                        f"quota={self._workspace_quota_bytes} bytes)"
+                    )
+
+            file_path.write_bytes(data)
+
             return f"Successfully edited {path}"
         except PermissionError as e:
             return f"Error: {e}"
@@ -163,31 +233,27 @@ class EditFileTool(Tool):
 
 class ListDirTool(Tool):
     """Tool to list directory contents."""
-    
-    def __init__(self, allowed_dir: Path | None = None):
+
+    def __init__(self, allowed_dir: Path | None = None, max_entries: int = 200):
         self._allowed_dir = allowed_dir
+        self._max_entries = max(1, int(max_entries))
 
     @property
     def name(self) -> str:
         return "list_dir"
-    
+
     @property
     def description(self) -> str:
         return "List the contents of a directory."
-    
+
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "The directory path to list"
-                }
-            },
-            "required": ["path"]
+            "properties": {"path": {"type": "string", "description": "The directory path to list"}},
+            "required": ["path"],
         }
-    
+
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
             dir_path = _resolve_path(path, self._allowed_dir)
@@ -195,15 +261,26 @@ class ListDirTool(Tool):
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():
                 return f"Error: Not a directory: {path}"
-            
+
+            limit = self._max_entries
+            first: list[Path] = []
+            extra = 0
+            for item in dir_path.iterdir():
+                if len(first) < limit:
+                    first.append(item)
+                else:
+                    extra += 1
+
             items = []
-            for item in sorted(dir_path.iterdir()):
+            for item in sorted(first, key=lambda p: p.name):
                 prefix = "📁 " if item.is_dir() else "📄 "
                 items.append(f"{prefix}{item.name}")
-            
+
             if not items:
                 return f"Directory {path} is empty"
-            
+
+            if extra:
+                items.append(f"... ({extra} more items)")
             return "\n".join(items)
         except PermissionError as e:
             return f"Error: {e}"

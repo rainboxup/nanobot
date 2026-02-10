@@ -1,0 +1,51 @@
+name: Deploy to 1Panel
+
+on:
+  push:
+    branches:
+      - saas-main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-saas-main
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_USER != '' && secrets.DEPLOY_SSH_KEY != '' && secrets.DEPLOY_PATH != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: 22
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
+            DEPLOY_BRANCH='${{ secrets.DEPLOY_BRANCH }}'
+            DEPLOY_COMMAND='${{ secrets.DEPLOY_COMMAND }}'
+
+            if [ -z "$DEPLOY_BRANCH" ]; then
+              DEPLOY_BRANCH='saas-main'
+            fi
+
+            cd "$DEPLOY_PATH"
+            git fetch origin --prune
+            git checkout "$DEPLOY_BRANCH"
+            git pull --ff-only origin "$DEPLOY_BRANCH"
+
+            if [ -n "$DEPLOY_COMMAND" ]; then
+              eval "$DEPLOY_COMMAND"
+            elif [ -f docker-compose.yml ] || [ -f compose.yml ]; then
+              docker compose up -d --build
+            else
+              echo "No DEPLOY_COMMAND provided and no compose file found."
+              exit 1
+            fi

@@ -49,10 +49,11 @@ def _to_ws_url(base_url: str, path: str) -> str:
 
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Nanobot web smoke test")
+    default_port = _env("NANOBOT_PORT", "18790")
     ap.add_argument(
         "--base-url",
-        default=_env("NANOBOT_SMOKE_URL", "http://127.0.0.1:8317"),
-        help="Base URL (default: http://127.0.0.1:8317)",
+        default=_env("NANOBOT_SMOKE_URL", f"http://127.0.0.1:{default_port}"),
+        help="Base URL (default: NANOBOT_SMOKE_URL or http://127.0.0.1:$NANOBOT_PORT)",
     )
     ap.add_argument(
         "--username",
@@ -183,4 +184,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

@@ -964,7 +964,7 @@ For closed beta multi-tenant deployment (recommended for SaaS), use `compose.yml
 ```bash
 cp .env.example .env
 docker compose -f compose.yml up -d --build
-python scripts/smoke_web.py --base-url http://127.0.0.1:${NANOBOT_PORT:-18790}
+python scripts/smoke_web.py --base-url http://127.0.0.1:8318
 ```
 
 ### Docker

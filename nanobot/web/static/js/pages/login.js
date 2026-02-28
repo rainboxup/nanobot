@@ -3,23 +3,23 @@ import { api, setAuthTokens } from "../api.js";
 export async function renderLogin(container) {
   container.innerHTML = `
     <div class="panel">
-      <h2>Login</h2>
-      <p class="muted">Use the admin credentials configured on the server.</p>
+      <h2>登录</h2>
+      <p class="muted">使用服务器上配置的管理员账号密码。</p>
       <form id="loginForm" class="row" style="gap: 16px">
         <div class="col">
-          <label>Username</label>
+          <label>用户名</label>
           <input id="username" type="text" autocomplete="username" placeholder="admin" />
         </div>
         <div class="col">
-          <label>Password</label>
+          <label>密码</label>
           <input id="password" type="password" autocomplete="current-password" />
         </div>
         <div class="col">
-          <label>Invite Code (optional)</label>
-          <input id="inviteCode" type="text" autocomplete="one-time-code" placeholder="For closed beta access" />
+          <label>邀请码（可选）</label>
+          <input id="inviteCode" type="text" autocomplete="one-time-code" placeholder="用于封闭 Beta 访问" />
         </div>
         <div class="row" style="width: 100%; justify-content: flex-end">
-          <button class="btn" type="submit">Login</button>
+          <button class="btn" type="submit">登录</button>
         </div>
       </form>
       <div id="loginError" class="error" style="margin-top: 10px"></div>
@@ -46,7 +46,7 @@ export async function renderLogin(container) {
       setAuthTokens(res.access_token || res.token, res.refresh_token || "");
       window.location.hash = "#/chat";
     } catch (err) {
-      errEl.textContent = err.message || "Login failed";
+      errEl.textContent = err.message || "登录失败";
     }
   });
 

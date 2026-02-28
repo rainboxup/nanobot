@@ -16,13 +16,13 @@ function escapeHtml(s) {
 }
 
 export async function renderSkills(container) {
-  container.innerHTML = `<div class="panel"><h2 style="margin-top:0">Skills</h2><div class="muted">Loading...</div></div>`;
+  container.innerHTML = `<div class="panel"><h2 style="margin-top:0">技能</h2><div class="muted">加载中...</div></div>`;
 
   const skills = await api.get("/api/skills");
   const list = el(`<div class="panel">
       <div class="row" style="justify-content: space-between">
-        <h2 style="margin:0">Skills</h2>
-        <div class="muted">${(skills || []).length} total</div>
+        <h2 style="margin:0">技能</h2>
+        <div class="muted">共 ${(skills || []).length} 个</div>
       </div>
       <div class="grid" style="margin-top: 12px" id="grid"></div>
       <div id="detail" style="margin-top: 12px"></div>
@@ -32,7 +32,7 @@ export async function renderSkills(container) {
   const detail = list.querySelector("#detail");
 
   async function showDetail(name) {
-    detail.innerHTML = `<div class="muted">Loading ${escapeHtml(name)}...</div>`;
+    detail.innerHTML = `<div class="muted">加载 ${escapeHtml(name)}...</div>`;
     const s = await api.get(`/api/skills/${encodeURIComponent(name)}`);
     detail.innerHTML = `
       <div class="panel" style="margin-top: 12px">
@@ -41,7 +41,7 @@ export async function renderSkills(container) {
             <div><span class="badge">${escapeHtml(s.name)}</span> <span class="muted">${escapeHtml(s.source || "")}</span></div>
             <div class="muted" style="margin-top: 4px">${escapeHtml(s.description || "")}</div>
           </div>
-          <button class="btn secondary" type="button" id="closeSkill">Close</button>
+          <button class="btn secondary" type="button" id="closeSkill">关闭</button>
         </div>
         <pre class="code" style="margin-top: 12px; white-space: pre-wrap">${escapeHtml(s.content || "")}</pre>
       </div>`;

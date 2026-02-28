@@ -28,6 +28,14 @@ function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+function roleLabel(role) {
+  const r = String(role || "").toLowerCase();
+  if (r === "member") return "成员";
+  if (r === "admin") return "管理员";
+  if (r === "owner") return "拥有者";
+  return String(role || "");
+}
+
 function formatDateTime(value) {
   try {
     return new Date(value).toLocaleString();
@@ -50,14 +58,14 @@ function setByPath(obj, path, value) {
 function renderConfigForm(name, config, onSave) {
   const form = el(`<form class="panel" style="margin-top: 12px">
       <div class="row" style="justify-content: space-between">
-        <h3 style="margin: 0">Edit: ${escapeHtml(name)}</h3>
+        <h3 style="margin: 0">编辑：${escapeHtml(name)}</h3>
         <div>
-          <button class="btn secondary" type="button" data-action="cancel">Close</button>
-          <button class="btn" type="submit">Save</button>
+          <button class="btn secondary" type="button" data-action="cancel">关闭</button>
+          <button class="btn" type="submit">保存</button>
         </div>
       </div>
       <div class="muted" style="margin-top: 6px">
-        Sensitive fields are not prefilled. Leave them blank to keep unchanged.
+        敏感字段不会自动填充；留空将保持不变。
       </div>
       <div data-fields style="margin-top: 12px"></div>
       <div class="error" data-error style="margin-top: 10px"></div>
@@ -106,7 +114,7 @@ function renderConfigForm(name, config, onSave) {
         if (!isSensitive) {
           input.value = String(v ?? "");
         } else {
-          input.placeholder = "unchanged";
+          input.placeholder = "保持不变";
         }
       }
 
@@ -161,7 +169,7 @@ function renderConfigForm(name, config, onSave) {
     try {
       await onSave(update);
     } catch (err) {
-      errEl.textContent = err.message || "Save failed";
+      errEl.textContent = err.message || "保存失败";
     }
   });
 
@@ -174,19 +182,19 @@ function renderConfigForm(name, config, onSave) {
 
 async function renderProviders(container) {
   const panel = container.querySelector("#settingsPanel");
-  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Providers</h3><div class="muted">Loading...</div></div>`;
+  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">模型服务</h3><div class="muted">加载中...</div></div>`;
 
   const providers = await api.get("/api/providers");
 
   const table = el(`<div class="panel">
-      <h3 style="margin-top:0">Providers</h3>
+      <h3 style="margin-top:0">模型服务</h3>
       <table class="table">
         <thead>
-          <tr><th>Name</th><th>API Base</th><th>Key</th><th></th></tr>
+          <tr><th>名称</th><th>API 地址</th><th>密钥</th><th></th></tr>
         </thead>
         <tbody></tbody>
       </table>
-      <div class="muted" style="margin-top:10px">Keys are always masked in responses.</div>
+      <div class="muted" style="margin-top:10px">返回结果中的密钥始终会被打码。</div>
     </div>`);
 
   const tbody = table.querySelector("tbody");
@@ -196,7 +204,7 @@ async function renderProviders(container) {
         <td><span class="badge">${escapeHtml(p.name)}</span></td>
         <td class="code">${escapeHtml(p.api_base || "")}</td>
         <td class="code">${escapeHtml(p.masked_key || "")}</td>
-        <td><button class="btn secondary" type="button">Edit</button></td>
+        <td><button class="btn secondary" type="button">编辑</button></td>
       </tr>`);
 
     tr.querySelector("button").addEventListener("click", async () => {
@@ -210,15 +218,15 @@ async function renderProviders(container) {
               </div>
               <div class="col">
                 <label>api_key</label>
-                <input type="password" placeholder="(leave blank to keep)" data-field="api_key" />
+                <input type="password" placeholder="（留空保持不变）" data-field="api_key" />
                 <label class="muted" style="display:flex; align-items:center; gap:8px; margin-top:8px">
                   <input type="checkbox" data-field="clear_key" />
-                  Clear key
+                  清空密钥
                 </label>
               </div>
               <div class="row" style="justify-content: flex-end">
-                <button class="btn secondary" type="button" data-action="cancel">Cancel</button>
-                <button class="btn" type="button" data-action="save">Save</button>
+                <button class="btn secondary" type="button" data-action="cancel">取消</button>
+                <button class="btn" type="button" data-action="save">保存</button>
               </div>
             </div>
             <div class="error" data-error style="margin-top: 8px"></div>
@@ -248,7 +256,7 @@ async function renderProviders(container) {
           await api.put(`/api/providers/${encodeURIComponent(p.name)}`, payload);
           await renderProviders(container);
         } catch (err) {
-          errEl.textContent = err.message || "Save failed";
+          errEl.textContent = err.message || "保存失败";
         }
       });
     });
@@ -262,10 +270,10 @@ async function renderProviders(container) {
 
 async function renderChannels(container) {
   const panel = container.querySelector("#settingsPanel");
-  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Channels</h3><div class="muted">Loading...</div></div>`;
+  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">渠道</h3><div class="muted">加载中...</div></div>`;
 
   const channels = await api.get("/api/channels");
-  const wrap = el(`<div class="panel"><h3 style="margin-top:0">Channels</h3><div id="list"></div></div>`);
+  const wrap = el(`<div class="panel"><h3 style="margin-top:0">渠道</h3><div id="list"></div></div>`);
   const list = wrap.querySelector("#list");
 
   for (const ch of channels || []) {
@@ -276,9 +284,9 @@ async function renderChannels(container) {
             <span class="muted" style="margin-left: 8px">${escapeHtml(JSON.stringify(ch.config_summary || {}))}</span>
           </div>
           <div class="row">
-            <label class="muted">Enabled</label>
+            <label class="muted">启用</label>
             <input type="checkbox" ${ch.enabled ? "checked" : ""} />
-            <button class="btn secondary" type="button">Edit</button>
+            <button class="btn secondary" type="button">编辑</button>
           </div>
         </div>
       </div>`);
@@ -309,23 +317,23 @@ async function renderChannels(container) {
 
 async function renderBetaAccess(container) {
   const panel = container.querySelector("#settingsPanel");
-  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Beta Access</h3><div class="muted">Loading...</div></div>`;
+  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">封闭 Beta</h3><div class="muted">加载中...</div></div>`;
 
   const allowlist = await api.get("/api/beta/allowlist");
   const invites = await api.get("/api/beta/invites");
 
   const wrap = el(`<div class="panel">
-      <h3 style="margin-top:0">Closed Beta Access</h3>
+      <h3 style="margin-top:0">封闭 Beta 访问</h3>
       <div class="muted" style="margin-top:6px">
-        Closed beta mode: <span class="badge">${allowlist.closed_beta ? "enabled" : "disabled"}</span>
+        封闭 Beta 模式：<span class="badge">${allowlist.closed_beta ? "已启用" : "未启用"}</span>
       </div>
 
       <div style="margin-top:14px">
         <div class="row" style="justify-content: space-between">
-          <h4 style="margin:0">Allowlist (${allowlist.count || 0})</h4>
+          <h4 style="margin:0">白名单（${allowlist.count || 0}）</h4>
           <div class="row">
-            <input id="betaUserInput" type="text" placeholder="username" style="min-width: 220px" />
-            <button class="btn" type="button" id="betaAddUserBtn">Add user</button>
+            <input id="betaUserInput" type="text" placeholder="用户名" style="min-width: 220px" />
+            <button class="btn" type="button" id="betaAddUserBtn">添加</button>
           </div>
         </div>
         <div id="betaUsers" style="margin-top:10px"></div>
@@ -333,18 +341,18 @@ async function renderBetaAccess(container) {
 
       <div style="margin-top:20px">
         <div class="row" style="justify-content: space-between">
-          <h4 style="margin:0">Invites</h4>
+          <h4 style="margin:0">邀请码</h4>
           <div class="row">
-            <input id="inviteForUser" type="text" placeholder="for username (optional)" style="min-width: 180px" />
+            <input id="inviteForUser" type="text" placeholder="指定用户名（可选）" style="min-width: 180px" />
             <input id="inviteTtlHours" type="number" min="1" value="72" style="width: 110px" />
             <input id="inviteMaxUses" type="number" min="1" value="1" style="width: 90px" />
-            <button class="btn" type="button" id="createInviteBtn">Create invite</button>
+            <button class="btn" type="button" id="createInviteBtn">创建邀请码</button>
           </div>
         </div>
-        <div class="muted" style="margin-top:6px">Send invite code to user. They can log in once with invite_code to join allowlist.</div>
+        <div class="muted" style="margin-top:6px">将邀请码发送给用户；用户可使用 invite_code 登录一次以加入白名单。</div>
         <table class="table" style="margin-top:10px">
           <thead>
-            <tr><th>Code</th><th>Target</th><th>Uses</th><th>Expires</th><th>Status</th><th></th></tr>
+            <tr><th>邀请码</th><th>目标用户</th><th>使用次数</th><th>过期时间</th><th>状态</th><th></th></tr>
           </thead>
           <tbody id="inviteRows"></tbody>
         </table>
@@ -355,7 +363,7 @@ async function renderBetaAccess(container) {
   for (const user of allowlist.users || []) {
     const row = el(`<div class="row" style="justify-content: space-between; padding: 8px 0; border-bottom: 1px solid var(--border);">
         <div><span class="badge">${escapeHtml(user)}</span></div>
-        <button class="btn secondary" type="button">Remove</button>
+        <button class="btn secondary" type="button">移除</button>
       </div>`);
     row.querySelector("button").addEventListener("click", async () => {
       await api.delete(`/api/beta/allowlist/${encodeURIComponent(user)}`);
@@ -379,8 +387,8 @@ async function renderBetaAccess(container) {
         <td>${escapeHtml(inv.for_username || "-")}</td>
         <td>${escapeHtml(String(inv.used_count || 0))} / ${escapeHtml(String(inv.max_uses || 1))}</td>
         <td>${escapeHtml(formatDateTime(inv.expires_at || ""))}</td>
-        <td>${inv.active ? '<span class="badge">active</span>' : '<span class="badge">inactive</span>'}</td>
-        <td><button class="btn secondary" type="button">Revoke</button></td>
+        <td>${inv.active ? '<span class="badge">有效</span>' : '<span class="badge">已失效</span>'}</td>
+        <td><button class="btn secondary" type="button">撤销</button></td>
       </tr>`);
     row.querySelector("button").addEventListener("click", async () => {
       await api.delete(`/api/beta/invites/${encodeURIComponent(inv.code || "")}`);
@@ -405,15 +413,15 @@ async function renderBetaAccess(container) {
 
 async function renderUsers(container) {
   const panel = container.querySelector("#settingsPanel");
-  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Users</h3><div class="muted">Loading...</div></div>`;
+  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">用户</h3><div class="muted">加载中...</div></div>`;
 
   let me = null;
   let users = [];
   try {
     [me, users] = await Promise.all([api.get("/api/auth/me"), api.get("/api/auth/users")]);
   } catch (err) {
-    const msg = String((err && err.message) || "Failed to load");
-    panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Users</h3><div class="error">${escapeHtml(msg)}</div></div>`;
+    const msg = String((err && err.message) || "加载失败");
+    panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">用户</h3><div class="error">${escapeHtml(msg)}</div></div>`;
     return;
   }
 
@@ -422,44 +430,49 @@ async function renderUsers(container) {
   const meTenant = String((me && me.tenant_id) || "").toLowerCase();
   const roleOptions = isOwner ? ["member", "admin", "owner"] : ["member", "admin"];
   const wrap = el(`<div class="panel">
-      <h3 style="margin-top:0">Users & Access</h3>
-      <div class="muted" style="margin-top:6px">Current role: <span class="badge">${escapeHtml(me.role || "-")}</span></div>
+      <h3 style="margin-top:0">用户与权限</h3>
+      <div class="muted" style="margin-top:6px">当前角色：<span class="badge">${escapeHtml(roleLabel(me.role || "-"))}</span></div>
 
       <div style="margin-top: 14px">
         <div class="row" style="justify-content: space-between; align-items: center;">
-          <h4 style="margin: 0">Create User</h4>
-          <button class="btn secondary" type="button" id="usersReloadBtn">Refresh</button>
+          <h4 style="margin: 0">创建用户</h4>
+          <button class="btn secondary" type="button" id="usersReloadBtn">刷新</button>
         </div>
         <div class="row" style="margin-top: 10px; gap: 8px; flex-wrap: wrap;">
-          <input id="usersCreateName" type="text" placeholder="username" style="min-width: 160px" />
-          <input id="usersCreatePassword" type="password" placeholder="password (>=6)" style="min-width: 180px" />
+          <input id="usersCreateName" type="text" placeholder="用户名" style="min-width: 160px" />
+          <input id="usersCreatePassword" type="password" placeholder="密码（>=6）" style="min-width: 180px" />
           <select id="usersCreateRole">
-            ${roleOptions.map((role) => `<option value="${escapeHtml(role)}">${escapeHtml(role)}</option>`).join("")}
+            ${roleOptions
+              .map(
+                (role) =>
+                  `<option value="${escapeHtml(role)}">${escapeHtml(roleLabel(role))}</option>`
+              )
+              .join("")}
           </select>
-          <input id="usersCreateTenant" type="text" placeholder="tenant_id (optional)" style="min-width: 160px" />
-          <button class="btn" type="button" id="usersCreateBtn">Create</button>
+          <input id="usersCreateTenant" type="text" placeholder="租户ID（可选）" style="min-width: 160px" />
+          <button class="btn" type="button" id="usersCreateBtn">创建</button>
         </div>
-        <div class="muted" style="margin-top: 6px">Admin can only create users in own tenant.</div>
+        <div class="muted" style="margin-top: 6px">Admin 只能在自己的租户内创建用户。</div>
       </div>
 
       <div style="margin-top: 18px">
-        <h4 style="margin: 0">Users</h4>
+        <h4 style="margin: 0">用户列表</h4>
         <div class="error" id="usersError" style="margin-top: 8px"></div>
         <table class="table" style="margin-top:10px">
           <thead>
-            <tr><th>Username</th><th>Tenant</th><th>Role</th><th>Status</th><th>Actions</th></tr>
+            <tr><th>用户名</th><th>租户</th><th>角色</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody id="usersRows"></tbody>
         </table>
       </div>
 
       <div style="margin-top: 20px">
-        <h4 style="margin: 0">Change My Password</h4>
+        <h4 style="margin: 0">修改我的密码</h4>
         <div class="row" style="margin-top: 10px; gap: 8px; flex-wrap: wrap;">
-          <input id="usersOldPassword" type="password" placeholder="old password" style="min-width: 180px" />
-          <input id="usersNewPassword" type="password" placeholder="new password (>=6)" style="min-width: 180px" />
-          <input id="usersNewPasswordConfirm" type="password" placeholder="confirm new password" style="min-width: 180px" />
-          <button class="btn secondary" type="button" id="usersChangePasswordBtn">Update password</button>
+          <input id="usersOldPassword" type="password" placeholder="旧密码" style="min-width: 180px" />
+          <input id="usersNewPassword" type="password" placeholder="新密码（>=6）" style="min-width: 180px" />
+          <input id="usersNewPasswordConfirm" type="password" placeholder="确认新密码" style="min-width: 180px" />
+          <button class="btn secondary" type="button" id="usersChangePasswordBtn">更新密码</button>
         </div>
       </div>
     </div>`);
@@ -494,18 +507,18 @@ async function renderUsers(container) {
           z-index: 2000;
         ">
           <div class="panel" style="width: 100%; max-width: 460px;">
-            <h4 style="margin-top:0">Reset Password</h4>
-            <div class="muted">User: <span class="badge">${escapeHtml(username)}</span></div>
+            <h4 style="margin-top:0">重置密码</h4>
+            <div class="muted">用户：<span class="badge">${escapeHtml(username)}</span></div>
             <div class="row" style="margin-top: 12px; gap: 8px; flex-wrap: wrap;">
-              <input id="resetPwdValue" type="password" placeholder="new password (>=6)" style="flex: 1; min-width: 200px" />
+              <input id="resetPwdValue" type="password" placeholder="新密码（>=6）" style="flex: 1; min-width: 200px" />
             </div>
             <div class="row" style="margin-top: 8px; gap: 8px; flex-wrap: wrap;">
-              <input id="resetPwdConfirm" type="password" placeholder="confirm new password" style="flex: 1; min-width: 200px" />
+              <input id="resetPwdConfirm" type="password" placeholder="确认新密码" style="flex: 1; min-width: 200px" />
             </div>
             <div class="error" id="resetPwdError" style="margin-top: 8px"></div>
             <div class="row" style="justify-content: flex-end; margin-top: 12px; gap: 8px;">
-              <button class="btn secondary" type="button" data-action="cancel">Cancel</button>
-              <button class="btn" type="button" data-action="submit">Confirm</button>
+              <button class="btn secondary" type="button" data-action="cancel">取消</button>
+              <button class="btn" type="button" data-action="submit">确认</button>
             </div>
           </div>
         </div>`);
@@ -523,11 +536,11 @@ async function renderUsers(container) {
         const pwd = String(pwdEl.value || "");
         const confirm = String(confirmEl.value || "");
         if (pwd.length < 6) {
-          errorEl.textContent = "Password must be at least 6 characters.";
+          errorEl.textContent = "密码至少 6 位。";
           return;
         }
         if (pwd !== confirm) {
-          errorEl.textContent = "Passwords do not match.";
+          errorEl.textContent = "两次输入的密码不一致。";
           return;
         }
         close(pwd);
@@ -553,24 +566,24 @@ async function renderUsers(container) {
       ">
         <div class="panel" style="width: 100%; max-width: 860px; max-height: 82vh; overflow: auto;">
           <div class="row" style="justify-content: space-between; align-items: center;">
-            <h4 style="margin: 0">Sessions</h4>
+            <h4 style="margin: 0">会话</h4>
             <div class="row" style="gap: 8px; flex-wrap: wrap;">
-              <button class="btn secondary" type="button" data-action="refresh">Refresh</button>
-              <button class="btn secondary" type="button" data-action="revoke-all">Force logout all</button>
-              <button class="btn secondary" type="button" data-action="close">Close</button>
+              <button class="btn secondary" type="button" data-action="refresh">刷新</button>
+              <button class="btn secondary" type="button" data-action="revoke-all">强制全部退出</button>
+              <button class="btn secondary" type="button" data-action="close">关闭</button>
             </div>
           </div>
           <div class="muted" style="margin-top: 8px">
-            User: <span class="badge">${escapeHtml(username)}</span>
+            用户：<span class="badge">${escapeHtml(username)}</span>
           </div>
           <div class="row" style="margin-top: 8px; gap: 8px; flex-wrap: wrap;">
-            <input id="sessionReasonInput" type="text" placeholder="reason for revoke (required)" style="min-width: 260px; flex: 1" />
+            <input id="sessionReasonInput" type="text" placeholder="撤销原因（必填）" style="min-width: 260px; flex: 1" />
           </div>
           <div class="muted" id="sessionSummary" style="margin-top: 8px"></div>
           <div class="error" id="sessionError" style="margin-top: 8px"></div>
           <table class="table" style="margin-top:10px">
             <thead>
-              <tr><th>Token ID</th><th>Status</th><th>Issued</th><th>Expires</th><th>Revoked</th><th></th></tr>
+              <tr><th>Token ID</th><th>状态</th><th>签发时间</th><th>过期时间</th><th>撤销时间</th><th></th></tr>
             </thead>
             <tbody id="sessionRows"></tbody>
           </table>
@@ -599,7 +612,7 @@ async function renderUsers(container) {
     function requireSessionReason() {
       const reason = String(reasonInput.value || "").trim();
       if (!reason) {
-        errEl2.textContent = "Please provide a reason.";
+        errEl2.textContent = "请填写原因。";
         reasonInput.focus();
         return null;
       }
@@ -613,14 +626,17 @@ async function renderUsers(container) {
         const active = Boolean(item && item.active);
         const revokedAt = String((item && item.revoked_at) || "");
         const status = revokedAt ? "revoked" : active ? "active" : "expired";
-        const statusBadge = status === "active" ? '<span class="badge">active</span>' : escapeHtml(status);
+        const statusLabel =
+          status === "active" ? "有效" : status === "revoked" ? "已撤销" : status === "expired" ? "已过期" : status;
+        const statusBadge =
+          status === "active" ? `<span class="badge">${escapeHtml(statusLabel)}</span>` : escapeHtml(statusLabel);
         const row = el(`<tr>
             <td class="code">${escapeHtml(tokenId || "-")}</td>
             <td>${statusBadge}</td>
             <td>${escapeHtml(formatDateTime((item && item.issued_at) || ""))}</td>
             <td>${escapeHtml(formatDateTime((item && item.expires_at) || ""))}</td>
             <td>${escapeHtml(formatDateTime(revokedAt || ""))}</td>
-            <td>${active ? '<button class="btn secondary" type="button" data-action="revoke-one">Revoke</button>' : ""}</td>
+            <td>${active ? '<button class="btn secondary" type="button" data-action="revoke-one">撤销</button>' : ""}</td>
           </tr>`);
         const revokeOneBtn = row.querySelector('[data-action="revoke-one"]');
         if (revokeOneBtn) {
@@ -628,7 +644,7 @@ async function renderUsers(container) {
             if (loading) return;
             const reason = requireSessionReason();
             if (!reason) return;
-            if (!window.confirm(`Revoke this session for "${username}"?`)) return;
+            if (!window.confirm(`确定撤销用户 "${username}" 的该会话吗？`)) return;
             errEl2.textContent = "";
             try {
               loading = true;
@@ -639,7 +655,7 @@ async function renderUsers(container) {
               );
               await fetchRows();
             } catch (err) {
-              errEl2.textContent = String((err && err.message) || "Revoke session failed");
+              errEl2.textContent = String((err && err.message) || "撤销会话失败");
             } finally {
               loading = false;
               setBusy(false);
@@ -648,7 +664,7 @@ async function renderUsers(container) {
         }
         rowsEl.appendChild(row);
       }
-      emptyEl2.textContent = rows.length ? "" : "No sessions found.";
+      emptyEl2.textContent = rows.length ? "" : "未找到会话。";
     }
 
     async function fetchRows() {
@@ -658,7 +674,7 @@ async function renderUsers(container) {
       rows = Array.isArray(data && data.sessions) ? data.sessions : [];
       const activeCount = Number((data && data.active_session_count) || 0);
       const totalCount = Number((data && data.session_count) || rows.length);
-      summaryEl.textContent = `Total sessions: ${totalCount}; active sessions: ${activeCount}`;
+      summaryEl.textContent = `会话总数：${totalCount}；活跃会话：${activeCount}`;
       renderRows();
     }
 
@@ -670,7 +686,7 @@ async function renderUsers(container) {
       try {
         await fetchRows();
       } catch (err) {
-        errEl2.textContent = String((err && err.message) || "Load sessions failed");
+        errEl2.textContent = String((err && err.message) || "加载会话失败");
       } finally {
         loading = false;
         setBusy(false);
@@ -684,7 +700,7 @@ async function renderUsers(container) {
       if (loading) return;
       const reason = requireSessionReason();
       if (!reason) return;
-      if (!window.confirm(`Force logout all active sessions for "${username}"?`)) return;
+      if (!window.confirm(`确定强制注销用户 "${username}" 的所有活跃会话吗？`)) return;
       errEl2.textContent = "";
       try {
         loading = true;
@@ -692,7 +708,7 @@ async function renderUsers(container) {
         await api.post(`/api/auth/users/${encodeURIComponent(username)}/sessions/revoke-all`, { reason });
         await fetchRows();
       } catch (err) {
-        errEl2.textContent = String((err && err.message) || "Force logout failed");
+        errEl2.textContent = String((err && err.message) || "强制全部退出失败");
       } finally {
         loading = false;
         setBusy(false);
@@ -732,18 +748,24 @@ async function renderUsers(container) {
           <td><span class="badge">${escapeHtml(username || "-")}</span></td>
           <td>${escapeHtml(item.tenant_id || "-")}</td>
           <td>${canEditRole ? `<select data-action="role-select">
-              <option value="member"${String(item.role) === "member" ? " selected" : ""}>member</option>
-              <option value="admin"${String(item.role) === "admin" ? " selected" : ""}>admin</option>
-              <option value="owner"${String(item.role) === "owner" ? " selected" : ""}>owner</option>
-            </select>` : escapeHtml(item.role || "-")}</td>
-          <td>${isActive ? '<span class="badge">active</span>' : '<span class="badge">inactive</span>'}</td>
+              <option value="member"${String(item.role) === "member" ? " selected" : ""}>${escapeHtml(
+                roleLabel("member")
+              )}</option>
+              <option value="admin"${String(item.role) === "admin" ? " selected" : ""}>${escapeHtml(
+                roleLabel("admin")
+              )}</option>
+              <option value="owner"${String(item.role) === "owner" ? " selected" : ""}>${escapeHtml(
+                roleLabel("owner")
+              )}</option>
+            </select>` : escapeHtml(roleLabel(item.role || "-"))}</td>
+          <td>${isActive ? '<span class="badge">启用</span>' : '<span class="badge">禁用</span>'}</td>
           <td>
             <div class="row" style="gap: 8px; flex-wrap: wrap;">
-              ${canEditRole ? '<button class="btn secondary" type="button" data-action="update-role">Update role</button>' : ""}
-              ${canManage ? `<button class="btn secondary" type="button" data-action="toggle-status">${isActive ? "Disable" : "Enable"}</button>` : ""}
-              ${canManage ? '<button class="btn secondary" type="button" data-action="manage-sessions">Sessions</button>' : ""}
-              ${canManage ? '<button class="btn secondary" type="button" data-action="delete-user">Delete</button>' : ""}
-              ${canManage ? '<button class="btn secondary" type="button" data-action="reset-password">Reset password</button>' : ""}
+              ${canEditRole ? '<button class="btn secondary" type="button" data-action="update-role">更新角色</button>' : ""}
+              ${canManage ? `<button class="btn secondary" type="button" data-action="toggle-status">${isActive ? "禁用" : "启用"}</button>` : ""}
+              ${canManage ? '<button class="btn secondary" type="button" data-action="manage-sessions">会话</button>' : ""}
+              ${canManage ? '<button class="btn secondary" type="button" data-action="delete-user">删除</button>' : ""}
+              ${canManage ? '<button class="btn secondary" type="button" data-action="reset-password">重置密码</button>' : ""}
             </div>
           </td>
         </tr>`);
@@ -758,7 +780,7 @@ async function renderUsers(container) {
             await loadUsers();
             await renderUserRows();
           } catch (err) {
-            errEl.textContent = String((err && err.message) || "Update role failed");
+            errEl.textContent = String((err && err.message) || "更新角色失败");
           }
         });
       }
@@ -768,14 +790,14 @@ async function renderUsers(container) {
         toggleBtn.addEventListener("click", async () => {
           errEl.textContent = "";
           const nextActive = !isActive;
-          const actionText = nextActive ? "enable" : "disable";
-          if (!window.confirm(`Are you sure to ${actionText} user "${username}"?`)) return;
+          const actionText = nextActive ? "启用" : "禁用";
+          if (!window.confirm(`确定要${actionText}用户 "${username}" 吗？`)) return;
           try {
             await api.put(`/api/auth/users/${encodeURIComponent(username)}/status`, { active: nextActive });
             await loadUsers();
             await renderUserRows();
           } catch (err) {
-            errEl.textContent = String((err && err.message) || "Update user status failed");
+            errEl.textContent = String((err && err.message) || "更新用户状态失败");
           }
         });
       }
@@ -784,13 +806,13 @@ async function renderUsers(container) {
       if (deleteBtn) {
         deleteBtn.addEventListener("click", async () => {
           errEl.textContent = "";
-          if (!window.confirm(`Delete user "${username}" permanently? This action cannot be undone.`)) return;
+          if (!window.confirm(`确定永久删除用户 "${username}" 吗？此操作不可撤销。`)) return;
           try {
             await api.delete(`/api/auth/users/${encodeURIComponent(username)}`);
             await loadUsers();
             await renderUserRows();
           } catch (err) {
-            errEl.textContent = String((err && err.message) || "Delete user failed");
+            errEl.textContent = String((err && err.message) || "删除用户失败");
           }
         });
       }
@@ -802,7 +824,7 @@ async function renderUsers(container) {
           try {
             await openSessionManager(username);
           } catch (err) {
-            errEl.textContent = String((err && err.message) || "Open sessions failed");
+            errEl.textContent = String((err && err.message) || "打开会话失败");
           }
         });
       }
@@ -818,7 +840,7 @@ async function renderUsers(container) {
               new_password: String(next),
             });
           } catch (err) {
-            errEl.textContent = String((err && err.message) || "Reset password failed");
+            errEl.textContent = String((err && err.message) || "重置密码失败");
           }
         });
       }
@@ -834,11 +856,11 @@ async function renderUsers(container) {
     const role = String(createRole.value || "member").trim();
     const tenant = String(createTenant.value || "").trim();
     if (!username) {
-      errEl.textContent = "username required";
+      errEl.textContent = "请输入用户名";
       return;
     }
     if (password.length < 6) {
-      errEl.textContent = "password must be at least 6 characters";
+      errEl.textContent = "密码至少 6 位";
       return;
     }
     const payload = { username, password, role };
@@ -849,7 +871,7 @@ async function renderUsers(container) {
       await loadUsers();
       await renderUserRows();
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Create user failed");
+      errEl.textContent = String((err && err.message) || "创建用户失败");
     }
   });
 
@@ -859,7 +881,7 @@ async function renderUsers(container) {
       await loadUsers();
       await renderUserRows();
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Refresh users failed");
+      errEl.textContent = String((err && err.message) || "刷新用户失败");
     }
   });
 
@@ -869,15 +891,15 @@ async function renderUsers(container) {
     const nextPassword = String(newPwd.value || "");
     const confirm = String(newPwdConfirm.value || "");
     if (!oldPassword || !nextPassword) {
-      errEl.textContent = "old/new password required";
+      errEl.textContent = "请输入旧密码和新密码";
       return;
     }
     if (nextPassword.length < 6) {
-      errEl.textContent = "new password must be at least 6 characters";
+      errEl.textContent = "新密码至少 6 位";
       return;
     }
     if (nextPassword !== confirm) {
-      errEl.textContent = "new passwords do not match";
+      errEl.textContent = "两次输入的新密码不一致";
       return;
     }
     try {
@@ -889,7 +911,7 @@ async function renderUsers(container) {
       newPwd.value = "";
       newPwdConfirm.value = "";
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Change password failed");
+      errEl.textContent = String((err && err.message) || "修改密码失败");
     }
   });
 
@@ -900,42 +922,42 @@ async function renderUsers(container) {
 
 async function renderSecurity(container) {
   const panel = container.querySelector("#settingsPanel");
-  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">Security</h3><div class="muted">Loading...</div></div>`;
+  panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">安全</h3><div class="muted">加载中...</div></div>`;
 
   const wrap = el(`<div class="panel">
-      <h3 style="margin-top:0">Security</h3>
-      <div class="muted" style="margin-top:6px">Owner-only observability panel</div>
+      <h3 style="margin-top:0">安全</h3>
+      <div class="muted" style="margin-top:6px">仅 Owner 可见（观测面板）</div>
 
       <div style="margin-top: 16px">
         <div class="row" style="justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
-          <h4 style="margin: 0">Login Lock Status</h4>
+          <h4 style="margin: 0">登录锁定状态</h4>
           <div class="row" style="gap: 8px; flex-wrap: wrap;">
-            <input id="securityLockUsername" type="text" placeholder="username (exact)" style="min-width: 150px" />
-            <input id="securityLockIp" type="text" placeholder="ip (exact)" style="min-width: 130px" />
+            <input id="securityLockUsername" type="text" placeholder="用户名（精确）" style="min-width: 150px" />
+            <input id="securityLockIp" type="text" placeholder="IP（精确）" style="min-width: 130px" />
             <select id="securityLockScope">
-              <option value="">all scope</option>
-              <option value="user_ip">user+ip</option>
-              <option value="ip">ip</option>
+              <option value="">全部范围</option>
+              <option value="user_ip">用户+IP</option>
+              <option value="ip">IP</option>
             </select>
-            <input id="securityLockReason" type="text" placeholder="unlock reason (required)" style="min-width: 220px" />
+            <input id="securityLockReason" type="text" placeholder="解锁原因（必填）" style="min-width: 220px" />
             <select id="securityLockView">
-              <option value="active" selected>active only</option>
-              <option value="all">all subjects</option>
+              <option value="active" selected>仅显示锁定</option>
+              <option value="all">全部主体</option>
             </select>
             <select id="securityLockLimit">
-              <option value="50">50 rows</option>
-              <option value="100" selected>100 rows</option>
-              <option value="200">200 rows</option>
+              <option value="50">50 行</option>
+              <option value="100" selected>100 行</option>
+              <option value="200">200 行</option>
             </select>
-            <button class="btn" type="button" id="securityLockBatchUnlockBtn">Unlock selected</button>
-            <button class="btn secondary" type="button" id="securityLockRefreshBtn">Refresh</button>
+            <button class="btn" type="button" id="securityLockBatchUnlockBtn">解锁选中</button>
+            <button class="btn secondary" type="button" id="securityLockRefreshBtn">刷新</button>
           </div>
         </div>
         <div class="muted" id="securityLockSummary" style="margin-top: 6px"></div>
         <div class="error" id="securityLockError" style="margin-top: 8px"></div>
         <table class="table" style="margin-top:10px">
           <thead>
-            <tr><th><input id="securityLockSelectAll" type="checkbox" /></th><th>Scope</th><th>Subject</th><th>Status</th><th>Retry</th><th>Failures</th><th>Last Failure</th><th>Locked Until</th><th></th></tr>
+            <tr><th><input id="securityLockSelectAll" type="checkbox" /></th><th>范围</th><th>主体</th><th>状态</th><th>重试</th><th>失败次数</th><th>最近失败</th><th>锁定到</th><th></th></tr>
           </thead>
           <tbody id="securityLockRows"></tbody>
         </table>
@@ -943,48 +965,48 @@ async function renderSecurity(container) {
       </div>
 
       <div style="margin-top: 20px">
-        <h4 style="margin: 0">Security Events</h4>
-        <div class="muted" style="margin-top:6px">Latest audit events</div>
+        <h4 style="margin: 0">安全事件</h4>
+        <div class="muted" style="margin-top:6px">最新审计事件</div>
         <div class="row" style="margin-top:8px; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap;">
           <div class="muted" id="securityRetentionSummary"></div>
-          <button class="btn secondary" type="button" id="securityRetentionRunBtn">Run retention now</button>
+          <button class="btn secondary" type="button" id="securityRetentionRunBtn">立即运行清理</button>
         </div>
         <div class="row" style="margin-top: 8px; gap: 8px; flex-wrap: wrap;">
-          <button class="btn secondary" type="button" id="securityPresetSessionAllBtn">Session events</button>
-          <button class="btn secondary" type="button" id="securityPresetSessionRevokeBtn">Session revoke</button>
-          <button class="btn secondary" type="button" id="securityPresetSessionRevokeAllBtn">Session revoke-all</button>
-          <button class="btn secondary" type="button" id="securityExportSessionBtn">Export session CSV</button>
+          <button class="btn secondary" type="button" id="securityPresetSessionAllBtn">会话事件</button>
+          <button class="btn secondary" type="button" id="securityPresetSessionRevokeBtn">会话撤销</button>
+          <button class="btn secondary" type="button" id="securityPresetSessionRevokeAllBtn">会话批量撤销</button>
+          <button class="btn secondary" type="button" id="securityExportSessionBtn">导出会话 CSV</button>
         </div>
         <div class="row" style="margin-top: 12px; gap: 8px; flex-wrap: wrap;">
-          <input id="securityEventFilter" type="text" placeholder="event contains..." style="min-width: 180px" />
-          <input id="securityActorFilter" type="text" placeholder="actor (exact)" style="min-width: 140px" />
+          <input id="securityEventFilter" type="text" placeholder="事件包含..." style="min-width: 180px" />
+          <input id="securityActorFilter" type="text" placeholder="操作者（精确）" style="min-width: 140px" />
           <select id="securityStatusFilter">
-            <option value="">any status</option>
-            <option value="succeeded">succeeded</option>
-            <option value="failed">failed</option>
-            <option value="blocked">blocked</option>
+            <option value="">任意状态</option>
+            <option value="succeeded">成功</option>
+            <option value="failed">失败</option>
+            <option value="blocked">被拦截</option>
           </select>
           <select id="securityMetaModeFilter">
-            <option value="">any mode</option>
-            <option value="single">single</option>
-            <option value="batch">batch</option>
+            <option value="">任意模式</option>
+            <option value="single">单条</option>
+            <option value="batch">批量</option>
           </select>
-          <input id="securityMetaUsernameFilter" type="text" placeholder="username (exact)" style="min-width: 160px" />
-          <input id="securityMetaReasonFilter" type="text" placeholder="reason contains..." style="min-width: 180px" />
-          <input id="securityMetaSubjectFilter" type="text" placeholder="subject_key (exact)" style="min-width: 180px" />
+          <input id="securityMetaUsernameFilter" type="text" placeholder="用户名（精确）" style="min-width: 160px" />
+          <input id="securityMetaReasonFilter" type="text" placeholder="原因包含..." style="min-width: 180px" />
+          <input id="securityMetaSubjectFilter" type="text" placeholder="subject_key（精确）" style="min-width: 180px" />
           <select id="securityLimitFilter">
-            <option value="50">50 rows</option>
-            <option value="100" selected>100 rows</option>
-            <option value="200">200 rows</option>
+            <option value="50">50 行</option>
+            <option value="100" selected>100 行</option>
+            <option value="200">200 行</option>
           </select>
-          <button class="btn" type="button" id="securityApplyBtn">Apply</button>
-          <button class="btn secondary" type="button" id="securityExportBtn">Export CSV</button>
-          <button class="btn secondary" type="button" id="securityMoreBtn">Load older</button>
+          <button class="btn" type="button" id="securityApplyBtn">应用</button>
+          <button class="btn secondary" type="button" id="securityExportBtn">导出 CSV</button>
+          <button class="btn secondary" type="button" id="securityMoreBtn">加载更早</button>
         </div>
         <div class="error" id="securityError" style="margin-top: 8px"></div>
         <table class="table" style="margin-top:10px">
           <thead>
-            <tr><th>Time</th><th>Event</th><th>Status</th><th>Actor</th><th>IP</th><th>Metadata</th></tr>
+            <tr><th>时间</th><th>事件</th><th>状态</th><th>操作者</th><th>IP</th><th>元数据</th></tr>
           </thead>
           <tbody id="securityRows"></tbody>
         </table>
@@ -1069,7 +1091,7 @@ async function renderSecurity(container) {
     const selectedRows = selectedLockedRows();
     lockBatchUnlockBtn.disabled = locksLoading || selectedRows.length === 0;
     lockBatchUnlockBtn.textContent =
-      selectedRows.length > 0 ? `Unlock selected (${selectedRows.length})` : "Unlock selected";
+      selectedRows.length > 0 ? `解锁选中（${selectedRows.length}）` : "解锁选中";
     const totalLocked = (lockRows || []).filter((item) => Boolean(item && item.locked)).length;
     lockSelectAll.checked = totalLocked > 0 && selectedRows.length === totalLocked;
     lockSelectAll.indeterminate = selectedRows.length > 0 && selectedRows.length < totalLocked;
@@ -1090,7 +1112,7 @@ async function renderSecurity(container) {
   function requireUnlockReason() {
     const reason = normalizeReason();
     if (!reason) {
-      lockErrEl.textContent = "Please provide an unlock reason.";
+      lockErrEl.textContent = "请填写解锁原因。";
       lockReasonInput.focus();
       return null;
     }
@@ -1104,14 +1126,14 @@ async function renderSecurity(container) {
     if (reason) metaReasonInput.value = String(reason || "");
     if (mode) metaModeSelect.value = String(mode || "");
     nextBeforeTs = "";
-    moreBtn.textContent = "Load older";
+    moreBtn.textContent = "加载更早";
   }
 
   async function unlockSubject(subjectKey) {
     if (!subjectKey || locksLoading) return;
     const reason = requireUnlockReason();
     if (!reason) return;
-    if (!window.confirm("Unlock this lock subject?")) return;
+    if (!window.confirm("确定解锁该主体吗？")) return;
     lockErrEl.textContent = "";
     try {
       const result = await api.post("/api/security/login-locks/unlock", {
@@ -1119,13 +1141,13 @@ async function renderSecurity(container) {
         reason,
       });
       if (!result || !result.cleared) {
-        lockErrEl.textContent = "Subject is already unlocked.";
+        lockErrEl.textContent = "该主体已处于解锁状态。";
       }
       selectedLockKeys.delete(String(subjectKey || ""));
       focusUnlockAudits({ subjectKey, reason, mode: "single" });
       await Promise.all([loadLockSnapshot(), loadEvents({ append: false })]);
     } catch (err) {
-      lockErrEl.textContent = String((err && err.message) || "Unlock failed");
+      lockErrEl.textContent = String((err && err.message) || "解锁失败");
     }
   }
 
@@ -1136,10 +1158,10 @@ async function renderSecurity(container) {
 
     const selectedRows = selectedLockedRows();
     if (!selectedRows.length) {
-      lockErrEl.textContent = "No locked subjects selected.";
+      lockErrEl.textContent = "未选择任何锁定主体。";
       return;
     }
-    if (!window.confirm(`Unlock ${selectedRows.length} selected subjects?`)) return;
+    if (!window.confirm(`确定解锁已选择的 ${selectedRows.length} 个主体吗？`)) return;
 
     lockErrEl.textContent = "";
     try {
@@ -1150,13 +1172,13 @@ async function renderSecurity(container) {
       const result = await api.post("/api/security/login-locks/unlock-batch", payload);
       const notFound = Number((result && result.not_found) || 0);
       if (notFound > 0) {
-        lockErrEl.textContent = `${notFound} selected subjects were already unlocked.`;
+        lockErrEl.textContent = `有 ${notFound} 个选中的主体已处于解锁状态。`;
       }
       selectedLockKeys.clear();
       focusUnlockAudits({ reason, mode: "batch" });
       await Promise.all([loadLockSnapshot(), loadEvents({ append: false })]);
     } catch (err) {
-      lockErrEl.textContent = String((err && err.message) || "Batch unlock failed");
+      lockErrEl.textContent = String((err && err.message) || "批量解锁失败");
     }
   }
 
@@ -1177,16 +1199,18 @@ async function renderSecurity(container) {
       const subjectKey = String(item.subject_key || "");
       const isLocked = Boolean(item.locked);
       const checked = isLocked && selectedLockKeys.has(subjectKey);
+      const scopeLabel =
+        item.scope === "user_ip" ? "用户+IP" : item.scope === "ip" ? "IP" : String(item.scope || "");
       const row = el(`<tr>
           <td><input type="checkbox" data-action="select-lock"${checked ? " checked" : ""}${isLocked ? "" : " disabled"} /></td>
-          <td>${escapeHtml(item.scope || "")}</td>
+          <td>${escapeHtml(scopeLabel)}</td>
           <td class="code">${escapeHtml(subject)}</td>
-          <td>${isLocked ? '<span class="badge">locked</span>' : "monitoring"}</td>
+          <td>${isLocked ? '<span class="badge">锁定</span>' : "监控中"}</td>
           <td>${escapeHtml(formatRetry(item.retry_after_s || 0))}</td>
           <td>${escapeHtml(String(item.failure_count || 0))}</td>
           <td>${escapeHtml(formatDateTime(item.last_failure_at || ""))}</td>
           <td>${escapeHtml(formatDateTime(item.locked_until || ""))}</td>
-          <td><button class="btn secondary" type="button" data-action="unlock"${isLocked ? "" : " disabled"}>Unlock</button></td>
+          <td><button class="btn secondary" type="button" data-action="unlock"${isLocked ? "" : " disabled"}>解锁</button></td>
         </tr>`);
       row.querySelector('[data-action="select-lock"]').addEventListener("change", (e) => {
         const checkedNow = Boolean(e.target && e.target.checked);
@@ -1200,7 +1224,7 @@ async function renderSecurity(container) {
       lockRowsEl.appendChild(row);
     }
     pruneSelection();
-    lockEmptyEl.textContent = lockRows.length ? "" : "No lock subjects found for current filter.";
+    lockEmptyEl.textContent = lockRows.length ? "" : "当前筛选条件下未找到锁定主体。";
   }
 
   async function loadLockSnapshot() {
@@ -1230,11 +1254,11 @@ async function renderSecurity(container) {
       const activeCount = Number(snapshot && snapshot.active_lock_count) || 0;
       const subjectCount = Number(snapshot && snapshot.subject_count) || 0;
       const generatedAt = formatDateTime((snapshot && snapshot.generated_at) || "");
-      lockSummaryEl.textContent = `Active locks: ${activeCount}; tracked subjects: ${subjectCount}${generatedAt ? `; updated: ${generatedAt}` : ""}`;
+      lockSummaryEl.textContent = `当前锁定：${activeCount}；跟踪主体：${subjectCount}${generatedAt ? `；更新时间：${generatedAt}` : ""}`;
     } catch (err) {
-      const msg = String((err && err.message) || "Failed to load");
+      const msg = String((err && err.message) || "加载失败");
       if (msg.toLowerCase().includes("insufficient role")) {
-        lockErrEl.textContent = "Lock status is only available to owner role.";
+        lockErrEl.textContent = "登录锁定状态仅对 Owner 角色开放。";
       } else {
         lockErrEl.textContent = msg;
       }
@@ -1257,7 +1281,7 @@ async function renderSecurity(container) {
         </tr>`);
       tbody.appendChild(row);
     }
-    emptyEl.textContent = rows.length ? "" : "No audit events found for current filters.";
+    emptyEl.textContent = rows.length ? "" : "当前筛选条件下未找到审计事件。";
   }
 
   function buildEventParams({ append = false } = {}) {
@@ -1313,7 +1337,7 @@ async function renderSecurity(container) {
 
   function resetEventPagination() {
     nextBeforeTs = "";
-    moreBtn.textContent = "Load older";
+    moreBtn.textContent = "加载更早";
   }
 
   function applyEventPreset({
@@ -1353,7 +1377,7 @@ async function renderSecurity(container) {
     });
     if (response.status === 401) {
       window.location.hash = "#/login";
-      throw new Error("Unauthorized");
+      throw new Error("未授权");
     }
     const payloadText = await response.text();
     if (!response.ok) {
@@ -1364,7 +1388,7 @@ async function renderSecurity(container) {
       } catch {
         detail = "";
       }
-      throw new Error(detail || response.statusText || "Export failed");
+      throw new Error(detail || response.statusText || "导出失败");
     }
     triggerCsvDownload(payloadText);
   }
@@ -1380,12 +1404,12 @@ async function renderSecurity(container) {
       const lastRunAt = formatDateTime((statusInfo && statusInfo.last_run_at) || "");
       const lastPruned = Number((statusInfo && statusInfo.pruned_lines) || 0);
       retentionSummaryEl.textContent = enabled
-        ? `Retention: ${days} days${lastRunAt ? `; last run: ${lastRunAt}` : ""}${lastRunAt ? `; pruned: ${lastPruned}` : ""}`
-        : "Retention is disabled.";
+        ? `清理策略：保留 ${days} 天${lastRunAt ? `；上次运行：${lastRunAt}` : ""}${lastRunAt ? `；清理行数：${lastPruned}` : ""}`
+        : "清理策略已禁用。";
     } catch (err) {
-      const msg = String((err && err.message) || "Failed to load retention status");
+      const msg = String((err && err.message) || "加载清理状态失败");
       if (msg.toLowerCase().includes("insufficient role")) {
-        retentionSummaryEl.textContent = "Retention status is only available to owner role.";
+        retentionSummaryEl.textContent = "清理状态仅对 Owner 角色开放。";
       } else {
         retentionSummaryEl.textContent = msg;
       }
@@ -1397,7 +1421,7 @@ async function renderSecurity(container) {
 
   async function runRetentionNow() {
     if (retentionLoading) return;
-    if (!window.confirm("Run audit retention cleanup now?")) return;
+    if (!window.confirm("现在执行审计日志清理吗？")) return;
     errEl.textContent = "";
     setRetentionControlsState(true);
     try {
@@ -1406,7 +1430,7 @@ async function renderSecurity(container) {
       retentionLoading = false;
       await Promise.all([loadRetentionStatus(), loadEvents({ append: false })]);
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Run retention failed");
+      errEl.textContent = String((err && err.message) || "执行清理失败");
     } finally {
       retentionLoading = false;
       setRetentionControlsState(false);
@@ -1421,7 +1445,7 @@ async function renderSecurity(container) {
       const { params } = buildEventParams({ append: false });
       await exportEventsCsvWithParams(params);
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Export failed");
+      errEl.textContent = String((err && err.message) || "导出失败");
     } finally {
       exportBtn.disabled = false;
     }
@@ -1435,7 +1459,7 @@ async function renderSecurity(container) {
       const params = buildSessionEventParams(eventText, mode);
       await exportEventsCsvWithParams(params);
     } catch (err) {
-      errEl.textContent = String((err && err.message) || "Export failed");
+      errEl.textContent = String((err && err.message) || "导出失败");
     } finally {
       sessionExportBtn.disabled = false;
     }
@@ -1465,14 +1489,14 @@ async function renderSecurity(container) {
       const hasMore = pageRows.length >= limit && Boolean(nextBeforeTs);
       moreBtn.disabled = !hasMore;
       if (!hasMore) {
-        moreBtn.textContent = "No more data";
+        moreBtn.textContent = "没有更多数据";
       } else {
-        moreBtn.textContent = "Load older";
+        moreBtn.textContent = "加载更早";
       }
     } catch (err) {
-      const msg = String((err && err.message) || "Failed to load");
+      const msg = String((err && err.message) || "加载失败");
       if (msg.toLowerCase().includes("insufficient role")) {
-        errEl.textContent = "Security events are only available to owner role.";
+        errEl.textContent = "安全事件仅对 Owner 角色开放。";
       } else {
         errEl.textContent = msg;
       }
@@ -1520,35 +1544,35 @@ async function renderSecurity(container) {
   eventInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       nextBeforeTs = "";
-      moreBtn.textContent = "Load older";
+      moreBtn.textContent = "加载更早";
       loadEvents({ append: false }).catch(() => {});
     }
   });
   actorInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       nextBeforeTs = "";
-      moreBtn.textContent = "Load older";
+      moreBtn.textContent = "加载更早";
       loadEvents({ append: false }).catch(() => {});
     }
   });
   metaReasonInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       nextBeforeTs = "";
-      moreBtn.textContent = "Load older";
+      moreBtn.textContent = "加载更早";
       loadEvents({ append: false }).catch(() => {});
     }
   });
   metaUsernameInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       nextBeforeTs = "";
-      moreBtn.textContent = "Load older";
+      moreBtn.textContent = "加载更早";
       loadEvents({ append: false }).catch(() => {});
     }
   });
   metaSubjectInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       nextBeforeTs = "";
-      moreBtn.textContent = "Load older";
+      moreBtn.textContent = "加载更早";
       loadEvents({ append: false }).catch(() => {});
     }
   });
@@ -1586,11 +1610,11 @@ async function renderSecurity(container) {
 export async function renderSettings(container) {
   container.innerHTML = `
     <div class="tabs">
-      <div class="tab active" data-tab="providers">Providers</div>
-      <div class="tab" data-tab="channels">Channels</div>
-      <div class="tab" data-tab="beta">Beta Access</div>
-      <div class="tab" data-tab="users">Users</div>
-      <div class="tab" data-tab="security">Security</div>
+      <div class="tab active" data-tab="providers">模型服务</div>
+      <div class="tab" data-tab="channels">渠道</div>
+      <div class="tab" data-tab="beta">封闭 Beta</div>
+      <div class="tab" data-tab="users">用户</div>
+      <div class="tab" data-tab="security">安全</div>
     </div>
     <div id="settingsPanel"></div>
   `;

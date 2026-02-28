@@ -9,13 +9,21 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
+function roleLabel(role) {
+  const r = String(role || "").toLowerCase();
+  if (r === "user") return "用户";
+  if (r === "assistant") return "助手";
+  if (r === "system") return "系统";
+  return String(role || "");
+}
+
 function addMessage(listEl, role, content, timestamp) {
   const cls = role === "user" ? "user" : "assistant";
   const safe = escapeHtml(content);
   const time = formatTime(timestamp);
   const div = document.createElement("div");
   div.className = `msg ${cls}`;
-  div.innerHTML = `<div class="meta">${escapeHtml(role)} • ${escapeHtml(time)}</div><div>${safe}</div>`;
+  div.innerHTML = `<div class="meta">${escapeHtml(roleLabel(role))} • ${escapeHtml(time)}</div><div>${safe}</div>`;
   listEl.appendChild(div);
   listEl.scrollTop = listEl.scrollHeight;
 }
@@ -25,20 +33,20 @@ export async function renderChat(container) {
     <div class="panel">
       <div class="row" style="justify-content: space-between">
         <div>
-          <h2 style="margin: 0">Chat</h2>
-          <div class="muted">Session: <span id="sessionId">connecting...</span></div>
+          <h2 style="margin: 0">对话</h2>
+          <div class="muted">会话：<span id="sessionId">连接中...</span></div>
         </div>
-        <div class="muted" id="wsStatus">disconnected</div>
+        <div class="muted" id="wsStatus">未连接</div>
       </div>
       <div id="chatNotice" class="notice hidden" style="margin-top: 12px"></div>
       <div id="messages" style="height: 55vh; overflow: auto; margin-top: 12px;"></div>
       <div class="row" style="margin-top: 12px; align-items: flex-end">
         <div class="col">
-          <label>Message</label>
-          <textarea id="chatInput" placeholder="Type a message..."></textarea>
+          <label>消息</label>
+          <textarea id="chatInput" placeholder="输入消息..."></textarea>
         </div>
         <div>
-          <button id="sendBtn" class="btn" type="button">Send</button>
+          <button id="sendBtn" class="btn" type="button">发送</button>
         </div>
       </div>
       <div id="chatError" class="error" style="margin-top: 10px"></div>
@@ -73,18 +81,18 @@ export async function renderChat(container) {
   function connect() {
     errEl.textContent = "";
     ws = new WebSocket(wsUrl("/ws/chat", { token }));
-    setStatus("connecting");
+    setStatus("连接中");
 
     ws.onopen = () => {
-      setStatus("connected");
+      setStatus("已连接");
     };
 
     ws.onclose = () => {
-      setStatus("disconnected");
+      setStatus("未连接");
     };
 
     ws.onerror = () => {
-      errEl.textContent = "WebSocket error";
+      errEl.textContent = "WebSocket 错误";
     };
 
     ws.onmessage = async (ev) => {
@@ -99,7 +107,7 @@ export async function renderChat(container) {
           return;
         }
         if (data && data.type === "error") {
-          const msg = String(data.detail || data.error || "Chat unavailable");
+          const msg = String(data.detail || data.error || "对话不可用");
           errEl.textContent = msg;
           addMessage(listEl, "assistant", msg, Date.now());
           return;
@@ -116,7 +124,7 @@ export async function renderChat(container) {
     const text = (inputEl.value || "").trim();
     if (!text) return;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      errEl.textContent = "Not connected";
+      errEl.textContent = "未连接";
       return;
     }
     ws.send(text);
@@ -142,7 +150,7 @@ export async function renderChat(container) {
 
       const model = String((cfg && cfg.model) || "");
       const modelHtml = model
-        ? `<div class="muted" style="margin-top: 4px">Current model: ${escapeHtml(model)}</div>`
+        ? `<div class="muted" style="margin-top: 4px">当前模型：${escapeHtml(model)}</div>`
         : "";
 
       noticeEl.classList.remove("hidden");
@@ -150,11 +158,11 @@ export async function renderChat(container) {
       noticeEl.innerHTML = `
         <div class="row" style="justify-content: space-between; gap: 12px">
           <div>
-            <div style="font-weight: 700">Provider not configured</div>
-            <div class="muted">Add an API key in Settings → Providers to enable chat responses.</div>
+            <div style="font-weight: 700">未配置模型服务</div>
+            <div class="muted">请在 设置 → 模型服务 中填写 API Key 以启用回复。</div>
             ${modelHtml}
           </div>
-          <button id="chatGoSettingsBtn" class="btn secondary" type="button">Open Settings</button>
+          <button id="chatGoSettingsBtn" class="btn secondary" type="button">打开设置</button>
         </div>
       `;
       const btn = noticeEl.querySelector("#chatGoSettingsBtn");

@@ -48,17 +48,25 @@ function formatPercent(value) {
   return `${(n * 100).toFixed(1)}%`;
 }
 
+function statusLabel(value) {
+  const v = String(value || "").toLowerCase();
+  if (v === "ready") return "正常";
+  if (v === "degraded") return "异常";
+  if (v === "unknown") return "未知";
+  return String(value || "") || "未知";
+}
+
 export async function renderOps(container) {
   const wrap = el(`
     <div class="panel">
       <div class="row" style="justify-content: space-between">
         <div>
-          <h2 style="margin:0">Ops</h2>
-          <div class="muted">Runtime snapshot for debugging and support.</div>
+          <h2 style="margin:0">运维</h2>
+          <div class="muted">运行时快照，用于排查问题与支持。</div>
         </div>
         <div class="row" style="gap: 8px">
-          <button id="opsRefreshBtn" class="btn secondary" type="button">Refresh</button>
-          <button id="opsCopyBtn" class="btn secondary" type="button">Copy JSON</button>
+          <button id="opsRefreshBtn" class="btn secondary" type="button">刷新</button>
+          <button id="opsCopyBtn" class="btn secondary" type="button">复制 JSON</button>
         </div>
       </div>
       <div id="opsBody" style="margin-top: 12px"></div>
@@ -76,13 +84,13 @@ export async function renderOps(container) {
   function setCopyButtonState(text) {
     copyBtn.textContent = text;
     setTimeout(() => {
-      copyBtn.textContent = "Copy JSON";
+      copyBtn.textContent = "复制 JSON";
     }, 1200);
   }
 
   async function load() {
     errEl.textContent = "";
-    bodyEl.innerHTML = `<div class="muted">Loading...</div>`;
+    bodyEl.innerHTML = `<div class="muted">加载中...</div>`;
 
     try {
       const data = await api.get("/api/ops/runtime");
@@ -102,53 +110,53 @@ export async function renderOps(container) {
         ? `<ul style="margin: 10px 0 0 18px">${warnings
             .map((w) => `<li>${escapeHtml(w)}</li>`)
             .join("")}</ul>`
-        : `<div class="muted" style="margin-top: 8px">No warnings</div>`;
+        : `<div class="muted" style="margin-top: 8px">暂无告警</div>`;
 
       bodyEl.innerHTML = `
         <div class="notice ${escapeHtml(noticeClass)}">
-          <div style="font-weight: 700">${escapeHtml(status || "unknown")} ${escapeHtml(version)}</div>
+          <div style="font-weight: 700">${escapeHtml(statusLabel(status))} ${escapeHtml(version)}</div>
           ${warningsHtml}
         </div>
 
         <div class="grid" style="margin-top: 12px">
           <div class="panel">
-            <h3 style="margin-top: 0">Uptime</h3>
-            <div class="muted">Started at: ${escapeHtml(formatTime(runtime.started_at || ""))}</div>
-            <div class="muted">Uptime seconds: ${escapeHtml(String(runtime.uptime_seconds ?? ""))}</div>
+            <h3 style="margin-top: 0">运行时间</h3>
+            <div class="muted">启动时间：${escapeHtml(formatTime(runtime.started_at || ""))}</div>
+            <div class="muted">运行时长（秒）：${escapeHtml(String(runtime.uptime_seconds ?? ""))}</div>
           </div>
 
           <div class="panel">
-            <h3 style="margin-top: 0">Queue</h3>
-            <div class="muted">Inbound: ${escapeHtml(String(queue.inbound_depth ?? 0))} / ${escapeHtml(
+            <h3 style="margin-top: 0">队列</h3>
+            <div class="muted">入站：${escapeHtml(String(queue.inbound_depth ?? 0))} / ${escapeHtml(
               String(queue.inbound_capacity ?? 0)
             )} (${escapeHtml(formatPercent(queue.inbound_utilization))})</div>
-            <div class="muted">Outbound: ${escapeHtml(String(queue.outbound_depth ?? 0))} / ${escapeHtml(
+            <div class="muted">出站：${escapeHtml(String(queue.outbound_depth ?? 0))} / ${escapeHtml(
               String(queue.outbound_capacity ?? 0)
             )} (${escapeHtml(formatPercent(queue.outbound_utilization))})</div>
           </div>
 
           <div class="panel">
-            <h3 style="margin-top: 0">Channels</h3>
-            <div class="muted">Registered: ${escapeHtml(registered.join(", ") || "(none)")}</div>
-            <div class="muted">Active web connections: ${escapeHtml(
+            <h3 style="margin-top: 0">渠道</h3>
+            <div class="muted">已注册：${escapeHtml(registered.join(", ") || "（无）")}</div>
+            <div class="muted">活跃 Web 连接：${escapeHtml(
               String(channels.active_web_connections ?? 0)
             )}</div>
-            <div class="muted" style="margin-top: 8px">Status:</div>
+            <div class="muted" style="margin-top: 8px">状态：</div>
             <pre class="code" style="margin-top: 6px">${escapeHtml(
               JSON.stringify(channelStatus, null, 2)
             )}</pre>
           </div>
 
           <div class="panel">
-            <h3 style="margin-top: 0">Raw JSON</h3>
+            <h3 style="margin-top: 0">原始 JSON</h3>
             <pre class="code" style="margin-top: 6px">${escapeHtml(lastJson)}</pre>
           </div>
         </div>
       `;
     } catch (err) {
-      const msg = String((err && err.message) || err || "Failed to load");
+      const msg = String((err && err.message) || err || "加载失败");
       if (msg.toLowerCase().includes("insufficient role")) {
-        errEl.textContent = "Ops dashboard is only available to owner role.";
+        errEl.textContent = "运维页面仅对 Owner 角色开放。";
       } else {
         errEl.textContent = msg;
       }
@@ -163,7 +171,7 @@ export async function renderOps(container) {
 
   copyBtn.addEventListener("click", async () => {
     const ok = await copyTextToClipboard(lastJson || "");
-    setCopyButtonState(ok ? "Copied" : "Copy failed");
+    setCopyButtonState(ok ? "已复制" : "复制失败");
   });
 
   container.innerHTML = "";
@@ -172,4 +180,3 @@ export async function renderOps(container) {
 
   return () => {};
 }
-

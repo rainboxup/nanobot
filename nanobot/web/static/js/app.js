@@ -75,7 +75,7 @@ async function refreshGlobalReadyNotice() {
     payload = data || {};
     degraded = !res.ok || String(payload.status || "") !== "ready";
   } catch (e) {
-    fetchError = String((e && e.message) || e || "Failed to load readiness");
+    fetchError = String((e && e.message) || e || "无法获取服务就绪状态");
     degraded = true;
   }
 
@@ -87,7 +87,7 @@ async function refreshGlobalReadyNotice() {
   globalNoticeEl.className = "notice";
   globalNoticeEl.classList.add(degraded ? "warn" : "ok");
 
-  const title = degraded ? "Service degraded" : "Service ready";
+  const title = degraded ? "服务异常" : "服务正常";
   const version = payload && payload.version ? `v${payload.version}` : "";
   const diag = {
     at: new Date().toISOString(),
@@ -111,8 +111,8 @@ async function refreshGlobalReadyNotice() {
         ${errorHtml}
       </div>
       <div class="row" style="gap: 8px">
-        <button id="readyRefreshBtn" class="btn secondary" type="button">Refresh</button>
-        <button id="readyCopyBtn" class="btn secondary" type="button">Copy diagnostics</button>
+        <button id="readyRefreshBtn" class="btn secondary" type="button">刷新</button>
+        <button id="readyCopyBtn" class="btn secondary" type="button">复制诊断信息</button>
       </div>
     </div>
     ${warningsHtml}
@@ -125,9 +125,9 @@ async function refreshGlobalReadyNotice() {
   });
   copyBtn.addEventListener("click", async () => {
     const ok = await copyTextToClipboard(diagText);
-    copyBtn.textContent = ok ? "Copied" : "Copy failed";
+    copyBtn.textContent = ok ? "已复制" : "复制失败";
     setTimeout(() => {
-      copyBtn.textContent = "Copy diagnostics";
+      copyBtn.textContent = "复制诊断信息";
     }, 1200);
   });
 }

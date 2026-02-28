@@ -60,7 +60,9 @@ async def test_web_index_degrades_to_503_html_when_dashboard_assets_unavailable(
     assert response.status_code == 503
     assert "text/html" in str(response.headers.get("content-type") or "").lower()
     body = response.text.lower()
-    assert "dashboard unavailable" in body
+    # HTML fallback is localized; assert stable signals only.
+    assert "<!doctype html" in body
+    assert "nanobot" in body
     assert "dashboard assets missing for test" in body
 
 

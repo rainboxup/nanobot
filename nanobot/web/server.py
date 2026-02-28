@@ -91,13 +91,13 @@ def _build_dashboard_unavailable_html(reason: str) -> str:
     safe_reason = str(reason or "dashboard assets missing")
     return (
         "<!doctype html>"
-        "<html lang='en'>"
-        "<head><meta charset='utf-8'><title>nanobot dashboard unavailable</title></head>"
+        "<html lang='zh-CN'>"
+        "<head><meta charset='utf-8'><title>nanobot 控制台不可用</title></head>"
         "<body style='font-family: sans-serif; margin: 24px'>"
-        "<h2>nanobot dashboard unavailable</h2>"
-        "<p>Web service is running, but dashboard assets are unavailable.</p>"
+        "<h2>nanobot 控制台不可用</h2>"
+        "<p>Web 服务已启动，但控制台静态资源不可用。</p>"
         f"<pre>{safe_reason}</pre>"
-        "<p>Check deployment package and static file paths.</p>"
+        "<p>请检查部署包以及静态文件路径是否正确。</p>"
         "</body></html>"
     )
 

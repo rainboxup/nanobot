@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 
 def iter_shell_scripts(repo_root: Path) -> list[Path]:

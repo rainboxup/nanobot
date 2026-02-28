@@ -21,6 +21,7 @@ class Session:
 
     key: str  # channel:chat_id
     messages: list[dict[str, Any]] = field(default_factory=list)
+    last_consolidated: int = 0
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -52,6 +53,7 @@ class Session:
     def clear(self) -> None:
         """Clear all messages in the session."""
         self.messages = []
+        self.last_consolidated = 0
         self.updated_at = datetime.now()
 
 
@@ -105,6 +107,8 @@ class SessionManager:
             messages = []
             metadata = {}
             created_at = None
+            updated_at = None
+            last_consolidated = 0
 
             with open(path) as f:
                 for line in f:
@@ -121,13 +125,24 @@ class SessionManager:
                             if data.get("created_at")
                             else None
                         )
+                        updated_at = (
+                            datetime.fromisoformat(data["updated_at"])
+                            if data.get("updated_at")
+                            else None
+                        )
+                        try:
+                            last_consolidated = int(data.get("last_consolidated", 0))
+                        except Exception:
+                            last_consolidated = 0
                     else:
                         messages.append(data)
 
             return Session(
                 key=key,
                 messages=messages,
+                last_consolidated=last_consolidated,
                 created_at=created_at or datetime.now(),
+                updated_at=updated_at or datetime.now(),
                 metadata=metadata,
             )
         except Exception as e:
@@ -144,6 +159,7 @@ class SessionManager:
                 "_type": "metadata",
                 "created_at": session.created_at.isoformat(),
                 "updated_at": session.updated_at.isoformat(),
+                "last_consolidated": int(session.last_consolidated),
                 "metadata": session.metadata,
             }
             f.write(json.dumps(metadata_line) + "\n")

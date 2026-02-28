@@ -19,6 +19,8 @@ def test_safe_extract_tar_blocks_links_and_traversal(tmp_path: Path) -> None:
         _add_file(tf, "ok.txt", b"ok\n")
         _add_file(tf, "../evil.txt", b"no\n")
         _add_file(tf, "/abs.txt", b"no\n")
+        _add_file(tf, "\\abs-win.txt", b"no\n")
+        _add_file(tf, "C:evil.txt", b"no\n")
 
         # Symlink entry should be skipped.
         link = tarfile.TarInfo(name="link.csv")
@@ -32,5 +34,7 @@ def test_safe_extract_tar_blocks_links_and_traversal(tmp_path: Path) -> None:
     assert (out_dir / "ok.txt").exists()
     assert not (out_dir / "evil.txt").exists()
     assert not (out_dir / "abs.txt").exists()
+    assert not (out_dir / "abs-win.txt").exists()
+    assert not (out_dir / "C:evil.txt").exists()
     assert not (out_dir / "link.csv").exists()
-    assert skipped >= 3
+    assert skipped >= 5

@@ -28,3 +28,4 @@ bridge/node_modules/
 _bmad/
 _bmad-output/
 .spec-workflow/
+.workflow/

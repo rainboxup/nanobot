@@ -7,7 +7,7 @@ import shutil
 import stat
 import tarfile
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from nanobot.agent.tools.base import Tool
@@ -426,6 +426,8 @@ class ExecTool(Tool):
                 name = (m.name or "").lstrip()
                 if not name or name == ".":
                     continue
+                # Normalize separators to avoid OS-specific bypasses (e.g. "\\abs.txt" on Windows).
+                name = name.replace("\\", "/")
                 # Normalize common tar prefixes.
                 if name.startswith("./"):
                     name = name[2:]
@@ -433,10 +435,16 @@ class ExecTool(Tool):
                     continue
 
                 # Path traversal / absolute paths are forbidden.
-                p = Path(name)
-                if p.is_absolute() or ".." in p.parts:
+                p = PurePosixPath(name)
+                if p.is_absolute() or name.startswith("/") or ".." in p.parts:
                     skipped += 1
                     continue
+                # Windows drive-relative paths like "C:foo" are not absolute but escape out_dir when joined.
+                if ":" in name[1:]:
+                    skipped += 1
+                    continue
+
+                rel_path = Path(*p.parts)
 
                 # Disallow links and non-regular files.
                 if m.issym() or m.islnk():
@@ -447,7 +455,7 @@ class ExecTool(Tool):
                     continue
 
                 if m.isdir():
-                    (out_dir / p).mkdir(parents=True, exist_ok=True)
+                    (out_dir / rel_path).mkdir(parents=True, exist_ok=True)
                     continue
 
                 # Regular file: extract bytes via extractfile (no implicit chmod/chown).
@@ -455,7 +463,7 @@ class ExecTool(Tool):
                 if src is None:
                     skipped += 1
                     continue
-                dst = out_dir / p
+                dst = out_dir / rel_path
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 with open(dst, "wb") as f:
                     shutil.copyfileobj(src, f, length=1024 * 1024)

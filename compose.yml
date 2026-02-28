@@ -7,7 +7,7 @@ services:
       dockerfile: Dockerfile
     image: rainboxup/nanobot:saas-main
     container_name: nanobot-gateway
-    command: ["gateway"]
+    command: ["gateway", "--multi-tenant", "--enable-web"]
     restart: unless-stopped
     init: true
 
@@ -19,6 +19,13 @@ services:
       NANOBOT_PROFILE: "${NANOBOT_PROFILE:-small}"
       NANOBOT_GATEWAY__HOST: "0.0.0.0"
       NANOBOT_GATEWAY__PORT: "18790"
+      # Required for web login + stable sessions (set in .env or your panel secrets UI).
+      NANOBOT_ADMIN_PASSWORD: "${NANOBOT_ADMIN_PASSWORD:?set NANOBOT_ADMIN_PASSWORD}"
+      NANOBOT_JWT_SECRET: "${NANOBOT_JWT_SECRET:?set NANOBOT_JWT_SECRET}"
+      # Closed beta mode (recommended for SaaS). Allowlist is seeded from env at startup.
+      NANOBOT_WEB_CLOSED_BETA: "${NANOBOT_WEB_CLOSED_BETA:-1}"
+      NANOBOT_WEB_ALLOWED_USERS: "${NANOBOT_WEB_ALLOWED_USERS:-admin}"
+      NANOBOT_WEB_AUDIT_ENABLED: "${NANOBOT_WEB_AUDIT_ENABLED:-1}"
       NANOBOT_TRAFFIC__INBOUND_QUEUE_SIZE: "${NANOBOT_TRAFFIC__INBOUND_QUEUE_SIZE:-50}"
       NANOBOT_TRAFFIC__OUTBOUND_QUEUE_SIZE: "${NANOBOT_TRAFFIC__OUTBOUND_QUEUE_SIZE:-50}"
       NANOBOT_TRAFFIC__TENANT_BURST_LIMIT: "${NANOBOT_TRAFFIC__TENANT_BURST_LIMIT:-5}"
@@ -26,6 +33,13 @@ services:
       # Keep host mode as default for compatibility. Switch to docker when
       # /var/run/docker.sock and docker CLI are mounted and validated.
       NANOBOT_TOOLS__EXEC__MODE: "${NANOBOT_TOOLS__EXEC__MODE:-host}"
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:18790/api/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
     volumes:
       - "${NANOBOT_DATA_DIR:-/opt/nanobot/data}:/root/.nanobot"

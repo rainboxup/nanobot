@@ -951,6 +951,22 @@ docker compose logs -f nanobot-gateway                   # view logs
 docker compose down                                      # stop
 ```
 
+### Web Dashboard (Closed Beta / SaaS)
+
+Start the gateway with the web dashboard enabled:
+
+```bash
+nanobot gateway --enable-web
+```
+
+For closed beta multi-tenant deployment (recommended for SaaS), use `compose.yml`:
+
+```bash
+cp .env.example .env
+docker compose -f compose.yml up -d --build
+python scripts/smoke_web.py --base-url http://127.0.0.1:${NANOBOT_PORT:-18790}
+```
+
 ### Docker
 
 ```bash

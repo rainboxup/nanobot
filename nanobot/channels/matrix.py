@@ -12,10 +12,21 @@ try:
     import nh3
     from mistune import create_markdown
     from nio import (
-        AsyncClient, AsyncClientConfig, ContentRepositoryConfigError,
-        DownloadError, InviteEvent, JoinError, MatrixRoom, MemoryDownloadResponse,
-        RoomEncryptedMedia, RoomMessage, RoomMessageMedia, RoomMessageText,
-        RoomSendError, RoomTypingError, SyncError, UploadError,
+        AsyncClient,
+        AsyncClientConfig,
+        DownloadError,
+        InviteEvent,
+        JoinError,
+        MatrixRoom,
+        MemoryDownloadResponse,
+        RoomEncryptedMedia,
+        RoomMessage,
+        RoomMessageMedia,
+        RoomMessageText,
+        RoomSendError,
+        RoomTypingError,
+        SyncError,
+        UploadError,
     )
     from nio.crypto.attachments import decrypt_attachment
     from nio.exceptions import EncryptionError
@@ -350,7 +361,11 @@ class MatrixChannel(BaseChannel):
                 limit_bytes = await self._effective_media_limit_bytes()
                 for path in candidates:
                     if fail := await self._upload_and_send_attachment(
-                        msg.chat_id, path, limit_bytes, relates_to):
+                        room_id=msg.chat_id,
+                        path=path,
+                        limit_bytes=limit_bytes,
+                        relates_to=relates_to,
+                    ):
                         failures.append(fail)
             if failures:
                 text = f"{text.rstrip()}\n{chr(10).join(failures)}" if text.strip() else "\n".join(failures)
@@ -669,8 +684,7 @@ class MatrixChannel(BaseChannel):
         await self._start_typing_keepalive(room.room_id)
         try:
             meta = self._base_metadata(room, event)
-            if attachment:
-                meta["attachments"] = [attachment]
+            meta["attachments"] = [attachment] if attachment else []
             await self._handle_message(
                 sender_id=event.sender, chat_id=room.room_id,
                 content="\n".join(parts),

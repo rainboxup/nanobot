@@ -77,7 +77,8 @@ jobs:
             fi
 
             compose_file=""
-            for candidate in docker-compose.yml compose.yml compose.yaml; do
+            # Prefer production compose.yml (SaaS) over local-dev docker-compose.yml.
+            for candidate in compose.yml compose.yaml docker-compose.yml docker-compose.yaml; do
               if [ -f "$candidate" ]; then
                 compose_file="$candidate"
                 break

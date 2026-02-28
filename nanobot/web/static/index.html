@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>nanobot Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">nanobot</div>
+      <nav id="nav" class="nav hidden">
+        <a href="#/chat" data-route="#/chat">Chat</a>
+        <a href="#/settings" data-route="#/settings">Settings</a>
+        <a href="#/skills" data-route="#/skills">Skills</a>
+        <a href="#/ops" data-route="#/ops">Ops</a>
+        <button id="logoutBtn" class="linklike" type="button">Logout</button>
+      </nav>
+    </header>
+
+    <div id="globalNoticeWrap" class="app hidden">
+      <div id="globalNotice" class="notice"></div>
+    </div>
+
+    <main id="app" class="app"></main>
+
+    <script type="module" src="/static/js/app.js"></script>
+  </body>
+</html>
+

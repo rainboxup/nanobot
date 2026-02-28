@@ -1,5 +1,7 @@
 """Heartbeat service - periodic agent wake-up to check for tasks."""
 
+from __future__ import annotations
+
 import asyncio
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -65,7 +67,7 @@ class HeartbeatService:
         """Read HEARTBEAT.md content."""
         if self.heartbeat_file.exists():
             try:
-                return self.heartbeat_file.read_text()
+                return self.heartbeat_file.read_text(encoding="utf-8")
             except Exception:
                 return None
         return None
@@ -76,9 +78,13 @@ class HeartbeatService:
             logger.info("Heartbeat disabled")
             return
 
+        if self._running and self._task and not self._task.done():
+            logger.debug("Heartbeat already running")
+            return
+
         self._running = True
         self._task = asyncio.create_task(self._run_loop())
-        logger.info(f"Heartbeat started (every {self.interval_s}s)")
+        logger.info("Heartbeat started (every {}s)", self.interval_s)
 
     def stop(self) -> None:
         """Stop the heartbeat service."""
@@ -97,7 +103,7 @@ class HeartbeatService:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
+                logger.error("Heartbeat error: {}", e)
 
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
@@ -121,7 +127,7 @@ class HeartbeatService:
                     logger.info("Heartbeat: completed task")
 
             except Exception as e:
-                logger.error(f"Heartbeat execution failed: {e}")
+                logger.error("Heartbeat execution failed: {}", e)
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""

@@ -150,12 +150,12 @@ class ChannelManager:
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
+        # Start outbound dispatcher
+        self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
+
         if not self.channels:
             logger.warning("No channels enabled")
             return
-
-        # Start outbound dispatcher
-        self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
 
         # Start channels
         tasks = []
@@ -242,6 +242,14 @@ class ChannelManager:
     def get_channel(self, name: str) -> BaseChannel | None:
         """Get a channel by name."""
         return self.channels.get(name)
+
+    def register_channel(self, name: str, channel: BaseChannel) -> None:
+        """Register (or replace) a channel instance by name.
+
+        This is used by the web layer to inject WebChannel without coupling it to
+        the core channel initialization flow.
+        """
+        self.channels[name] = channel
 
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""

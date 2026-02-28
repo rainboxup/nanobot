@@ -3,9 +3,9 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Base(BaseModel):
@@ -271,16 +271,48 @@ class WebSearchConfig(Base):
     max_results: int = 5
 
 
+class WebFetchConfig(Base):
+    """Web fetch tool configuration."""
+
+    allow_private_network: bool = False
+    max_chars: int = 50_000
+    max_download_bytes: int = 2_000_000
+    timeout_s: float = 30.0
+    max_redirects: int = 5
+
+
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
+    fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
+
+
+class FilesystemToolConfig(Base):
+    """Filesystem tools configuration (limits to reduce DoS risk)."""
+
+    max_read_bytes: int = 200_000
+    max_write_bytes: int = 200_000
+    max_edit_bytes: int = 500_000
+    workspace_quota_mib: int = 50  # 0 disables quota enforcement
+    max_list_entries: int = 200
 
 
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
     timeout: int = 60
+    mode: Literal["host", "docker"] = "host"
+    docker_image: str = "python:3.11-slim"
+    docker_runtime: str | None = "runsc"  # Preferred runtime for docker mode
+    require_runtime: bool = False  # If true, do not fallback when docker_runtime is unavailable
+    cpu: float = 0.5
+    memory_mib: int = 384
+    pids_limit: int = 128
+    output_limit: int = 10_000  # chars (best-effort)
+    whitelist: list[str] = Field(
+        default_factory=list
+    )  # tenant_id / "channel:sender_id" / sender_id
     path_append: str = ""
 
 
@@ -299,9 +331,32 @@ class ToolsConfig(Base):
     """Tools configuration."""
 
     web: WebToolsConfig = Field(default_factory=WebToolsConfig)
+    filesystem: FilesystemToolConfig = Field(default_factory=FilesystemToolConfig)
     exec: ExecToolConfig = Field(default_factory=ExecToolConfig)
     restrict_to_workspace: bool = False  # If true, restrict all tool access to workspace directory
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
+
+
+class TrafficConfig(Base):
+    """Traffic control configuration for queueing and worker concurrency."""
+
+    inbound_queue_size: int = Field(default=100, ge=1)
+    outbound_queue_size: int = Field(default=100, ge=1)
+    tenant_burst_limit: int = Field(default=5, ge=1)
+    worker_concurrency: int = Field(default=4, ge=1)
+    max_total_tenants: int = Field(default=5000, ge=1)
+    new_tenants_per_window: int = Field(default=20, ge=1)
+    new_tenant_window_seconds: int = Field(default=60, ge=1)
+    runtime_cache_ttl_seconds: int = Field(default=1800, ge=60)
+    tenant_lock_ttl_seconds: int = Field(default=3600, ge=60)
+    max_cached_tenant_runtimes: int = Field(default=256, ge=1)
+    link_attempt_window_seconds: int = Field(default=60, ge=1)
+    link_max_attempts_per_window: int = Field(default=5, ge=1)
+    link_failures_before_cooldown: int = Field(default=5, ge=1)
+    link_cooldown_seconds: int = Field(default=300, ge=1)
+    link_state_ttl_seconds: int = Field(default=3600, ge=60)
+    link_state_max_entries: int = Field(default=20000, ge=100)
+    link_state_gc_every_calls: int = Field(default=64, ge=1)
 
 
 class Config(BaseSettings):
@@ -312,6 +367,7 @@ class Config(BaseSettings):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
+    traffic: TrafficConfig = Field(default_factory=TrafficConfig)
 
     @property
     def workspace_path(self) -> Path:
@@ -391,4 +447,16 @@ class Config(BaseSettings):
                 return spec.default_api_base
         return None
 
-    model_config = ConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls,
+        init_settings,
+        env_settings,
+        dotenv_settings,
+        file_secret_settings,
+    ):
+        # Keep env vars authoritative over file/init values.
+        return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    model_config = SettingsConfigDict(env_prefix="NANOBOT_", env_nested_delimiter="__")

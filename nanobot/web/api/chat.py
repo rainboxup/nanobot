@@ -40,9 +40,33 @@ def _session_prefix(claims: dict[str, Any]) -> str:
     return f"web:{tenant_id_from_claims(claims)}:"
 
 
+def _extract_ws_token(ws: WebSocket) -> tuple[str, str | None]:
+    token = str(ws.query_params.get("token") or "").strip()
+    if token:
+        return token, None
+
+    header = str(ws.headers.get("sec-websocket-protocol") or "")
+    if not header:
+        return "", None
+
+    # Browser clients can't set custom headers on WebSocket requests. As a safer alternative to putting
+    # the JWT in the URL query string, clients may pass it as one of the offered subprotocol values:
+    # `new WebSocket(url, ["nanobot", "<jwt>"])`.
+    #
+    # We accept "nanobot" as the negotiated subprotocol and read the JWT from the offered list.
+    offered = [item.strip() for item in header.split(",") if item.strip()]
+    jwt = ""
+    for item in offered:
+        if item.startswith("eyJ") and item.count(".") >= 2:
+            jwt = item
+            break
+    negotiated = "nanobot" if "nanobot" in offered else None
+    return jwt, negotiated
+
+
 @router.websocket("/ws/chat")
 async def ws_chat(ws: WebSocket) -> None:
-    token = (ws.query_params.get("token") or "").strip()
+    token, negotiated_subprotocol = _extract_ws_token(ws)
     secret = getattr(ws.app.state, "jwt_secret", None)
     if not token or not secret:
         await ws.close(code=1008)
@@ -57,7 +81,7 @@ async def ws_chat(ws: WebSocket) -> None:
     user = tenant_id_from_claims(claims)
     session_id = f"{_session_prefix(claims)}{uuid.uuid4().hex[:8]}"
 
-    await ws.accept()
+    await ws.accept(subprotocol=negotiated_subprotocol)
 
     web_channel = getattr(ws.app.state, "web_channel", None)
     if web_channel is None:

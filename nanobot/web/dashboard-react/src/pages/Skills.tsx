@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react"
-import { Code2, Copy, Download, ExternalLink, HardDrive, Puzzle, Search, Server } from "lucide-react"
+import { Code2, Copy, Download, ExternalLink, HardDrive, Puzzle, Search, Server, Trash2 } from "lucide-react"
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter"
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism"
 
@@ -61,6 +61,16 @@ function groupByCategory<T extends { category?: string }>(items: T[]): Array<{ c
     .sort((a, b) => a.category.localeCompare(b.category, "zh-CN"))
 }
 
+const INSTALL_CENTER_CARD_CLASS =
+  "flex h-full flex-col border border-border/60 transition-all hover:border-primary/50 hover:shadow-md"
+const INSTALL_CENTER_FOOTER_CLASS = "mt-auto flex items-center justify-between gap-2 border-t pt-3"
+
+function normalizeSkillSource(source?: string): string {
+  const value = String(source || "").trim().toLowerCase()
+  if (value === "workspace" || value === "builtin" || value === "store") return value
+  return value || "-"
+}
+
 export function Skills() {
   const { addToast } = useStore()
 
@@ -72,7 +82,7 @@ export function Skills() {
   const [error, setError] = useState("")
   const [searchQuery, setSearchQuery] = useState("")
   const [installTarget, setInstallTarget] = useState<"skill" | "mcp">("skill")
-  const [installingKey, setInstallingKey] = useState("")
+  const [mutatingKey, setMutatingKey] = useState("")
   const [expandedGroups, setExpandedGroups] = useState<Record<string, boolean>>({})
   const [selectedSkill, setSelectedSkill] = useState<SkillDetail | null>(null)
   const [detailLoading, setDetailLoading] = useState(false)
@@ -80,7 +90,7 @@ export function Skills() {
     typeof window === "undefined" ? 1280 : window.innerWidth
   )
   const detailRequestIdRef = useRef(0)
-  const installInFlightRef = useRef(false)
+  const mutationInFlightRef = useRef(false)
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth)
@@ -91,10 +101,8 @@ export function Skills() {
   }, [])
 
   const collapsedCardCount = useMemo(() => {
-    if (viewportWidth >= 1280) return 8
-    if (viewportWidth >= 1024) return 6
-    if (viewportWidth >= 640) return 4
-    return 2
+    const columns = viewportWidth >= 1280 ? 4 : viewportWidth >= 1024 ? 3 : viewportWidth >= 640 ? 2 : 1
+    return columns * 2
   }, [viewportWidth])
 
   useEffect(() => {
@@ -222,6 +230,38 @@ export function Skills() {
 
   const isGroupExpanded = (key: string) => Boolean(expandedGroups[key])
 
+  const getErrorMessage = (err: unknown, fallback: string) =>
+    err instanceof ApiError ? err.detail : String((err as any)?.message || fallback)
+
+  const notifyRefreshFailed = (err: unknown) => {
+    const detail = err instanceof ApiError ? err.detail : String((err as any)?.message || "")
+    addToast({
+      type: "warning",
+      message: detail ? `操作已成功，刷新失败：${detail}` : "操作已成功，刷新失败",
+    })
+  }
+
+  const markSkillInstalledLocally = (name: string, installed: boolean) => {
+    setSkillCatalog((prev) => prev.map((item) => (item.name === name ? { ...item, installed } : item)))
+    if (!installed) {
+      setSkills((prev) => prev.filter((item) => item.name !== name))
+      setSelectedSkill((prev) => (prev?.name === name ? null : prev))
+    }
+  }
+
+  const markMcpPresetInstalledLocally = (presetId: string, installed: boolean) => {
+    setMcpCatalog((prev) => prev.map((item) => (item.id === presetId ? { ...item, installed } : item)))
+  }
+
+  const removeMcpServerLocally = (serverName: string) => {
+    setMcpServers((prev) => prev.filter((server) => server.name !== serverName))
+    setMcpCatalog((prev) =>
+      prev.map((item) =>
+        item.id === serverName || item.name === serverName ? { ...item, installed: false } : item
+      )
+    )
+  }
+
   async function reloadInstalledSkillsAndCatalog() {
     const [installedList, catalogList] = await Promise.all([
       api.get<SkillListItem[]>("/api/skills"),
@@ -241,60 +281,114 @@ export function Skills() {
   }
 
   async function installSkill(name: string) {
-    const key = `skill:${name}`
-    if (installInFlightRef.current) return
-    installInFlightRef.current = true
-    setInstallingKey(key)
-    let installed = false
+    const key = `skill:install:${name}`
+    if (mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
+    setMutatingKey(key)
+    let succeeded = false
     try {
       await api.post("/api/skills/install", { name })
-      installed = true
+      succeeded = true
+      markSkillInstalledLocally(name, true)
       addToast({ type: "success", message: `已安装 Skill：${name}` })
     } catch (err) {
-      const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "安装失败")
+      const msg = getErrorMessage(err, "安装失败")
       addToast({ type: "error", message: msg })
       return
     } finally {
-      setInstallingKey("")
-      installInFlightRef.current = false
+      setMutatingKey("")
+      mutationInFlightRef.current = false
     }
 
-    if (installed) {
-      try {
-        await reloadInstalledSkillsAndCatalog()
-      } catch (err) {
-        const msg = err instanceof ApiError ? err.detail : "安装已完成，但刷新列表失败"
-        addToast({ type: "warning", message: msg })
-      }
+    if (!succeeded) return
+    try {
+      await reloadInstalledSkillsAndCatalog()
+    } catch (err) {
+      notifyRefreshFailed(err)
+    }
+  }
+
+  async function uninstallSkill(name: string) {
+    const key = `skill:uninstall:${name}`
+    if (mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
+    setMutatingKey(key)
+    let succeeded = false
+    try {
+      await api.delete(`/api/skills/${encodeURIComponent(name)}`)
+      succeeded = true
+      markSkillInstalledLocally(name, false)
+      addToast({ type: "success", message: `已卸载 Skill：${name}` })
+    } catch (err) {
+      const msg = getErrorMessage(err, "卸载失败")
+      addToast({ type: "error", message: msg })
+      return
+    } finally {
+      setMutatingKey("")
+      mutationInFlightRef.current = false
+    }
+
+    if (!succeeded) return
+    try {
+      await reloadInstalledSkillsAndCatalog()
+    } catch (err) {
+      notifyRefreshFailed(err)
     }
   }
 
   async function installMcp(presetId: string) {
-    const key = `mcp:${presetId}`
-    if (installInFlightRef.current) return
-    installInFlightRef.current = true
-    setInstallingKey(key)
-    let installed = false
+    const key = `mcp:install:${presetId}`
+    if (mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
+    setMutatingKey(key)
+    let succeeded = false
     try {
       await api.post("/api/mcp/install", { preset: presetId })
-      installed = true
+      succeeded = true
+      markMcpPresetInstalledLocally(presetId, true)
       addToast({ type: "success", message: `已安装 MCP：${presetId}` })
     } catch (err) {
-      const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "安装失败")
+      const msg = getErrorMessage(err, "安装失败")
       addToast({ type: "error", message: msg })
       return
     } finally {
-      setInstallingKey("")
-      installInFlightRef.current = false
+      setMutatingKey("")
+      mutationInFlightRef.current = false
     }
 
-    if (installed) {
-      try {
-        await reloadMcpData()
-      } catch (err) {
-        const msg = err instanceof ApiError ? err.detail : "安装已完成，但刷新列表失败"
-        addToast({ type: "warning", message: msg })
-      }
+    if (!succeeded) return
+    try {
+      await reloadMcpData()
+    } catch (err) {
+      notifyRefreshFailed(err)
+    }
+  }
+
+  async function uninstallMcpServer(serverName: string) {
+    const key = `mcp:uninstall:${serverName}`
+    if (mutationInFlightRef.current) return
+    mutationInFlightRef.current = true
+    setMutatingKey(key)
+    let succeeded = false
+    try {
+      await api.delete(`/api/mcp/servers/${encodeURIComponent(serverName)}`)
+      succeeded = true
+      removeMcpServerLocally(serverName)
+      addToast({ type: "success", message: `已卸载 MCP：${serverName}` })
+    } catch (err) {
+      const msg = getErrorMessage(err, "卸载失败")
+      addToast({ type: "error", message: msg })
+      return
+    } finally {
+      setMutatingKey("")
+      mutationInFlightRef.current = false
+    }
+
+    if (!succeeded) return
+    try {
+      await reloadMcpData()
+    } catch (err) {
+      notifyRefreshFailed(err)
     }
   }
 
@@ -330,7 +424,7 @@ export function Skills() {
             {filteredSkills.map((skill) => (
               <Card
                 key={skill.name}
-                className="flex flex-col cursor-pointer transition-all hover:border-primary/50 hover:shadow-md"
+                className="flex h-full cursor-pointer flex-col border border-border/60 transition-all hover:border-primary/50 hover:shadow-md"
                 onClick={() => openDetail(skill.name).catch(() => {})}
               >
                 <CardHeader className="pb-3">
@@ -374,7 +468,7 @@ export function Skills() {
           <CardHeader className="space-y-4">
             <div>
               <CardTitle className="text-lg">安装中心</CardTitle>
-              <CardDescription>可在此安装 Skill 或 MCP，卡片样式与技能列表保持统一。</CardDescription>
+              <CardDescription>可在此安装/卸载 Skill 与 MCP，卡片样式与技能列表保持统一。</CardDescription>
             </div>
             <div className="inline-flex w-full rounded-md border p-1 sm:w-auto">
               <Button
@@ -411,19 +505,25 @@ export function Skills() {
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                       {shownItems.map((item) => {
                         const isInstalled = Boolean(item.installed)
-                        const key = `skill:${item.name}`
-                        const isInstalling = installingKey === key
+                        const sourceLabel = normalizeSkillSource(item.source)
+                        const installKey = `skill:install:${item.name}`
+                        const uninstallKey = `skill:uninstall:${item.name}`
+                        const isInstalling = mutatingKey === installKey
+                        const isUninstalling = mutatingKey === uninstallKey
+                        const isMutating = Boolean(mutatingKey)
                         return (
-                          <Card
-                            key={item.name}
-                            className="flex h-full flex-col transition-all hover:border-primary/50 hover:shadow-md"
-                          >
+                          <Card key={item.name} className={INSTALL_CENTER_CARD_CLASS}>
                             <CardHeader className="pb-2">
                               <div className="flex items-start justify-between gap-2">
                                 <CardTitle className="text-sm leading-5">{item.name}</CardTitle>
-                                <Badge variant={isInstalled ? "default" : "outline"} className="text-[10px] uppercase">
-                                  {isInstalled ? "已安装" : String(item.source || "builtin")}
-                                </Badge>
+                                <div className="flex flex-wrap items-center justify-end gap-1">
+                                  <Badge variant="outline" className="text-[10px]">
+                                    {sourceLabel}
+                                  </Badge>
+                                  <Badge variant={isInstalled ? "default" : "secondary"} className="text-[10px]">
+                                    {isInstalled ? "已安装" : "未安装"}
+                                  </Badge>
+                                </div>
                               </div>
                             </CardHeader>
                             <CardContent className="flex-1 pb-2">
@@ -431,7 +531,7 @@ export function Skills() {
                                 {item.description || "（无描述）"}
                               </CardDescription>
                             </CardContent>
-                            <CardFooter className="border-t pt-3 flex items-center justify-between gap-2">
+                            <CardFooter className={INSTALL_CENTER_FOOTER_CLASS}>
                               <Button
                                 variant="outline"
                                 size="sm"
@@ -440,12 +540,19 @@ export function Skills() {
                                 详情
                               </Button>
                               <Button
+                                variant={isInstalled ? "destructive" : "default"}
                                 size="sm"
-                                disabled={isInstalled || isInstalling || Boolean(installingKey)}
-                                onClick={() => installSkill(item.name).catch(() => {})}
+                                disabled={isMutating}
+                                onClick={() =>
+                                  (isInstalled ? uninstallSkill(item.name) : installSkill(item.name)).catch(() => {})
+                                }
                               >
-                                <Download className="mr-1 h-3.5 w-3.5" />
-                                {isInstalled ? "已安装" : isInstalling ? "安装中..." : "安装"}
+                                {isInstalled ? (
+                                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                                ) : (
+                                  <Download className="mr-1 h-3.5 w-3.5" />
+                                )}
+                                {isInstalled ? (isUninstalling ? "卸载中..." : "卸载") : isInstalling ? "安装中..." : "安装"}
                               </Button>
                             </CardFooter>
                           </Card>
@@ -478,19 +585,22 @@ export function Skills() {
                       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                         {shownItems.map((item) => {
                           const isInstalled = Boolean(item.installed)
-                          const key = `mcp:${item.id}`
-                          const isInstalling = installingKey === key
+                          const installKey = `mcp:install:${item.id}`
+                          const isInstalling = mutatingKey === installKey
+                          const isMutating = Boolean(mutatingKey)
                           return (
-                            <Card
-                              key={item.id}
-                              className="flex h-full flex-col transition-all hover:border-primary/50 hover:shadow-md"
-                            >
+                            <Card key={item.id} className={INSTALL_CENTER_CARD_CLASS}>
                               <CardHeader className="pb-2">
                                 <div className="flex items-start justify-between gap-2">
                                   <CardTitle className="text-sm leading-5">{item.name}</CardTitle>
-                                  <Badge variant={isInstalled ? "default" : "outline"} className="text-[10px] uppercase">
-                                    {isInstalled ? "已安装" : String(item.transport || "stdio")}
-                                  </Badge>
+                                  <div className="flex flex-wrap items-center justify-end gap-1">
+                                    <Badge variant="outline" className="text-[10px]">
+                                      {String(item.transport || "stdio")}
+                                    </Badge>
+                                    <Badge variant={isInstalled ? "default" : "secondary"} className="text-[10px]">
+                                      {isInstalled ? "已安装" : "未安装"}
+                                    </Badge>
+                                  </div>
                                 </div>
                               </CardHeader>
                               <CardContent className="flex-1 pb-2">
@@ -498,10 +608,10 @@ export function Skills() {
                                   {item.description || "（无描述）"}
                                 </CardDescription>
                               </CardContent>
-                              <CardFooter className="border-t pt-3 flex items-center justify-end">
+                              <CardFooter className={`${INSTALL_CENTER_FOOTER_CLASS} justify-end`}>
                                 <Button
                                   size="sm"
-                                  disabled={isInstalled || isInstalling || Boolean(installingKey)}
+                                  disabled={isInstalled || isInstalling || isMutating}
                                   onClick={() => installMcp(item.id).catch(() => {})}
                                 >
                                   <Download className="mr-1 h-3.5 w-3.5" />
@@ -524,7 +634,7 @@ export function Skills() {
                 <div className="space-y-3">
                   <div className="flex items-center gap-2">
                     <HardDrive className="h-4 w-4 text-primary" />
-                    <h4 className="text-sm font-semibold">已配置 MCP 服务器</h4>
+                    <h4 className="text-sm font-semibold">已配置 MCP 服务器（支持卸载）</h4>
                   </div>
                   {mcpServers.length === 0 ? (
                     <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
@@ -546,18 +656,39 @@ export function Skills() {
                             <Badge variant="secondary">{group.items.length}</Badge>
                           </div>
                           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-                            {shownItems.map((server) => (
-                              <Card key={`${group.category}:${server.name}`} className="flex h-full flex-col">
-                                <CardHeader className="pb-2">
-                                  <CardTitle className="text-sm">{server.name}</CardTitle>
-                                </CardHeader>
-                                <CardContent className="space-y-1 text-xs text-muted-foreground">
-                                  {server.command && <div className="truncate">cmd: {server.command}</div>}
-                                  {server.url && <div className="truncate">url: {server.url}</div>}
-                                  <div>timeout: {Number(server.tool_timeout || 30)}s</div>
-                                </CardContent>
-                              </Card>
-                            ))}
+                            {shownItems.map((server) => {
+                              const uninstallKey = `mcp:uninstall:${server.name}`
+                              const isUninstalling = mutatingKey === uninstallKey
+                              const isMutating = Boolean(mutatingKey)
+                              return (
+                                <Card key={`${group.category}:${server.name}`} className={INSTALL_CENTER_CARD_CLASS}>
+                                  <CardHeader className="pb-2">
+                                    <div className="flex items-start justify-between gap-2">
+                                      <CardTitle className="text-sm">{server.name}</CardTitle>
+                                      <Badge variant="outline" className="text-[10px]">
+                                        {String(server.transport || "stdio")}
+                                      </Badge>
+                                    </div>
+                                  </CardHeader>
+                                  <CardContent className="space-y-1 text-xs text-muted-foreground">
+                                    {server.command && <div className="truncate">cmd: {server.command}</div>}
+                                    {server.url && <div className="truncate">url: {server.url}</div>}
+                                    <div>timeout: {Number(server.tool_timeout || 30)}s</div>
+                                  </CardContent>
+                                  <CardFooter className={`${INSTALL_CENTER_FOOTER_CLASS} justify-end`}>
+                                    <Button
+                                      variant="destructive"
+                                      size="sm"
+                                      disabled={isMutating}
+                                      onClick={() => uninstallMcpServer(server.name).catch(() => {})}
+                                    >
+                                      <Trash2 className="mr-1 h-3.5 w-3.5" />
+                                      {isUninstalling ? "卸载中..." : "卸载"}
+                                    </Button>
+                                  </CardFooter>
+                                </Card>
+                              )
+                            })}
                           </div>
                           {group.items.length > collapsedCardCount && (
                             <Button variant="ghost" size="sm" onClick={() => toggleGroup(groupKey)}>

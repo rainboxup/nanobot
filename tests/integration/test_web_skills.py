@@ -87,6 +87,73 @@ async def test_skill_catalog_and_install(http_client, auth_headers) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_skill_catalog_includes_store_skill_and_can_install(
+    web_ctx, http_client, auth_headers
+) -> None:
+    store_dir = web_ctx.workspace_dir.parent / "skill-store" / "skills"
+    web_ctx.app.state.skill_store_dir = store_dir
+    store_skill = store_dir / "store-only-skill"
+    store_skill.mkdir(parents=True, exist_ok=True)
+    marker = "This skill is installed from tenant skill store."
+    (store_skill / "SKILL.md").write_text(
+        "---\n"
+        "description: Store only skill\n"
+        "---\n"
+        "\n"
+        f"{marker}\n",
+        encoding="utf-8",
+    )
+
+    catalog = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert catalog.status_code == 200
+    items = catalog.json()
+    target = next((item for item in items if item.get("name") == "store-only-skill"), None)
+    assert target is not None
+    assert target.get("source") == "store"
+    assert bool(target.get("installed")) is False
+
+    install = await http_client.post(
+        "/api/skills/install",
+        headers=auth_headers,
+        json={"name": "store-only-skill"},
+    )
+    assert install.status_code == 201
+    body = install.json()
+    assert body.get("name") == "store-only-skill"
+    assert body.get("source") == "store"
+    assert bool(body.get("installed")) is True
+
+    detail = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
+    assert detail.status_code == 200
+    assert marker in str(detail.json().get("content") or "")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_uninstall_success_and_404(http_client, auth_headers) -> None:
+    catalog = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert catalog.status_code == 200
+    target = next((item for item in catalog.json() if not bool(item.get("installed"))), None)
+    assert target is not None
+    skill_name = str(target["name"])
+
+    install = await http_client.post(
+        "/api/skills/install",
+        headers=auth_headers,
+        json={"name": skill_name},
+    )
+    assert install.status_code == 201
+
+    remove = await http_client.delete(f"/api/skills/{skill_name}", headers=auth_headers)
+    assert remove.status_code == 200
+    assert bool(remove.json().get("removed")) is True
+
+    remove_again = await http_client.delete(f"/api/skills/{skill_name}", headers=auth_headers)
+    assert remove_again.status_code == 404
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_skill_install_validation_and_permissions(http_client, auth_headers_for) -> None:
     member_headers = await auth_headers_for("member-skill", role="member", tenant_id="member-skill")
     denied = await http_client.post(
@@ -95,6 +162,8 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
         json={"name": "clawhub"},
     )
     assert denied.status_code == 403
+    denied_uninstall = await http_client.delete("/api/skills/clawhub", headers=member_headers)
+    assert denied_uninstall.status_code == 403
 
     bad_name = await http_client.post(
         "/api/skills/install",
@@ -155,6 +224,8 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "filesystem"},
     )
     assert denied.status_code == 403
+    denied_uninstall = await http_client.delete("/api/mcp/servers/filesystem", headers=member_headers)
+    assert denied_uninstall.status_code == 403
 
     bad_name = await http_client.post(
         "/api/mcp/install",
@@ -182,6 +253,28 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "filesystem", "name": "dup-server"},
     )
     assert second.status_code == 409
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_mcp_uninstall_success_and_404(http_client, auth_headers) -> None:
+    install = await http_client.post(
+        "/api/mcp/install",
+        headers=auth_headers,
+        json={"preset": "filesystem", "name": "filesystem-to-remove"},
+    )
+    assert install.status_code == 201
+
+    remove = await http_client.delete("/api/mcp/servers/filesystem-to-remove", headers=auth_headers)
+    assert remove.status_code == 200
+    assert bool(remove.json().get("removed")) is True
+
+    servers = await http_client.get("/api/mcp/servers", headers=auth_headers)
+    assert servers.status_code == 200
+    assert not any(item.get("name") == "filesystem-to-remove" for item in servers.json())
+
+    remove_again = await http_client.delete("/api/mcp/servers/filesystem-to-remove", headers=auth_headers)
+    assert remove_again.status_code == 404
 
 
 @pytest.mark.integration
@@ -215,4 +308,31 @@ async def test_skill_install_is_tenant_isolated(http_client, auth_headers_for) -
     assert bob_item is not None
     assert alice_item.get("source") == "workspace"
     assert bob_item.get("source") == "builtin"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_catalog_includes_workspace_only_installed_skill(
+    web_ctx, http_client, auth_headers
+) -> None:
+    tenant_ctx = web_ctx.tenant_store.ensure_tenant_files("admin")
+    skill_dir = tenant_ctx.workspace / "skills" / "tenant-only-skill"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: Tenant only skill\n"
+        "---\n"
+        "\n"
+        "This skill exists only in tenant workspace.\n",
+        encoding="utf-8",
+    )
+
+    r = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert r.status_code == 200
+    items = r.json()
+    matched = [item for item in items if item.get("name") == "tenant-only-skill"]
+    assert len(matched) == 1
+    item = matched[0]
+    assert bool(item.get("installed")) is True
+    assert item.get("source") == "workspace"
 

@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from nanobot.agent.skills import SkillsLoader
 from nanobot.config.schema import MCPServerConfig
 from nanobot.utils.fs import dir_size_bytes
+from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.tenant import load_tenant_config
 
@@ -78,42 +79,109 @@ def _tenant_skills_loader(
     return SkillsLoader(workspace=workspace), tenant_id, store, cfg, workspace
 
 
+def _list_skill_dirs(root: Path | None) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    if root is None or not root.exists():
+        return result
+    for skill_dir in root.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        if (skill_dir / "SKILL.md").exists():
+            result[skill_dir.name] = skill_dir
+    return result
+
+
 def _workspace_skill_names(loader: SkillsLoader) -> set[str]:
-    names: set[str] = set()
-    root = loader.workspace_skills
-    if not root.exists():
-        return names
-    for skill_dir in root.iterdir():
-        if not skill_dir.is_dir():
+    return set(_list_skill_dirs(loader.workspace_skills).keys())
+
+
+def _read_skill_description(skill_file: Path) -> str | None:
+    try:
+        content = skill_file.read_text(encoding="utf-8")
+    except Exception:
+        return None
+    match = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
+    if not match:
+        return None
+    for line in match.group(1).splitlines():
+        if ":" not in line:
             continue
-        if (skill_dir / "SKILL.md").exists():
-            names.add(skill_dir.name)
-    return names
+        key, value = line.split(":", 1)
+        if key.strip() == "description":
+            desc = value.strip().strip("\"'")
+            return desc or None
+    return None
 
 
-def _builtin_skill_names(loader: SkillsLoader) -> list[str]:
-    names: list[str] = []
-    root = loader.builtin_skills
-    if not root or not root.exists():
-        return names
-    for skill_dir in root.iterdir():
-        if not skill_dir.is_dir():
-            continue
-        if (skill_dir / "SKILL.md").exists():
-            names.append(skill_dir.name)
-    return sorted(names)
+def _resolve_skill_store_dir(request: Request) -> Path:
+    raw = getattr(request.app.state, "skill_store_dir", None)
+    if raw:
+        return Path(str(raw)).expanduser()
+    return get_data_path() / "store" / "skills"
 
 
-def _skill_payload(loader: SkillsLoader, name: str, *, installed: bool) -> dict[str, Any]:
-    meta = loader.get_skill_metadata(name) or {}
-    source = "workspace" if installed else "builtin"
+def _skill_payload(
+    *,
+    name: str,
+    source: str,
+    installed: bool,
+    description: str | None = None,
+) -> dict[str, Any]:
     return {
         "name": name,
         "source": source,
-        "description": meta.get("description"),
+        "description": description,
         "installed": bool(installed),
         "category": "已安装" if installed else "可安装",
     }
+
+
+def _build_skill_catalog(loader: SkillsLoader, skill_store_dir: Path) -> list[dict[str, Any]]:
+    workspace_skills = _list_skill_dirs(loader.workspace_skills)
+    builtin_skills = _list_skill_dirs(loader.builtin_skills)
+    store_skills = _list_skill_dirs(skill_store_dir)
+    all_names = set(workspace_skills) | set(builtin_skills) | set(store_skills)
+
+    items: list[dict[str, Any]] = []
+    for name in all_names:
+        installed = name in workspace_skills
+        if installed:
+            source = "workspace"
+            source_file = workspace_skills[name] / "SKILL.md"
+        elif name in store_skills:
+            source = "store"
+            source_file = store_skills[name] / "SKILL.md"
+        else:
+            source = "builtin"
+            source_file = builtin_skills[name] / "SKILL.md"
+        items.append(
+            _skill_payload(
+                name=name,
+                source=source,
+                installed=installed,
+                description=_read_skill_description(source_file),
+            )
+        )
+
+    items.sort(key=lambda item: (0 if item["installed"] else 1, str(item["name"]).lower()))
+    return items
+
+
+def _resolve_skill_install_source(
+    loader: SkillsLoader,
+    *,
+    skill_store_dir: Path,
+    name: str,
+) -> tuple[str, Path] | None:
+    store_src_dir = skill_store_dir / name
+    if (store_src_dir / "SKILL.md").exists():
+        return "store", store_src_dir
+    builtin_root = loader.builtin_skills
+    if builtin_root is not None:
+        builtin_src_dir = builtin_root / name
+        if (builtin_src_dir / "SKILL.md").exists():
+            return "builtin", builtin_src_dir
+    return None
 
 
 def _mcp_preset_by_id(preset_id: str) -> dict[str, Any] | None:
@@ -178,6 +246,7 @@ async def list_skills(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
+    installed_names = _workspace_skill_names(loader)
     skills = loader.list_skills(filter_unavailable=False)
 
     result: list[dict[str, Any]] = []
@@ -190,6 +259,7 @@ async def list_skills(
                 "source": s.get("source"),
                 "path": s.get("path"),
                 "description": meta.get("description"),
+                "installed": name in installed_names,
             }
         )
     return result
@@ -200,15 +270,8 @@ async def list_installable_skills(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
-    installed_names = _workspace_skill_names(loader)
-    builtin_names = _builtin_skill_names(loader)
-
-    items = [
-        _skill_payload(loader, name, installed=name in installed_names)
-        for name in builtin_names
-    ]
-    items.sort(key=lambda item: (0 if item["installed"] else 1, str(item["name"]).lower()))
-    return items
+    skill_store_dir = _resolve_skill_store_dir(request)
+    return _build_skill_catalog(loader, skill_store_dir)
 
 
 @router.post("/api/skills/install", status_code=status.HTTP_201_CREATED)
@@ -226,10 +289,17 @@ async def install_skill(
         )
 
     loader, tenant_id, _store, cfg, _workspace = _tenant_skills_loader(request, user)
-    src_dir = loader.builtin_skills / name
-    src = src_dir / "SKILL.md"
-    if not src.exists():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found in builtin store")
+    install_source = _resolve_skill_install_source(
+        loader,
+        skill_store_dir=_resolve_skill_store_dir(request),
+        name=name,
+    )
+    if install_source is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Skill not found in skill store or builtin skills",
+        )
+    source, src_dir = install_source
 
     dst_root = loader.workspace_skills
     dst_root.mkdir(parents=True, exist_ok=True)
@@ -272,7 +342,42 @@ async def install_skill(
         "installed": True,
         "already_installed": False,
         "repaired": bool(installed_from_partial),
+        "source": source,
     }
+
+
+@router.delete("/api/skills/{name}")
+async def uninstall_skill(
+    name: str,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    skill_name = str(name or "").strip()
+    if not _SKILL_NAME_RE.fullmatch(skill_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid skill name",
+        )
+
+    loader, tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
+    dst_root = loader.workspace_skills
+    dst = dst_root / skill_name
+    lock = _install_lock(f"{tenant_id}:{skill_name}")
+
+    with lock:
+        if not (dst / "SKILL.md").exists():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not installed")
+        tmp_removed = dst_root / f".{skill_name}.del-{uuid.uuid4().hex}"
+        try:
+            dst.replace(tmp_removed)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not installed") from exc
+        finally:
+            if tmp_removed.exists():
+                shutil.rmtree(tmp_removed, ignore_errors=True)
+
+    return {"name": skill_name, "removed": True}
 
 
 @router.get("/api/mcp/catalog")
@@ -353,6 +458,31 @@ async def install_mcp_server(
         "url": model_payload["url"],
         "tool_timeout": model_payload["tool_timeout"],
     }
+
+
+@router.delete("/api/mcp/servers/{name}")
+async def uninstall_mcp_server(
+    name: str,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    server_name = str(name or "").strip()
+    if not _MCP_NAME_RE.fullmatch(server_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid MCP server name",
+        )
+
+    tenant_id, store, cfg = load_tenant_config(request, user)
+    servers = dict(getattr(cfg.tools, "mcp_servers", {}) or {})
+    if server_name not in servers:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found")
+
+    servers.pop(server_name, None)
+    cfg.tools.mcp_servers = servers
+    store.save_tenant_config(tenant_id, cfg)
+    return {"name": server_name, "removed": True}
 
 
 @router.get("/api/skills/{name}")

@@ -4,18 +4,56 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>nanobot 控制台</title>
+    <script>
+      (() => {
+        try {
+          const theme = String(localStorage.getItem("nanobot_theme") || "").toLowerCase();
+          if (theme === "light" || theme === "dark") {
+            document.documentElement.setAttribute("data-theme", theme);
+          }
+
+          const palette = String(localStorage.getItem("nanobot_palette") || "").toLowerCase();
+          const allowedPalettes = new Set(["gold", "ocean", "rose"]);
+          if (allowedPalettes.has(palette)) {
+            document.documentElement.setAttribute("data-palette", palette);
+          }
+        } catch {
+          // ignore storage errors
+        }
+      })();
+    </script>
     <link rel="stylesheet" href="/static/css/style.css" />
   </head>
   <body>
     <header class="topbar">
-      <div class="brand">nanobot</div>
-      <nav id="nav" class="nav hidden">
-        <a href="#/chat" data-route="#/chat">对话</a>
-        <a href="#/settings" data-route="#/settings">设置</a>
-        <a href="#/skills" data-route="#/skills">技能</a>
-        <a href="#/ops" data-route="#/ops">运维</a>
-        <button id="logoutBtn" class="linklike" type="button">退出登录</button>
-      </nav>
+      <div class="topbar-inner">
+        <div class="brand">
+          <div class="brand-name">nanobot</div>
+          <div class="brand-tag">控制台</div>
+        </div>
+
+        <nav id="nav" class="nav hidden" aria-label="主导航">
+          <a href="#/chat" data-route="#/chat">对话</a>
+          <a href="#/settings" data-route="#/settings">设置</a>
+          <a href="#/skills" data-route="#/skills">技能</a>
+          <a href="#/ops" data-route="#/ops">运维</a>
+        </nav>
+
+        <div class="topbar-actions">
+          <div id="themeSwitch" class="segmented" role="group" aria-label="主题">
+            <button type="button" class="segmented-btn" data-theme="auto">自动</button>
+            <button type="button" class="segmented-btn" data-theme="light">亮色</button>
+            <button type="button" class="segmented-btn" data-theme="dark">暗色</button>
+          </div>
+          <select id="paletteSelect" class="select" aria-label="配色">
+            <option value="indigo">默认</option>
+            <option value="gold">鎏金</option>
+            <option value="ocean">海蓝</option>
+            <option value="rose">玫瑰</option>
+          </select>
+          <button id="logoutBtn" class="btn secondary hidden" type="button">退出</button>
+        </div>
+      </div>
     </header>
 
     <div id="globalNoticeWrap" class="app hidden">
@@ -23,6 +61,12 @@
     </div>
 
     <main id="app" class="app"></main>
+    <div
+      id="toastRoot"
+      class="toast-root"
+      role="region"
+      aria-label="通知"
+    ></div>
 
     <script type="module" src="/static/js/app.js"></script>
   </body>

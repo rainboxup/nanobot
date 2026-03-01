@@ -1,4 +1,6 @@
 import { api, clearToken, getToken } from "./api.js";
+import { initPaletteSwitcher, initThemeSwitcher } from "./theme.js";
+import { initToast, showToast } from "./toast.js";
 import { renderLogin } from "./pages/login.js";
 import { renderChat } from "./pages/chat.js";
 import { renderSettings } from "./pages/settings.js";
@@ -8,10 +10,17 @@ import { renderOps } from "./pages/ops.js";
 const appEl = document.getElementById("app");
 const navEl = document.getElementById("nav");
 const logoutBtn = document.getElementById("logoutBtn");
+const themeSwitchEl = document.getElementById("themeSwitch");
+const paletteSelectEl = document.getElementById("paletteSelect");
+const toastRootEl = document.getElementById("toastRoot");
 const globalNoticeWrap = document.getElementById("globalNoticeWrap");
 const globalNoticeEl = document.getElementById("globalNotice");
 
 let cleanupFn = null;
+
+initThemeSwitcher(themeSwitchEl);
+initPaletteSwitcher(paletteSelectEl);
+initToast(toastRootEl);
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -126,6 +135,11 @@ async function refreshGlobalReadyNotice() {
   copyBtn.addEventListener("click", async () => {
     const ok = await copyTextToClipboard(diagText);
     copyBtn.textContent = ok ? "已复制" : "复制失败";
+    showToast({
+      title: ok ? "已复制" : "复制失败",
+      message: ok ? "诊断信息已复制到剪贴板。" : "请重试或手动复制诊断信息。",
+      kind: ok ? "success" : "error",
+    });
     setTimeout(() => {
       copyBtn.textContent = "复制诊断信息";
     }, 1200);
@@ -140,6 +154,7 @@ function setActiveNav(route) {
 
 function showNav(show) {
   navEl.classList.toggle("hidden", !show);
+  logoutBtn.classList.toggle("hidden", !show);
 }
 
 function routeFromHash() {

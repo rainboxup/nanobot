@@ -1,4 +1,5 @@
 import { api, formatTime } from "../api.js";
+import { showToast } from "../toast.js";
 
 function el(html) {
   const t = document.createElement("template");
@@ -172,6 +173,11 @@ export async function renderOps(container) {
   copyBtn.addEventListener("click", async () => {
     const ok = await copyTextToClipboard(lastJson || "");
     setCopyButtonState(ok ? "已复制" : "复制失败");
+    showToast({
+      title: ok ? "已复制" : "复制失败",
+      message: ok ? "运维快照已复制到剪贴板。" : "请重试或手动复制 JSON。",
+      kind: ok ? "success" : "error",
+    });
   });
 
   container.innerHTML = "";

@@ -1,4 +1,5 @@
 import { api, getToken } from "../api.js";
+import { showToast } from "../toast.js";
 
 const SENSITIVE_KEYS = new Set([
   "token",
@@ -56,6 +57,8 @@ function setByPath(obj, path, value) {
 }
 
 function renderConfigForm(name, config, onSave) {
+  const formIdPrefix = `settings-${Math.random().toString(16).slice(2)}`;
+  const fieldFilterId = `${formIdPrefix}-field-filter`;
   const form = el(`<form class="panel" style="margin-top: 12px">
       <div class="row" style="justify-content: space-between">
         <h3 style="margin: 0">编辑：${escapeHtml(name)}</h3>
@@ -67,12 +70,35 @@ function renderConfigForm(name, config, onSave) {
       <div class="muted" style="margin-top: 6px">
         敏感字段不会自动填充；留空将保持不变。
       </div>
+      <div class="row" style="margin-top: 12px; align-items: flex-end; gap: 8px">
+        <div class="col">
+          <label
+            class="muted"
+            for="${escapeHtml(fieldFilterId)}"
+            style="display:block; margin-bottom: 6px; font-size: 12px"
+          >搜索字段</label>
+          <input
+            type="text"
+            id="${escapeHtml(fieldFilterId)}"
+            data-action="field-filter"
+            placeholder="例如：openai.api_key / channels.telegram / smtp_password"
+          />
+        </div>
+        <div>
+          <button class="btn secondary" type="button" data-action="clear-field-filter">清除</button>
+        </div>
+      </div>
       <div data-fields style="margin-top: 12px"></div>
       <div class="error" data-error style="margin-top: 10px"></div>
     </form>`);
 
   const fields = form.querySelector("[data-fields]");
   const errEl = form.querySelector("[data-error]");
+  const fieldFilterInput = form.querySelector('[data-action="field-filter"]');
+  const fieldFilterClearBtn = form.querySelector('[data-action="clear-field-filter"]');
+  const saveBtn = form.querySelector('button[type="submit"]');
+
+  let fieldIdSeq = 0;
 
   function renderFields(obj, prefix, target) {
     for (const [k, v] of Object.entries(obj || {})) {
@@ -80,8 +106,8 @@ function renderConfigForm(name, config, onSave) {
 
       if (v && typeof v === "object" && !Array.isArray(v)) {
         const box = el(
-          `<div style="margin-top: 10px; padding: 10px; border: 1px solid var(--border); border-radius: 10px;">
-            <div class="muted" style="margin-bottom: 8px">${escapeHtml(path)}</div>
+          `<div class="field-group" data-field-kind="group" data-field-path="${escapeHtml(path)}">
+            <div class="muted field-group-title">${escapeHtml(path)}</div>
             <div data-box-fields></div>
           </div>`
         );
@@ -91,7 +117,8 @@ function renderConfigForm(name, config, onSave) {
       }
 
       let input = null;
-      const label = el(`<label style="display:block; margin-top: 10px">${escapeHtml(path)}</label>`);
+      const inputId = `${formIdPrefix}-field-${fieldIdSeq++}`;
+      const label = el(`<label class="field-label" for="${inputId}">${escapeHtml(path)}</label>`);
 
       if (typeof v === "boolean") {
         input = el(`<input type="checkbox" data-path="${escapeHtml(path)}" />`);
@@ -118,16 +145,82 @@ function renderConfigForm(name, config, onSave) {
         }
       }
 
-      target.appendChild(label);
-      target.appendChild(input);
+      input.id = inputId;
+
+      const wrap = el(
+        `<div class="field" data-field-kind="leaf" data-field-path="${escapeHtml(path)}"></div>`
+      );
+      wrap.appendChild(label);
+      wrap.appendChild(input);
+      target.appendChild(wrap);
     }
   }
 
   renderFields(config, "", fields);
 
+  const leafEls = Array.from(form.querySelectorAll('[data-field-kind="leaf"]'));
+  const groupEls = Array.from(form.querySelectorAll('[data-field-kind="group"]'));
+  const leafPathLowers = leafEls.map((leaf) => String(leaf.dataset.fieldPath || "").toLowerCase());
+  const groupPathLowers = groupEls.map((group) => String(group.dataset.fieldPath || "").toLowerCase());
+
+  function applyFieldFilter() {
+    if (!fieldFilterInput) return;
+    const query = String(fieldFilterInput.value || "").trim().toLowerCase();
+
+    if (!query) {
+      for (const el of leafEls) el.classList.remove("hidden");
+      for (const el of groupEls) el.classList.remove("hidden");
+      return;
+    }
+
+    const leafMatch = leafPathLowers.map((path) => path.includes(query));
+    for (let i = 0; i < leafEls.length; i++) {
+      leafEls[i].classList.toggle("hidden", !leafMatch[i]);
+    }
+
+    // Walk groups from deepest to shallowest so child visibility is already resolved.
+    for (let i = groupEls.length - 1; i >= 0; i--) {
+      const group = groupEls[i];
+      const path = groupPathLowers[i];
+
+      if (path.includes(query)) {
+        group.classList.remove("hidden");
+        // If parent group matches, ensure all descendants are visible.
+        for (const child of group.querySelectorAll('[data-field-kind="leaf"], [data-field-kind="group"]')) {
+          child.classList.remove("hidden");
+        }
+        continue;
+      }
+
+      const hasVisibleChild = Boolean(
+        group.querySelector('[data-field-kind="leaf"]:not(.hidden), [data-field-kind="group"]:not(.hidden)')
+      );
+      group.classList.toggle("hidden", !hasVisibleChild);
+    }
+  }
+
+  if (fieldFilterInput) {
+    fieldFilterInput.addEventListener("input", applyFieldFilter);
+    fieldFilterInput.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") {
+        fieldFilterInput.value = "";
+        applyFieldFilter();
+      }
+    });
+  }
+  if (fieldFilterClearBtn && fieldFilterInput) {
+    fieldFilterClearBtn.addEventListener("click", () => {
+      fieldFilterInput.value = "";
+      applyFieldFilter();
+      fieldFilterInput.focus();
+    });
+  }
+
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
     errEl.textContent = "";
+
+    if (saveBtn) saveBtn.disabled = true;
 
     const update = {};
     for (const input of form.querySelectorAll("[data-path]")) {
@@ -168,8 +261,23 @@ function renderConfigForm(name, config, onSave) {
 
     try {
       await onSave(update);
+      showToast({
+        id: `settings-save:${name}`,
+        title: "已保存",
+        message: `${name} 配置已更新。`,
+        kind: "success",
+      });
     } catch (err) {
-      errEl.textContent = err.message || "保存失败";
+      const msg = String((err && err.message) || err || "保存失败");
+      errEl.textContent = msg;
+      showToast({
+        id: `settings-save:${name}`,
+        title: "保存失败",
+        message: msg,
+        kind: "error",
+      });
+    } finally {
+      if (saveBtn && saveBtn.isConnected) saveBtn.disabled = false;
     }
   });
 
@@ -180,8 +288,9 @@ function renderConfigForm(name, config, onSave) {
   return form;
 }
 
-async function renderProviders(container) {
+async function renderProviders(container, ctx) {
   const panel = container.querySelector("#settingsPanel");
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">模型服务</h3><div class="muted">加载中...</div></div>`;
 
   const providers = await api.get("/api/providers");
@@ -254,9 +363,22 @@ async function renderProviders(container) {
           if (apiKey !== "") payload.api_key = apiKey;
           else if (clearKey) payload.api_key = "";
           await api.put(`/api/providers/${encodeURIComponent(p.name)}`, payload);
-          await renderProviders(container);
+          await renderProviders(container, ctx);
+          showToast({
+            id: `provider-save:${p.name}`,
+            title: "已保存",
+            message: `${p.name} 已更新。`,
+            kind: "success",
+          });
         } catch (err) {
-          errEl.textContent = err.message || "保存失败";
+          const msg = String((err && err.message) || err || "保存失败");
+          errEl.textContent = msg;
+          showToast({
+            id: `provider-save:${p.name}`,
+            title: "保存失败",
+            message: msg,
+            kind: "error",
+          });
         }
       });
     });
@@ -264,12 +386,14 @@ async function renderProviders(container) {
     tbody.appendChild(tr);
   }
 
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = "";
   panel.appendChild(table);
 }
 
-async function renderChannels(container) {
+async function renderChannels(container, ctx) {
   const panel = container.querySelector("#settingsPanel");
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">渠道</h3><div class="muted">加载中...</div></div>`;
 
   const channels = await api.get("/api/channels");
@@ -294,7 +418,7 @@ async function renderChannels(container) {
     const toggle = item.querySelector('input[type="checkbox"]');
     toggle.addEventListener("change", async () => {
       await api.post(`/api/channels/${encodeURIComponent(ch.name)}/toggle`, {});
-      await renderChannels(container);
+      await renderChannels(container, ctx);
     });
 
     item.querySelector("button").addEventListener("click", async () => {
@@ -302,7 +426,7 @@ async function renderChannels(container) {
       const form = renderConfigForm(ch.name, detail.config || {}, async (update) => {
         await api.put(`/api/channels/${encodeURIComponent(ch.name)}`, update);
         form.remove();
-        await renderChannels(container);
+        await renderChannels(container, ctx);
       });
       wrap.appendChild(form);
       form.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -311,12 +435,14 @@ async function renderChannels(container) {
     list.appendChild(item);
   }
 
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = "";
   panel.appendChild(wrap);
 }
 
-async function renderBetaAccess(container) {
+async function renderBetaAccess(container, ctx) {
   const panel = container.querySelector("#settingsPanel");
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">封闭 Beta</h3><div class="muted">加载中...</div></div>`;
 
   const allowlist = await api.get("/api/beta/allowlist");
@@ -367,7 +493,7 @@ async function renderBetaAccess(container) {
       </div>`);
     row.querySelector("button").addEventListener("click", async () => {
       await api.delete(`/api/beta/allowlist/${encodeURIComponent(user)}`);
-      await renderBetaAccess(container);
+      await renderBetaAccess(container, ctx);
     });
     usersEl.appendChild(row);
   }
@@ -377,7 +503,7 @@ async function renderBetaAccess(container) {
     const username = String(userInput.value || "").trim();
     if (!username) return;
     await api.post("/api/beta/allowlist", { username });
-    await renderBetaAccess(container);
+    await renderBetaAccess(container, ctx);
   });
 
   const inviteRows = wrap.querySelector("#inviteRows");
@@ -392,7 +518,7 @@ async function renderBetaAccess(container) {
       </tr>`);
     row.querySelector("button").addEventListener("click", async () => {
       await api.delete(`/api/beta/invites/${encodeURIComponent(inv.code || "")}`);
-      await renderBetaAccess(container);
+      await renderBetaAccess(container, ctx);
     });
     inviteRows.appendChild(row);
   }
@@ -404,15 +530,17 @@ async function renderBetaAccess(container) {
     const payload = { ttl_hours: ttlHours, max_uses: maxUses };
     if (forUsername) payload.for_username = forUsername;
     await api.post("/api/beta/invites", payload);
-    await renderBetaAccess(container);
+    await renderBetaAccess(container, ctx);
   });
 
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = "";
   panel.appendChild(wrap);
 }
 
-async function renderUsers(container) {
+async function renderUsers(container, ctx) {
   const panel = container.querySelector("#settingsPanel");
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">用户</h3><div class="muted">加载中...</div></div>`;
 
   let me = null;
@@ -421,6 +549,7 @@ async function renderUsers(container) {
     [me, users] = await Promise.all([api.get("/api/auth/me"), api.get("/api/auth/users")]);
   } catch (err) {
     const msg = String((err && err.message) || "加载失败");
+    if (ctx && !ctx.isActive()) return;
     panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">用户</h3><div class="error">${escapeHtml(msg)}</div></div>`;
     return;
   }
@@ -916,12 +1045,14 @@ async function renderUsers(container) {
   });
 
   await renderUserRows();
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = "";
   panel.appendChild(wrap);
 }
 
-async function renderSecurity(container) {
+async function renderSecurity(container, ctx) {
   const panel = container.querySelector("#settingsPanel");
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = `<div class="panel"><h3 style="margin-top:0">安全</h3><div class="muted">加载中...</div></div>`;
 
   const wrap = el(`<div class="panel">
@@ -1603,39 +1734,108 @@ async function renderSecurity(container) {
   });
 
   await Promise.all([loadLockSnapshot(), loadEvents({ append: false }), loadRetentionStatus()]);
+  if (ctx && !ctx.isActive()) return;
   panel.innerHTML = "";
   panel.appendChild(wrap);
 }
 
 export async function renderSettings(container) {
+  const SETTINGS_TAB_KEY = "nanobot_settings_tab";
+  let activeRenderId = 0;
+  const items = [
+    { key: "providers", label: "模型服务", desc: "API Key、模型与路由" },
+    { key: "channels", label: "渠道", desc: "Telegram/Slack/Discord 等接入" },
+    { key: "beta", label: "封闭 Beta", desc: "邀请码与白名单访问" },
+    { key: "users", label: "用户", desc: "角色、租户与会话" },
+    { key: "security", label: "安全", desc: "审计、登录防护与解锁" },
+  ];
+
+  const navHtml = items
+    .map(
+      (it) => `
+        <li class="settings-nav-li">
+          <button
+            class="settings-nav-item"
+            type="button"
+            data-tab="${escapeHtml(it.key)}"
+            aria-controls="settingsPanel"
+          >
+            <div class="settings-nav-item-title">${escapeHtml(it.label)}</div>
+            <div class="muted settings-nav-item-desc">${escapeHtml(it.desc)}</div>
+          </button>
+        </li>
+      `
+    )
+    .join("");
+
   container.innerHTML = `
-    <div class="tabs">
-      <div class="tab active" data-tab="providers">模型服务</div>
-      <div class="tab" data-tab="channels">渠道</div>
-      <div class="tab" data-tab="beta">封闭 Beta</div>
-      <div class="tab" data-tab="users">用户</div>
-      <div class="tab" data-tab="security">安全</div>
+    <div class="settings-layout">
+      <aside class="panel settings-nav" aria-label="设置导航">
+        <div class="settings-nav-head">
+          <div class="settings-nav-title">设置</div>
+          <div class="muted settings-nav-sub">按模块管理模型、渠道与安全策略</div>
+        </div>
+        <ul class="settings-nav-list">
+          ${navHtml}
+        </ul>
+      </aside>
+      <div id="settingsPanel" class="settings-panel"></div>
     </div>
-    <div id="settingsPanel"></div>
   `;
 
-  const tabs = Array.from(container.querySelectorAll(".tab"));
+  const navButtons = Array.from(container.querySelectorAll("button[data-tab]"));
 
-  async function select(tabName) {
-    for (const t of tabs) t.classList.toggle("active", t.dataset.tab === tabName);
-    if (tabName === "providers") await renderProviders(container);
-    if (tabName === "channels") await renderChannels(container);
-    if (tabName === "beta") await renderBetaAccess(container);
-    if (tabName === "users") await renderUsers(container);
-    if (tabName === "security") await renderSecurity(container);
+  function isValidTab(tabName) {
+    return items.some((x) => x.key === tabName);
   }
 
-  tabs.forEach((t) => {
-    t.addEventListener("click", () => {
-      select(t.dataset.tab).catch(() => {});
-    });
-  });
+  function loadLastTab() {
+    try {
+      return String(localStorage.getItem(SETTINGS_TAB_KEY) || "");
+    } catch {
+      return "";
+    }
+  }
 
-  await select("providers");
+  function saveLastTab(tabName) {
+    try {
+      localStorage.setItem(SETTINGS_TAB_KEY, tabName);
+    } catch {
+      // ignore storage errors
+    }
+  }
+
+  function setActiveNav(tabName) {
+    for (const btn of navButtons) {
+      const active = btn.dataset.tab === tabName;
+      btn.classList.toggle("active", active);
+      if (active) btn.setAttribute("aria-current", "page");
+      else btn.removeAttribute("aria-current");
+    }
+  }
+
+  async function select(tabName) {
+    const key = isValidTab(tabName) ? tabName : "providers";
+    const renderId = ++activeRenderId;
+    const ctx = { isActive: () => renderId === activeRenderId };
+
+    setActiveNav(key);
+    saveLastTab(key);
+
+    if (key === "providers") await renderProviders(container, ctx);
+    if (key === "channels") await renderChannels(container, ctx);
+    if (key === "beta") await renderBetaAccess(container, ctx);
+    if (key === "users") await renderUsers(container, ctx);
+    if (key === "security") await renderSecurity(container, ctx);
+  }
+
+  for (const btn of navButtons) {
+    btn.addEventListener("click", () => {
+      select(btn.dataset.tab).catch(() => {});
+    });
+  }
+
+  const initial = loadLastTab();
+  await select(initial || "providers");
   return () => {};
 }

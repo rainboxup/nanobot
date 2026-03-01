@@ -26,9 +26,21 @@ interface SkillDetail extends SkillListItem {
 interface SkillCatalogItem {
   name: string
   description?: string
+  author?: string
+  version?: string
+  slug?: string
   source?: string
+  install_source?: string
   installed?: boolean
   category?: string
+}
+
+type SkillCatalogResponse = SkillCatalogItem[] | { items?: SkillCatalogItem[]; next_cursor?: string }
+interface SkillCatalogV2Response {
+  items?: SkillCatalogItem[]
+  next_cursor?: string
+  partial?: boolean
+  warnings?: Array<{ source?: string; status_code?: number; detail?: string }>
 }
 
 interface MCPPresetItem {
@@ -67,8 +79,95 @@ const INSTALL_CENTER_FOOTER_CLASS = "mt-auto flex items-center justify-between g
 
 function normalizeSkillSource(source?: string): string {
   const value = String(source || "").trim().toLowerCase()
-  if (value === "workspace" || value === "builtin" || value === "store") return value
+  if (value === "workspace" || value === "builtin" || value === "store" || value === "clawhub" || value === "local")
+    return value
   return value || "-"
+}
+
+function formatSkillField(value?: string): string {
+  const text = String(value || "").trim()
+  return text || "-"
+}
+
+function normalizeSkillCatalogResponse(payload: SkillCatalogResponse | unknown): SkillCatalogItem[] {
+  if (Array.isArray(payload)) return payload
+  if (!payload || typeof payload !== "object") return []
+  const items = (payload as { items?: unknown }).items
+  return Array.isArray(items) ? (items as SkillCatalogItem[]) : []
+}
+
+function mergeSkillCatalogItems(localItems: SkillCatalogItem[], remoteItems: SkillCatalogItem[]): SkillCatalogItem[] {
+  const merged = new Map<string, SkillCatalogItem>()
+  for (const item of localItems) {
+    const name = String(item.name || "").trim()
+    if (!name) continue
+    merged.set(name, item)
+  }
+  for (const item of remoteItems) {
+    const name = String(item.name || "").trim()
+    if (!name) continue
+    const existing = merged.get(name)
+    if (!existing) {
+      merged.set(name, item)
+      continue
+    }
+    merged.set(name, {
+      ...existing,
+      description: existing.description || item.description,
+      author: existing.author || item.author,
+      version: item.version || existing.version,
+      slug: item.slug || existing.slug,
+      install_source: item.install_source || existing.install_source,
+    })
+  }
+  return Array.from(merged.values()).sort((a, b) => {
+    const installedOrder = Number(Boolean(a.installed)) === Number(Boolean(b.installed)) ? 0 : a.installed ? -1 : 1
+    if (installedOrder !== 0) return installedOrder
+    return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN")
+  })
+}
+
+async function fetchCatalogV2Page(params: URLSearchParams): Promise<SkillCatalogV2Response> {
+  const raw = await api.get<SkillCatalogV2Response>(`/api/skills/catalog/v2?${params.toString()}`)
+  if (!raw || typeof raw !== "object") return { items: [] }
+  return raw
+}
+
+async function fetchSkillCatalogFromV2(): Promise<SkillCatalogItem[]> {
+  const localParams = new URLSearchParams({ source: "local", limit: "500" })
+  const localPayload = await fetchCatalogV2Page(localParams)
+  const localItems = normalizeSkillCatalogResponse(localPayload)
+
+  const remoteItems: SkillCatalogItem[] = []
+  const maxPages = 20
+  const maxItems = 2000
+  let cursor: string | undefined
+  for (let pageIndex = 0; pageIndex < maxPages; pageIndex += 1) {
+    const remoteParams = new URLSearchParams({ source: "clawhub", limit: "200" })
+    if (cursor) remoteParams.set("cursor", cursor)
+    const remotePayload = await fetchCatalogV2Page(remoteParams)
+    const pageItems = normalizeSkillCatalogResponse(remotePayload)
+    if (pageItems.length > 0) remoteItems.push(...pageItems)
+    if (remoteItems.length >= maxItems) break
+    const nextCursor = String(remotePayload.next_cursor || "").trim() || undefined
+    if (!nextCursor || nextCursor === cursor) break
+    cursor = nextCursor
+  }
+  return mergeSkillCatalogItems(localItems, remoteItems)
+}
+
+async function fetchSkillCatalogWithFallback(): Promise<SkillCatalogItem[]> {
+  try {
+    return await fetchSkillCatalogFromV2()
+  } catch {
+    try {
+      const latest = await api.get<SkillCatalogResponse>("/api/skills/catalog?source=all&limit=200")
+      return normalizeSkillCatalogResponse(latest)
+    } catch {
+      const legacy = await api.get<SkillCatalogResponse>("/api/skills/catalog")
+      return normalizeSkillCatalogResponse(legacy)
+    }
+  }
 }
 
 export function Skills() {
@@ -113,11 +212,6 @@ export function Skills() {
       return Array.isArray(list) ? list : []
     }
 
-    async function fetchSkillCatalog() {
-      const list = await api.get<SkillCatalogItem[]>("/api/skills/catalog")
-      return Array.isArray(list) ? list : []
-    }
-
     async function fetchMcpCatalog() {
       const list = await api.get<MCPPresetItem[]>("/api/mcp/catalog")
       return Array.isArray(list) ? list : []
@@ -132,20 +226,42 @@ export function Skills() {
       setLoading(true)
       setError("")
       try {
-        const [installedList, catalogList, mcpCatalogList, mcpServerList] = await Promise.all([
+        const [installedResult, catalogResult, mcpCatalogResult, mcpServerResult] = await Promise.allSettled([
           fetchInstalledSkills(),
-          fetchSkillCatalog(),
+          fetchSkillCatalogWithFallback(),
           fetchMcpCatalog(),
           fetchMcpServers(),
         ])
         if (cancelled) return
-        setSkills(installedList)
-        setSkillCatalog(catalogList)
-        setMcpCatalog(mcpCatalogList)
-        setMcpServers(mcpServerList)
+        const loadErrors: string[] = []
+        if (installedResult.status === "fulfilled") {
+          setSkills(installedResult.value)
+        } else {
+          loadErrors.push(getErrorMessage(installedResult.reason, "技能列表加载失败"))
+        }
+        if (catalogResult.status === "fulfilled") {
+          setSkillCatalog(catalogResult.value)
+        } else {
+          loadErrors.push(getErrorMessage(catalogResult.reason, "技能目录加载失败"))
+        }
+        if (mcpCatalogResult.status === "fulfilled") {
+          setMcpCatalog(mcpCatalogResult.value)
+        } else {
+          loadErrors.push(getErrorMessage(mcpCatalogResult.reason, "MCP目录加载失败"))
+        }
+        if (mcpServerResult.status === "fulfilled") {
+          setMcpServers(mcpServerResult.value)
+        } else {
+          loadErrors.push(getErrorMessage(mcpServerResult.reason, "MCP服务器加载失败"))
+        }
+
+        if (loadErrors.length === 4) {
+          setError(loadErrors[0] || "加载失败")
+        } else if (loadErrors.length > 0) {
+          addToast({ type: "warning", message: `部分数据加载失败：${loadErrors[0]}` })
+        }
       } catch (err) {
-        const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "加载失败")
-        if (!cancelled) setError(msg)
+        if (!cancelled) setError(getErrorMessage(err, "加载失败"))
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -172,7 +288,18 @@ export function Skills() {
     return skillCatalog.filter((item) => {
       const name = String(item.name || "").toLowerCase()
       const desc = String(item.description || "").toLowerCase()
-      return name.includes(q) || desc.includes(q)
+      const author = String(item.author || "").toLowerCase()
+      const version = String(item.version || "").toLowerCase()
+      const source = String(item.source || "").toLowerCase()
+      const installSource = String(item.install_source || "").toLowerCase()
+      return (
+        name.includes(q) ||
+        desc.includes(q) ||
+        author.includes(q) ||
+        version.includes(q) ||
+        source.includes(q) ||
+        installSource.includes(q)
+      )
     })
   }, [searchQuery, skillCatalog])
 
@@ -233,20 +360,43 @@ export function Skills() {
   const getErrorMessage = (err: unknown, fallback: string) =>
     err instanceof ApiError ? err.detail : String((err as any)?.message || fallback)
 
-  const notifyRefreshFailed = (err: unknown) => {
-    const detail = err instanceof ApiError ? err.detail : String((err as any)?.message || "")
+  const notifyRefreshIssues = (errors: string[]) => {
+    const detail = errors.filter(Boolean).join("；")
     addToast({
       type: "warning",
       message: detail ? `操作已成功，刷新失败：${detail}` : "操作已成功，刷新失败",
     })
   }
 
-  const markSkillInstalledLocally = (name: string, installed: boolean) => {
-    setSkillCatalog((prev) => prev.map((item) => (item.name === name ? { ...item, installed } : item)))
-    if (!installed) {
-      setSkills((prev) => prev.filter((item) => item.name !== name))
-      setSelectedSkill((prev) => (prev?.name === name ? null : prev))
+  const applySkillMutationFallback = (
+    item: Pick<SkillCatalogItem, "name" | "description" | "source" | "install_source">,
+    installed: boolean
+  ) => {
+    const skillName = String(item.name || "").trim()
+    if (!skillName) return
+    setSkillCatalog((prev) => {
+      const next = prev.map((row) => (row.name === skillName ? { ...row, installed } : row))
+      if (installed && !next.some((row) => row.name === skillName)) {
+        next.unshift({
+          name: skillName,
+          description: item.description,
+          source: item.source,
+          install_source: item.install_source,
+          installed: true,
+          category: "已安装",
+        })
+      }
+      return next
+    })
+    if (installed) {
+      setSkills((prev) => {
+        if (prev.some((row) => row.name === skillName)) return prev
+        return [{ name: skillName, description: item.description, source: "workspace" }, ...prev]
+      })
+      return
     }
+    setSkills((prev) => prev.filter((row) => row.name !== skillName))
+    setSelectedSkill((prev) => (prev?.name === skillName ? null : prev))
   }
 
   const markMcpPresetInstalledLocally = (presetId: string, installed: boolean) => {
@@ -262,13 +412,27 @@ export function Skills() {
     )
   }
 
-  async function reloadInstalledSkillsAndCatalog() {
-    const [installedList, catalogList] = await Promise.all([
+  async function reloadInstalledSkillsAndCatalog(): Promise<{ skillsUpdated: boolean; catalogUpdated: boolean; errors: string[] }> {
+    const [installedResult, catalogResult] = await Promise.allSettled([
       api.get<SkillListItem[]>("/api/skills"),
-      api.get<SkillCatalogItem[]>("/api/skills/catalog"),
+      fetchSkillCatalogWithFallback(),
     ])
-    setSkills(Array.isArray(installedList) ? installedList : [])
-    setSkillCatalog(Array.isArray(catalogList) ? catalogList : [])
+    const errors: string[] = []
+    let skillsUpdated = false
+    let catalogUpdated = false
+    if (installedResult.status === "fulfilled") {
+      setSkills(Array.isArray(installedResult.value) ? installedResult.value : [])
+      skillsUpdated = true
+    } else {
+      errors.push(getErrorMessage(installedResult.reason, "技能列表刷新失败"))
+    }
+    if (catalogResult.status === "fulfilled") {
+      setSkillCatalog(catalogResult.value)
+      catalogUpdated = true
+    } else {
+      errors.push(getErrorMessage(catalogResult.reason, "技能目录刷新失败"))
+    }
+    return { skillsUpdated, catalogUpdated, errors }
   }
 
   async function reloadMcpData() {
@@ -280,17 +444,36 @@ export function Skills() {
     setMcpServers(Array.isArray(serverList) ? serverList : [])
   }
 
-  async function installSkill(name: string) {
+  async function installSkill(item: SkillCatalogItem) {
+    const name = item.name
     const key = `skill:install:${name}`
     if (mutationInFlightRef.current) return
     mutationInFlightRef.current = true
     setMutatingKey(key)
-    let succeeded = false
     try {
-      await api.post("/api/skills/install", { name })
-      succeeded = true
-      markSkillInstalledLocally(name, true)
+      const payload: Record<string, string> = { name }
+      const installSource = String(item.install_source || "").trim().toLowerCase()
+      const rawSource = installSource || String(item.source || "").trim().toLowerCase()
+      const source =
+        rawSource === "clawhub"
+          ? "clawhub"
+          : rawSource === "local" || rawSource === "workspace" || rawSource === "builtin" || rawSource === "store"
+            ? "local"
+            : ""
+      const slug = String(item.slug || "").trim()
+      const version = String(item.version || "").trim()
+      if (source) payload.source = source
+      if (source === "clawhub") {
+        if (slug) payload.slug = slug
+        if (version) payload.version = version
+      }
+      await api.post("/api/skills/install", payload)
       addToast({ type: "success", message: `已安装 Skill：${name}` })
+      const refresh = await reloadInstalledSkillsAndCatalog()
+      if (refresh.errors.length > 0) {
+        applySkillMutationFallback(item, true)
+        notifyRefreshIssues(refresh.errors)
+      }
     } catch (err) {
       const msg = getErrorMessage(err, "安装失败")
       addToast({ type: "error", message: msg })
@@ -299,26 +482,22 @@ export function Skills() {
       setMutatingKey("")
       mutationInFlightRef.current = false
     }
-
-    if (!succeeded) return
-    try {
-      await reloadInstalledSkillsAndCatalog()
-    } catch (err) {
-      notifyRefreshFailed(err)
-    }
   }
 
-  async function uninstallSkill(name: string) {
+  async function uninstallSkill(item: SkillCatalogItem) {
+    const name = item.name
     const key = `skill:uninstall:${name}`
     if (mutationInFlightRef.current) return
     mutationInFlightRef.current = true
     setMutatingKey(key)
-    let succeeded = false
     try {
       await api.delete(`/api/skills/${encodeURIComponent(name)}`)
-      succeeded = true
-      markSkillInstalledLocally(name, false)
       addToast({ type: "success", message: `已卸载 Skill：${name}` })
+      const refresh = await reloadInstalledSkillsAndCatalog()
+      if (refresh.errors.length > 0) {
+        applySkillMutationFallback(item, false)
+        notifyRefreshIssues(refresh.errors)
+      }
     } catch (err) {
       const msg = getErrorMessage(err, "卸载失败")
       addToast({ type: "error", message: msg })
@@ -326,13 +505,6 @@ export function Skills() {
     } finally {
       setMutatingKey("")
       mutationInFlightRef.current = false
-    }
-
-    if (!succeeded) return
-    try {
-      await reloadInstalledSkillsAndCatalog()
-    } catch (err) {
-      notifyRefreshFailed(err)
     }
   }
 
@@ -360,7 +532,7 @@ export function Skills() {
     try {
       await reloadMcpData()
     } catch (err) {
-      notifyRefreshFailed(err)
+      notifyRefreshIssues([getErrorMessage(err, "MCP数据刷新失败")])
     }
   }
 
@@ -388,7 +560,7 @@ export function Skills() {
     try {
       await reloadMcpData()
     } catch (err) {
-      notifyRefreshFailed(err)
+      notifyRefreshIssues([getErrorMessage(err, "MCP数据刷新失败")])
     }
   }
 
@@ -506,6 +678,9 @@ export function Skills() {
                       {shownItems.map((item) => {
                         const isInstalled = Boolean(item.installed)
                         const sourceLabel = normalizeSkillSource(item.source)
+                        const installSourceLabel = normalizeSkillSource(item.install_source)
+                        const authorLabel = formatSkillField(item.author)
+                        const versionLabel = formatSkillField(item.version)
                         const installKey = `skill:install:${item.name}`
                         const uninstallKey = `skill:uninstall:${item.name}`
                         const isInstalling = mutatingKey === installKey
@@ -530,6 +705,12 @@ export function Skills() {
                               <CardDescription className="line-clamp-2 text-xs">
                                 {item.description || "（无描述）"}
                               </CardDescription>
+                              <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+                                <span className="truncate">作者：{authorLabel}</span>
+                                <span className="truncate">版本：{versionLabel}</span>
+                                <span className="truncate">来源：{sourceLabel}</span>
+                                <span className="truncate">安装源：{installSourceLabel}</span>
+                              </div>
                             </CardContent>
                             <CardFooter className={INSTALL_CENTER_FOOTER_CLASS}>
                               <Button
@@ -544,7 +725,7 @@ export function Skills() {
                                 size="sm"
                                 disabled={isMutating}
                                 onClick={() =>
-                                  (isInstalled ? uninstallSkill(item.name) : installSkill(item.name)).catch(() => {})
+                                  (isInstalled ? uninstallSkill(item) : installSkill(item)).catch(() => {})
                                 }
                               >
                                 {isInstalled ? (

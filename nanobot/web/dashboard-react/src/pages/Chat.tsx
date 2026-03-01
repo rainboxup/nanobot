@@ -156,6 +156,7 @@ export function Chat() {
   const sessionsReqRef = useRef(0)
   const activeSessionIdRef = useRef("")
   const boundSessionIdRef = useRef("")
+  const authRetryCountRef = useRef(0)
 
   const { addToast } = useStore()
 
@@ -253,6 +254,11 @@ export function Chat() {
         if (current && mapped.some((item) => item.id === current)) return current
         const preferred = String(preferredSessionId || "").trim()
         if (preferred && mapped.some((item) => item.id === preferred)) return preferred
+        if (current) {
+          const bound = String(boundSessionIdRef.current || "").trim()
+          if (bound && bound === current) return current
+          if (wsStatus !== "closed") return current
+        }
         return mapped[0]?.id || ""
       })
       if (mapped.length === 0) {
@@ -479,6 +485,7 @@ export function Chat() {
       ws.onopen = () => {
         if (wsRef.current !== ws) return
         attempts = 0
+        authRetryCountRef.current = 0
         if (targetSessionId) {
           setBoundSessionId(targetSessionId)
         }
@@ -489,13 +496,22 @@ export function Chat() {
         if (wsRef.current !== ws) return
         wsRef.current = null
         setWsStatus("closed")
+        if (ev.reason) {
+          setWsError(String(ev.reason))
+        }
 
         void (async () => {
           if (cancelled) return
           if (ev.code === 1008) {
+            if (authRetryCountRef.current >= 1) {
+              setWsError("鉴权失败，请重新登录。")
+              handleUnauthorized("鉴权失败，请重新登录。")
+              return
+            }
             const refreshed = await tryRefreshAccessToken().catch(() => false)
             if (refreshed) {
-              scheduleReconnect(200)
+              authRetryCountRef.current += 1
+              scheduleReconnect(500)
               return
             }
             setWsError("登录已失效，请重新登录。")
@@ -503,7 +519,10 @@ export function Chat() {
             return
           }
           attempts += 1
-          const delay = Math.min(30_000, 800 * Math.pow(2, Math.min(attempts, 6)))
+          const baseDelay = Math.min(30_000, 800 * Math.pow(2, Math.min(attempts, 6)))
+          const reason = String(ev.reason || "")
+          const isRateLimited = ev.code === 1013 || /too\s*many\s*requests/i.test(reason)
+          const delay = isRateLimited ? Math.max(baseDelay, 10_000) : baseDelay
           scheduleReconnect(delay)
         })()
       }
@@ -531,7 +550,6 @@ export function Chat() {
             title: String(data.title || data.name || "").trim() || undefined,
             updatedAt: data.updated_at || data.updatedAt || new Date().toISOString(),
           })
-          fetchSessions(sid).catch(() => {})
           return
         }
 

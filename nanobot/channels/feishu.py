@@ -89,8 +89,9 @@ def _extract_interactive_content(content: dict) -> list[str]:
         elif isinstance(title, str):
             parts.append(f"title: {title}")
 
-    for element in content.get("elements", []) if isinstance(content.get("elements"), list) else []:
-        parts.extend(_extract_element_content(element))
+    for elements in content.get("elements", []) if isinstance(content.get("elements"), list) else []:
+        for element in elements:
+            parts.extend(_extract_element_content(element))
 
     card = content.get("card", {})
     if card:
@@ -181,57 +182,59 @@ def _extract_element_content(element: dict) -> list[str]:
 
 
 def _extract_post_content(content_json: dict) -> tuple[str, list[str]]:
-    """Extract text and image keys from Feishu post (rich text) message content.
+    """Extract text and image keys from Feishu post (rich text) message.
 
-    Supports two formats:
-    1. Direct format: {"title": "...", "content": [...]}
-    2. Localized format: {"zh_cn": {"title": "...", "content": [...]}}
-
-    Returns:
-        (text, image_keys) - extracted text and list of image keys
+    Handles three payload shapes:
+    - Direct:    {"title": "...", "content": [[...]]}
+    - Localized: {"zh_cn": {"title": "...", "content": [...]}}
+    - Wrapped:   {"post": {"zh_cn": {"title": "...", "content": [...]}}}
     """
-    def extract_from_lang(lang_content: dict) -> tuple[str | None, list[str]]:
-        if not isinstance(lang_content, dict):
+
+    def _parse_block(block: dict) -> tuple[str | None, list[str]]:
+        if not isinstance(block, dict) or not isinstance(block.get("content"), list):
             return None, []
-        title = lang_content.get("title", "")
-        content_blocks = lang_content.get("content", [])
-        if not isinstance(content_blocks, list):
-            return None, []
-        text_parts = []
-        image_keys = []
-        if title:
-            text_parts.append(title)
-        for block in content_blocks:
-            if not isinstance(block, list):
+        texts, images = [], []
+        if title := block.get("title"):
+            texts.append(title)
+        for row in block["content"]:
+            if not isinstance(row, list):
                 continue
-            for element in block:
-                if isinstance(element, dict):
-                    tag = element.get("tag")
-                    if tag == "text":
-                        text_parts.append(element.get("text", ""))
-                    elif tag == "a":
-                        text_parts.append(element.get("text", ""))
-                    elif tag == "at":
-                        text_parts.append(f"@{element.get('user_name', 'user')}")
-                    elif tag == "img":
-                        img_key = element.get("image_key")
-                        if img_key:
-                            image_keys.append(img_key)
-        text = " ".join(text_parts).strip() if text_parts else None
-        return text, image_keys
+            for el in row:
+                if not isinstance(el, dict):
+                    continue
+                tag = el.get("tag")
+                if tag in ("text", "a"):
+                    texts.append(el.get("text", ""))
+                elif tag == "at":
+                    texts.append(f"@{el.get('user_name', 'user')}")
+                elif tag == "img" and (key := el.get("image_key")):
+                    images.append(key)
+        return (" ".join(texts).strip() or None), images
 
-    # Try direct format first
-    if "content" in content_json:
-        text, images = extract_from_lang(content_json)
-        if text or images:
-            return text or "", images
+    # Unwrap optional {"post": ...} envelope
+    root = content_json
+    if isinstance(root, dict) and isinstance(root.get("post"), dict):
+        root = root["post"]
+    if not isinstance(root, dict):
+        return "", []
 
-    # Try localized format
-    for lang_key in ("zh_cn", "en_us", "ja_jp"):
-        lang_content = content_json.get(lang_key)
-        text, images = extract_from_lang(lang_content)
-        if text or images:
-            return text or "", images
+    # Direct format
+    if "content" in root:
+        text, imgs = _parse_block(root)
+        if text or imgs:
+            return text or "", imgs
+
+    # Localized: prefer known locales, then fall back to any dict child
+    for key in ("zh_cn", "en_us", "ja_jp"):
+        if key in root:
+            text, imgs = _parse_block(root[key])
+            if text or imgs:
+                return text or "", imgs
+    for val in root.values():
+        if isinstance(val, dict):
+            text, imgs = _parse_block(val)
+            if text or imgs:
+                return text or "", imgs
 
     return "", []
 
@@ -312,6 +315,7 @@ class FeishuChannel(BaseChannel):
                 except Exception as e:
                     logger.warning("Feishu WebSocket error: {}", e)
                 if self._running:
+                    import time
                     time.sleep(5)
 
         self._ws_thread = threading.Thread(target=run_ws, daemon=True)
@@ -325,13 +329,14 @@ class FeishuChannel(BaseChannel):
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
-        """Stop the Feishu bot."""
+        """
+        Stop the Feishu bot.
+
+        Notice: lark.ws.Client does not expose stop method， simply exiting the program will close the client.
+
+        Reference: https://github.com/larksuite/oapi-sdk-python/blob/v2_main/lark_oapi/ws/client.py#L86
+        """
         self._running = False
-        if self._ws_client:
-            try:
-                self._ws_client.stop()
-            except Exception as e:
-                logger.warning("Error stopping WebSocket client: {}", e)
         logger.info("Feishu bot stopped")
 
     def _add_reaction_sync(self, message_id: str, emoji_type: str) -> None:
@@ -379,15 +384,13 @@ class FeishuChannel(BaseChannel):
     @staticmethod
     def _parse_md_table(table_text: str) -> dict | None:
         """Parse a markdown table into a Feishu table element."""
-        lines = [line.strip() for line in table_text.strip().split("\n") if line.strip()]
+        lines = [_line.strip() for _line in table_text.strip().split("\n") if _line.strip()]
         if len(lines) < 3:
             return None
-
-        def split_cells(row_text: str) -> list[str]:
-            return [cell.strip() for cell in row_text.strip("|").split("|")]
-
-        headers = split_cells(lines[0])
-        rows = [split_cells(row_text) for row_text in lines[2:]]
+        def split(_line: str) -> list[str]:
+            return [c.strip() for c in _line.strip("|").split("|")]
+        headers = split(lines[0])
+        rows = [split(_line) for _line in lines[2:]]
         columns = [{"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
                    for i, h in enumerate(headers)]
         return {
@@ -695,7 +698,7 @@ class FeishuChannel(BaseChannel):
             msg_type = message.message_type
 
             # Add reaction
-            await self._add_reaction(message_id, "THUMBSUP")
+            await self._add_reaction(message_id, self.config.react_emoji)
 
             # Parse content
             content_parts = []

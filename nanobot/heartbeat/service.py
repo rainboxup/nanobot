@@ -4,56 +4,66 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from loguru import logger
 
-# Default interval: 30 minutes
-DEFAULT_HEARTBEAT_INTERVAL_S = 30 * 60
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
 
-# The prompt sent to agent during heartbeat
-HEARTBEAT_PROMPT = """Read HEARTBEAT.md in your workspace (if it exists).
-Follow any instructions or tasks listed there.
-If nothing needs attention, reply with just: HEARTBEAT_OK"""
-
-# Token that indicates "nothing to do"
-HEARTBEAT_OK_TOKEN = "HEARTBEAT_OK"
-
-
-def _is_heartbeat_empty(content: str | None) -> bool:
-    """Check if HEARTBEAT.md has no actionable content."""
-    if not content:
-        return True
-
-    # Lines to skip: empty, headers, HTML comments, empty checkboxes
-    skip_patterns = {"- [ ]", "* [ ]", "- [x]", "* [x]"}
-
-    for line in content.split("\n"):
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("<!--") or line in skip_patterns:
-            continue
-        return False  # Found actionable content
-
-    return True
+_HEARTBEAT_TOOL = [
+    {
+        "type": "function",
+        "function": {
+            "name": "heartbeat",
+            "description": "Report heartbeat decision after reviewing tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["skip", "run"],
+                        "description": "skip = nothing to do, run = has active tasks",
+                    },
+                    "tasks": {
+                        "type": "string",
+                        "description": "Natural-language summary of active tasks (required for run)",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    }
+]
 
 
 class HeartbeatService:
     """
     Periodic heartbeat service that wakes the agent to check for tasks.
 
-    The agent reads HEARTBEAT.md from the workspace and executes any
-    tasks listed there. If nothing needs attention, it replies HEARTBEAT_OK.
+    Phase 1 (decision): reads HEARTBEAT.md and asks the LLM — via a virtual
+    tool call — whether there are active tasks. This avoids free-text parsing.
+
+    Phase 2 (execution): only triggered when Phase 1 returns ``run``. The
+    ``on_execute`` callback runs the task through the full agent loop and
+    returns the result to deliver.
     """
 
     def __init__(
         self,
         workspace: Path,
-        on_heartbeat: Callable[[str], Coroutine[Any, Any, str]] | None = None,
-        interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
+        provider: "LLMProvider",
+        model: str,
+        on_execute: Callable[[str], Coroutine[Any, Any, str]] | None = None,
+        on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
+        interval_s: int = 30 * 60,
         enabled: bool = True,
     ):
         self.workspace = workspace
-        self.on_heartbeat = on_heartbeat
+        self.provider = provider
+        self.model = model
+        self.on_execute = on_execute
+        self.on_notify = on_notify
         self.interval_s = interval_s
         self.enabled = enabled
         self._running = False
@@ -64,13 +74,40 @@ class HeartbeatService:
         return self.workspace / "HEARTBEAT.md"
 
     def _read_heartbeat_file(self) -> str | None:
-        """Read HEARTBEAT.md content."""
         if self.heartbeat_file.exists():
             try:
                 return self.heartbeat_file.read_text(encoding="utf-8")
             except Exception:
                 return None
         return None
+
+    async def _decide(self, content: str) -> tuple[str, str]:
+        """Phase 1: ask LLM to decide skip/run via virtual tool call."""
+        response = await self.provider.chat(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a heartbeat agent. Call the heartbeat tool to report your decision."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                        f"{content}"
+                    ),
+                },
+            ],
+            tools=_HEARTBEAT_TOOL,
+            model=self.model,
+        )
+
+        if not getattr(response, "has_tool_calls", False):
+            return "skip", ""
+
+        args = response.tool_calls[0].arguments if response.tool_calls else {}
+        return str(args.get("action", "skip")), str(args.get("tasks", ""))
 
     async def start(self) -> None:
         """Start the heartbeat service."""
@@ -108,29 +145,33 @@ class HeartbeatService:
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         content = self._read_heartbeat_file()
-
-        # Skip if HEARTBEAT.md is empty or doesn't exist
-        if _is_heartbeat_empty(content):
-            logger.debug("Heartbeat: no tasks (HEARTBEAT.md empty)")
+        if not content:
+            logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
             return
 
         logger.info("Heartbeat: checking for tasks...")
 
-        if self.on_heartbeat:
-            try:
-                response = await self.on_heartbeat(HEARTBEAT_PROMPT)
+        try:
+            action, tasks = await self._decide(content)
+            if action != "run":
+                logger.info("Heartbeat: OK (nothing to report)")
+                return
 
-                # Check if agent said "nothing to do"
-                if HEARTBEAT_OK_TOKEN.replace("_", "") in response.upper().replace("_", ""):
-                    logger.info("Heartbeat: OK (no action needed)")
-                else:
-                    logger.info("Heartbeat: completed task")
-
-            except Exception as e:
-                logger.error("Heartbeat execution failed: {}", e)
+            logger.info("Heartbeat: tasks found, executing...")
+            if self.on_execute:
+                response = await self.on_execute(tasks)
+                if response and self.on_notify:
+                    logger.info("Heartbeat: completed, delivering response")
+                    await self.on_notify(response)
+        except Exception:
+            logger.exception("Heartbeat execution failed")
 
     async def trigger_now(self) -> str | None:
         """Manually trigger a heartbeat."""
-        if self.on_heartbeat:
-            return await self.on_heartbeat(HEARTBEAT_PROMPT)
-        return None
+        content = self._read_heartbeat_file()
+        if not content:
+            return None
+        action, tasks = await self._decide(content)
+        if action != "run" or not self.on_execute:
+            return None
+        return await self.on_execute(tasks)

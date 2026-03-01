@@ -23,6 +23,7 @@ class ExecTool(Tool):
         deny_patterns: list[str] | None = None,
         allow_patterns: list[str] | None = None,
         restrict_to_workspace: bool = False,
+        path_append: str = "",
         mode: str = "host",
         docker_image: str = "python:3.11-slim",
         docker_runtime: str | None = "runsc",
@@ -38,7 +39,8 @@ class ExecTool(Tool):
             r"\brm\s+-[rf]{1,2}\b",  # rm -r, rm -rf, rm -fr
             r"\bdel\s+/[fq]\b",  # del /f, del /q
             r"\brmdir\s+/s\b",  # rmdir /s
-            r"\b(format|mkfs|diskpart)\b",  # disk operations
+            r"(?:^|[;&|]\s*)format\b",  # format (standalone command only)
+            r"\b(mkfs|diskpart)\b",  # disk operations
             r"\bdd\s+if=",  # dd
             r">\s*/dev/sd",  # write to disk
             r"\b(shutdown|reboot|poweroff)\b",  # system power
@@ -46,6 +48,7 @@ class ExecTool(Tool):
         ]
         self.allow_patterns = allow_patterns or []
         self.restrict_to_workspace = restrict_to_workspace
+        self.path_append = path_append
         self.mode = mode
         self.docker_image = docker_image
         self.docker_runtime = docker_runtime
@@ -106,17 +109,26 @@ class ExecTool(Tool):
             if self.mode == "docker":
                 return await self._execute_docker(command=command, host_workspace=cwd)
 
+            env = os.environ.copy()
+            if self.path_append:
+                env["PATH"] = env.get("PATH", "") + os.pathsep + self.path_append
+
             process = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=cwd,
+                env=env,
             )
 
             try:
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=self.timeout)
             except asyncio.TimeoutError:
                 process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 return f"Error: Command timed out after {self.timeout} seconds"
 
             output_parts = []
@@ -193,13 +205,7 @@ class ExecTool(Tool):
 
             cwd_path = Path(cwd).resolve()
 
-            win_paths = re.findall(r"[A-Za-z]:\\[^\\\"']+", cmd)
-            # Only match absolute paths — avoid false positives on relative
-            # paths like ".venv/bin/python" where "/bin/python" would be
-            # incorrectly extracted by the old pattern.
-            posix_paths = re.findall(r"(?:^|[\s|>])(/[^\s\"'>]+)", cmd)
-
-            for raw in win_paths + posix_paths:
+            for raw in self._extract_absolute_paths(cmd):
                 try:
                     p = Path(raw.strip()).resolve()
                 except Exception:
@@ -770,3 +776,8 @@ class ExecTool(Tool):
             elif result.get("truncated"):
                 text = text + "\n... (truncated)"
         return text
+    @staticmethod
+    def _extract_absolute_paths(command: str) -> list[str]:
+        win_paths = re.findall(r"[A-Za-z]:\\[^\s\"'|><;]+", command)   # Windows: C:\...
+        posix_paths = re.findall(r"(?:^|[\s|>])(/[^\s\"'>]+)", command) # POSIX: /absolute only
+        return win_paths + posix_paths

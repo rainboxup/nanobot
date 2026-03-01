@@ -176,12 +176,21 @@ class WebSearchTool(Tool):
     }
 
     def __init__(self, api_key: str | None = None, max_results: int = 5):
-        self.api_key = api_key or os.environ.get("BRAVE_API_KEY", "")
+        self._init_api_key = api_key
         self.max_results = max_results
+
+    @property
+    def api_key(self) -> str:
+        """Resolve API key at call time so env/config changes are picked up."""
+        return self._init_api_key or os.environ.get("BRAVE_API_KEY", "")
 
     async def execute(self, query: str, count: int | None = None, **kwargs: Any) -> str:
         if not self.api_key:
-            return "Error: BRAVE_API_KEY not configured"
+            return (
+                "Error: Brave Search API key not configured. "
+                "Set it in ~/.nanobot/config.json under tools.web.search.apiKey "
+                "(or export BRAVE_API_KEY), then restart the gateway."
+            )
 
         try:
             n = min(max(count or self.max_results, 1), 10)
@@ -190,7 +199,7 @@ class WebSearchTool(Tool):
                     "https://api.search.brave.com/res/v1/web/search",
                     params={"q": query, "count": n},
                     headers={"Accept": "application/json", "X-Subscription-Token": self.api_key},
-                    timeout=10.0,
+                    timeout=10.0
                 )
                 r.raise_for_status()
 
@@ -258,7 +267,10 @@ class WebFetchTool(Tool):
             url, allow_private_network=self.allow_private_network
         )
         if not is_valid:
-            return json.dumps({"error": f"URL validation failed: {error_msg}", "url": url})
+            return json.dumps(
+                {"error": f"URL validation failed: {error_msg}", "url": url},
+                ensure_ascii=False,
+            )
 
         try:
             async with httpx.AsyncClient(follow_redirects=False, timeout=self.timeout_s) as client:
@@ -275,7 +287,10 @@ class WebFetchTool(Tool):
                         r = resp
                         if resp.status_code in {301, 302, 303, 307, 308}:
                             if redirects >= max(0, int(self.max_redirects)):
-                                return json.dumps({"error": "Too many redirects", "url": url})
+                                return json.dumps(
+                                    {"error": "Too many redirects", "url": url},
+                                    ensure_ascii=False,
+                                )
                             loc = resp.headers.get("location")
                             if not loc:
                                 break
@@ -289,7 +304,8 @@ class WebFetchTool(Tool):
                                         "error": f"Redirect blocked: {err2}",
                                         "url": url,
                                         "redirectUrl": nxt,
-                                    }
+                                    },
+                                    ensure_ascii=False,
                                 )
                             current = nxt
                             redirects += 1
@@ -315,7 +331,10 @@ class WebFetchTool(Tool):
                         break
 
             if r is None:
-                return json.dumps({"error": "Fetch failed (no response)", "url": url})
+                return json.dumps(
+                    {"error": "Fetch failed (no response)", "url": url},
+                    ensure_ascii=False,
+                )
 
             ctype = r.headers.get("content-type", "")
             text_raw = raw.decode("utf-8", errors="replace")
@@ -324,7 +343,10 @@ class WebFetchTool(Tool):
             if "application/json" in ctype:
                 if not download_truncated:
                     try:
-                        text, extractor = json.dumps(json.loads(text_raw), indent=2), "json"
+                        text, extractor = (
+                            json.dumps(json.loads(text_raw), indent=2, ensure_ascii=False),
+                            "json",
+                        )
                     except Exception:
                         text, extractor = text_raw, "raw-json"
                 else:
@@ -356,10 +378,11 @@ class WebFetchTool(Tool):
                     "downloadTruncated": download_truncated,
                     "length": len(text),
                     "text": text,
-                }
+                },
+                ensure_ascii=False,
             )
         except Exception as e:
-            return json.dumps({"error": str(e), "url": url})
+            return json.dumps({"error": str(e), "url": url}, ensure_ascii=False)
 
     def _to_markdown(self, html: str) -> str:
         """Convert HTML to markdown."""

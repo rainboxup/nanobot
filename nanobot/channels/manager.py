@@ -61,7 +61,7 @@ class ChannelManager:
                 )
                 logger.info("Telegram channel enabled")
             except ImportError as e:
-                logger.warning(f"Telegram channel not available: {e}")
+                logger.warning("Telegram channel not available: {}", e)
 
         # WhatsApp channel
         if self.config.channels.whatsapp.enabled:
@@ -85,7 +85,7 @@ class ChannelManager:
                 )
                 logger.info("Discord channel enabled")
             except ImportError as e:
-                logger.warning(f"Discord channel not available: {e}")
+                logger.warning("Discord channel not available: {}", e)
 
         # Feishu channel
         if self.config.channels.feishu.enabled:
@@ -139,28 +139,39 @@ class ChannelManager:
                 self.channels["qq"] = QQChannel(self.config.channels.qq, self.inbound_bus)
                 logger.info("QQ channel enabled")
             except ImportError as e:
-                logger.warning(f"QQ channel not available: {e}")
+                logger.warning("QQ channel not available: {}", e)
+
+        # Matrix channel
+        if self.config.channels.matrix.enabled:
+            try:
+                from nanobot.channels.matrix import MatrixChannel
+                self.channels["matrix"] = MatrixChannel(
+                    self.config.channels.matrix,
+                    self.inbound_bus,
+                )
+                logger.info("Matrix channel enabled")
+            except ImportError as e:
+                logger.warning("Matrix channel not available: {}", e)
 
     async def _start_channel(self, name: str, channel: BaseChannel) -> None:
         """Start a channel and log any exceptions."""
         try:
             await channel.start()
         except Exception as e:
-            logger.error(f"Failed to start channel {name}: {e}")
+            logger.error("Failed to start channel {}: {}", name, e)
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
-        # Start outbound dispatcher
-        self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
-
         if not self.channels:
             logger.warning("No channels enabled")
             return
 
+        # Start outbound dispatcher
+        self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
         # Start channels
         tasks = []
         for name, channel in self.channels.items():
-            logger.info(f"Starting {name} channel...")
+            logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
         # Wait for all to complete (they should run forever)
@@ -182,9 +193,9 @@ class ChannelManager:
         for name, channel in self.channels.items():
             try:
                 await channel.stop()
-                logger.info(f"Stopped {name} channel")
+                logger.info("Stopped {} channel", name)
             except Exception as e:
-                logger.error(f"Error stopping {name}: {e}")
+                logger.error("Error stopping {}: {}", name, e)
 
     async def _dispatch_outbound(self) -> None:
         """Dispatch outbound messages to the appropriate channel."""
@@ -201,9 +212,15 @@ class ChannelManager:
             try:
                 msg = await asyncio.wait_for(self.bus.consume_outbound(), timeout=1.0)
 
+                if msg.metadata.get("_progress"):
+                    if msg.metadata.get("_tool_hint") and not self.config.channels.send_tool_hints:
+                        continue
+                    if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
+                        continue
+
                 channel = self.channels.get(msg.channel)
                 if not channel:
-                    logger.warning(f"Unknown channel: {msg.channel}")
+                    logger.warning("Unknown channel: {}", msg.channel)
                     continue
 
                 limit = limits_by_channel.get(msg.channel)
@@ -232,7 +249,7 @@ class ChannelManager:
                     try:
                         await channel.send(out)
                     except Exception as e:
-                        logger.error(f"Error sending to {msg.channel}: {e}")
+                        logger.error("Error sending to {}: {}", msg.channel, e)
 
             except asyncio.TimeoutError:
                 continue
@@ -250,7 +267,6 @@ class ChannelManager:
         the core channel initialization flow.
         """
         self.channels[name] = channel
-
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {

@@ -1,5 +1,6 @@
 """File system tools: read, write, edit."""
 
+import difflib
 from pathlib import Path
 from typing import Any
 
@@ -7,9 +8,12 @@ from nanobot.agent.tools.base import Tool
 from nanobot.utils.fs import dir_size_bytes
 
 
-def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
-    """Resolve path and optionally enforce directory restriction."""
-    resolved = Path(path).expanduser().resolve()
+def _resolve_path(path: str, workspace: Path | None = None, allowed_dir: Path | None = None) -> Path:
+    """Resolve path against workspace (if relative) and enforce directory restriction."""
+    p = Path(path).expanduser()
+    if not p.is_absolute() and workspace:
+        p = workspace / p
+    resolved = p.resolve()
     if allowed_dir:
         allowed = allowed_dir.expanduser().resolve()
         try:
@@ -24,7 +28,13 @@ def _resolve_path(path: str, allowed_dir: Path | None = None) -> Path:
 class ReadFileTool(Tool):
     """Tool to read file contents."""
 
-    def __init__(self, allowed_dir: Path | None = None, max_read_bytes: int = 200_000):
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        allowed_dir: Path | None = None,
+        max_read_bytes: int = 200_000,
+    ):
+        self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._max_read_bytes = max(1, int(max_read_bytes))
 
@@ -46,7 +56,7 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():
@@ -77,10 +87,12 @@ class WriteFileTool(Tool):
 
     def __init__(
         self,
+        workspace: Path | None = None,
         allowed_dir: Path | None = None,
         max_write_bytes: int = 200_000,
         workspace_quota_mib: int = 50,
     ):
+        self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._max_write_bytes = max(1, int(max_write_bytes))
         self._workspace_quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
@@ -106,7 +118,7 @@ class WriteFileTool(Tool):
 
     async def execute(self, path: str, content: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             data = (content or "").encode("utf-8")
             if len(data) > self._max_write_bytes:
                 return (
@@ -145,11 +157,13 @@ class EditFileTool(Tool):
 
     def __init__(
         self,
+        workspace: Path | None = None,
         allowed_dir: Path | None = None,
         max_edit_bytes: int = 500_000,
         max_write_bytes: int = 200_000,
         workspace_quota_mib: int = 50,
     ):
+        self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._max_edit_bytes = max(1, int(max_edit_bytes))
         self._max_write_bytes = max(1, int(max_write_bytes))
@@ -179,7 +193,7 @@ class EditFileTool(Tool):
 
     async def execute(self, path: str, old_text: str, new_text: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._allowed_dir)
+            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if not file_path.exists():
                 return f"Error: File not found: {path}"
 
@@ -196,7 +210,7 @@ class EditFileTool(Tool):
             content = file_path.read_text(encoding="utf-8")
 
             if old_text not in content:
-                return "Error: old_text not found in file. Make sure it matches exactly."
+                return self._not_found_message(old_text, content, path)
 
             # Count occurrences
             count = content.count(old_text)
@@ -230,11 +244,39 @@ class EditFileTool(Tool):
         except Exception as e:
             return f"Error editing file: {str(e)}"
 
+    @staticmethod
+    def _not_found_message(old_text: str, content: str, path: str) -> str:
+        """Build a helpful error when old_text is not found."""
+        lines = content.splitlines(keepends=True)
+        old_lines = old_text.splitlines(keepends=True)
+        window = len(old_lines)
+
+        best_ratio, best_start = 0.0, 0
+        for i in range(max(1, len(lines) - window + 1)):
+            ratio = difflib.SequenceMatcher(None, old_lines, lines[i : i + window]).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_start = ratio, i
+
+        if best_ratio > 0.5:
+            diff = "\n".join(
+                difflib.unified_diff(
+                    old_lines,
+                    lines[best_start : best_start + window],
+                    fromfile="old_text (provided)",
+                    tofile=f"{path} (actual, line {best_start + 1})",
+                    lineterm="",
+                )
+            )
+            return f"Error: old_text not found in {path}.\nBest match ({best_ratio:.0%} similar) at line {best_start + 1}:\n{diff}"
+        return (
+            f"Error: old_text not found in {path}. No similar text found. Verify the file content."
+        )
 
 class ListDirTool(Tool):
     """Tool to list directory contents."""
 
-    def __init__(self, allowed_dir: Path | None = None, max_entries: int = 200):
+    def __init__(self, workspace: Path | None = None, allowed_dir: Path | None = None, max_entries: int = 200):
+        self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._max_entries = max(1, int(max_entries))
 
@@ -256,7 +298,7 @@ class ListDirTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            dir_path = _resolve_path(path, self._allowed_dir)
+            dir_path = _resolve_path(path, self._workspace, self._allowed_dir)
             if not dir_path.exists():
                 return f"Error: Directory not found: {path}"
             if not dir_path.is_dir():

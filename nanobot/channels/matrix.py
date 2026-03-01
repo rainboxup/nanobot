@@ -14,6 +14,7 @@ try:
     from nio import (
         AsyncClient,
         AsyncClientConfig,
+        ContentRepositoryConfigError,
         DownloadError,
         InviteEvent,
         JoinError,

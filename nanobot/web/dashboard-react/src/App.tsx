@@ -50,12 +50,18 @@ export default function App() {
       }
 
       try {
-        const me = await api.get<{ username: string; tenant_id: string; role: string }>("/api/auth/me")
+        const me = await api.get<{
+          username: string
+          tenant_id: string
+          role: string
+          is_beta_admin?: boolean
+        }>("/api/auth/me")
         if (!cancelled) {
           setUser({
             username: String(me.username || ""),
-            role: String(me.role || "member") as any,
+            role: String(me.role || "member").toLowerCase() as any,
             tenant_id: String(me.tenant_id || ""),
+            is_beta_admin: Boolean(me.is_beta_admin),
           })
         }
       } catch {

@@ -1,7 +1,10 @@
 """Session management for conversation history."""
 
 import json
+import os
 import shutil
+import threading
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +85,16 @@ class SessionManager:
         self.legacy_sessions_dir = Path.home() / ".nanobot" / "sessions"
         self._migrate_legacy = sessions_dir is None
         self._cache: dict[str, Session] = {}
+        self._cache_lock = threading.RLock()
+        self._session_locks: dict[str, threading.RLock] = {}
+
+    def _session_lock(self, key: str) -> threading.RLock:
+        with self._cache_lock:
+            lock = self._session_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._session_locks[key] = lock
+            return lock
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -103,15 +116,43 @@ class SessionManager:
         Returns:
             The session.
         """
-        if key in self._cache:
-            return self._cache[key]
+        with self._session_lock(key):
+            with self._cache_lock:
+                if key in self._cache:
+                    return self._cache[key]
 
-        session = self._load(key)
-        if session is None:
-            session = Session(key=key)
+            session = self._load(key)
+            if session is None:
+                session = Session(key=key)
 
-        self._cache[key] = session
-        return session
+            with self._cache_lock:
+                self._cache[key] = session
+            return session
+
+    def get(self, key: str) -> Session | None:
+        """Get an existing session without creating a new one."""
+        with self._session_lock(key):
+            with self._cache_lock:
+                if key in self._cache:
+                    return self._cache[key]
+
+            session = self._load(key)
+            if session is None:
+                return None
+
+            with self._cache_lock:
+                self._cache[key] = session
+            return session
+
+    def create(self, key: str, metadata: dict[str, Any] | None = None) -> Session:
+        """Create and persist a new session, overwriting any existing one with the same key."""
+        with self._session_lock(key):
+            session = Session(
+                key=key,
+                metadata=dict(metadata or {}),
+            )
+            self.save(session)
+            return session
 
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
@@ -169,25 +210,82 @@ class SessionManager:
     def save(self, session: Session) -> None:
         """Save a session to disk."""
         path = self._get_session_path(session.key)
+        tmp_path = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+        lock = self._session_lock(session.key)
 
-        with open(path, "w", encoding="utf-8") as f:
-            metadata_line = {
-                "_type": "metadata",
-                "key": session.key,
-                "created_at": session.created_at.isoformat(),
-                "updated_at": session.updated_at.isoformat(),
-                "metadata": session.metadata,
-                "last_consolidated": session.last_consolidated
-            }
-            f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
-            for msg in session.messages:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        with lock:
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    metadata_line = {
+                        "_type": "metadata",
+                        "key": session.key,
+                        "created_at": session.created_at.isoformat(),
+                        "updated_at": session.updated_at.isoformat(),
+                        "metadata": session.metadata,
+                        "last_consolidated": session.last_consolidated
+                    }
+                    f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
+                    for msg in session.messages:
+                        f.write(json.dumps(msg, ensure_ascii=False) + "\n")
 
-        self._cache[session.key] = session
+                os.replace(tmp_path, path)
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except Exception:
+                        pass
+
+            with self._cache_lock:
+                self._cache[session.key] = session
+
+    def update_title(self, key: str, title: str | None) -> Session | None:
+        """Update metadata.title for an existing session."""
+        with self._session_lock(key):
+            session = self.get(key)
+            if session is None:
+                return None
+
+            if not isinstance(session.metadata, dict):
+                session.metadata = {}
+
+            title_text = str(title or "").strip()
+            if title_text:
+                session.metadata["title"] = title_text
+            else:
+                session.metadata.pop("title", None)
+            session.updated_at = datetime.now()
+            self.save(session)
+            return session
+
+    def delete(self, key: str) -> bool:
+        """Delete a session from disk and in-memory cache."""
+        lock = self._session_lock(key)
+        with lock:
+            deleted = False
+            try:
+                path = self._get_session_path(key)
+                if path.exists():
+                    path.unlink()
+                    deleted = True
+
+                if self._migrate_legacy:
+                    legacy_path = self._get_legacy_session_path(key)
+                    if legacy_path.exists():
+                        legacy_path.unlink()
+                        deleted = True
+            except Exception as e:
+                logger.warning("Failed to delete session {}: {}", key, e)
+                return False
+            finally:
+                self.invalidate(key)
+
+            return deleted
 
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
-        self._cache.pop(key, None)
+        with self._cache_lock:
+            self._cache.pop(key, None)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """
@@ -207,10 +305,16 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
+                            metadata = data.get("metadata", {})
+                            if not isinstance(metadata, dict):
+                                metadata = {}
+                            title = str(metadata.get("title") or "").strip() or None
                             sessions.append({
                                 "key": key,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
+                                "title": title,
+                                "metadata": metadata,
                                 "path": str(path)
                             })
             except Exception:

@@ -151,6 +151,7 @@ export function Channels() {
 
   function buildUpdateFromValues(config: Record<string, any>) {
     const update: Record<string, any> = {}
+    const errors: string[] = []
 
     function walk(obj: any, prefix: string) {
       for (const [k, v] of Object.entries(obj || {})) {
@@ -175,8 +176,17 @@ export function Channels() {
         }
 
         if (kind === "number") {
-          const n = Number(String(nextVal || "").trim())
-          setByPath(update, path, Number.isFinite(n) ? n : 0)
+          const raw = String(nextVal ?? "").trim()
+          if (raw === "") {
+            errors.push(`${path} 不能为空`)
+            continue
+          }
+          const n = Number(raw)
+          if (!Number.isFinite(n)) {
+            errors.push(`${path} 必须是数字`)
+            continue
+          }
+          setByPath(update, path, n)
           continue
         }
 
@@ -195,7 +205,7 @@ export function Channels() {
     }
 
     walk(config || {}, "")
-    return update
+    return { update, errors }
   }
 
   async function saveConfig() {
@@ -205,7 +215,13 @@ export function Channels() {
     setSaving(true)
     setDetailError("")
     try {
-      const payload = buildUpdateFromValues(activeChannel.config || {})
+      const { update: payload, errors } = buildUpdateFromValues(activeChannel.config || {})
+      if (errors.length > 0) {
+        const msg = `请先修正配置字段：${errors.slice(0, 5).join("；")}${errors.length > 5 ? "；..." : ""}`
+        setDetailError(msg)
+        addToast({ id: `channel:${activeChannel.name}`, type: "error", message: msg })
+        return
+      }
       await api.put(`/api/channels/${encodeURIComponent(activeChannel.name)}`, payload)
       addToast({ id: `channel:${activeChannel.name}`, type: "success", message: "已保存" })
       setDrawerOpen(false)

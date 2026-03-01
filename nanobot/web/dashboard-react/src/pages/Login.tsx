@@ -43,8 +43,9 @@ export function Login() {
       setAuthTokens(String(res.access_token || res.token || ""), String(res.refresh_token || ""))
       setUser({
         username: String(res.username || payload.username || ""),
-        role: String(res.role || "member") as any,
+        role: String(res.role || "member").toLowerCase() as any,
         tenant_id: String(res.tenant_id || ""),
+        is_beta_admin: Boolean(res.is_beta_admin),
       })
       addToast({ type: "success", message: "登录成功" })
       navigate("/chat")

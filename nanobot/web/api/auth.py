@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
-from nanobot.web.beta_access import get_beta_store
+from nanobot.web.beta_access import get_beta_store, is_beta_admin, normalize_username
 from nanobot.web.user_store import ROLE_MEMBER, ROLE_OWNER, VALID_ROLES, UserStore
 
 router = APIRouter()
@@ -172,10 +172,13 @@ def _require_action_reason(value: str | None) -> str:
 
 @router.get("/api/auth/me")
 async def auth_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str, Any]:
+    username = normalize_username(str(user.get("sub") or ""))
+    role = str(user.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
     return {
-        "username": str(user.get("sub") or ""),
+        "username": username,
         "tenant_id": str(user.get("tenant_id") or ""),
-        "role": str(user.get("role") or ROLE_MEMBER),
+        "role": role,
+        "is_beta_admin": bool(role == ROLE_OWNER and is_beta_admin(username)),
     }
 
 

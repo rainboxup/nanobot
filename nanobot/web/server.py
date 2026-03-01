@@ -20,7 +20,13 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.web.audit import AuditLogger, request_ip, resolve_audit_log_path
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
-from nanobot.web.beta_access import BetaAccessStore, parse_allowlist_env, resolve_beta_state_path
+from nanobot.web.beta_access import (
+    BetaAccessStore,
+    is_beta_admin,
+    normalize_username,
+    parse_allowlist_env,
+    resolve_beta_state_path,
+)
 from nanobot.web.login_guard import LoginAttemptGuard, LoginGuardConfig, resolve_login_guard_path
 from nanobot.web.user_store import ROLE_MEMBER, ROLE_OWNER, UserStore, resolve_auth_state_path
 
@@ -439,15 +445,18 @@ def create_app(
         if isinstance(login_guard, LoginAttemptGuard):
             login_guard.record_success(username, source_ip)
         _audit_login("succeeded", "ok")
+        username_out = normalize_username(str(user_rec.get("username") or username))
+        role_out = str(user_rec.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
         return {
             "token": access_token,
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
             "expires_in": access_ttl,
-            "role": str(user_rec.get("role") or ROLE_MEMBER),
+            "role": role_out,
             "tenant_id": str(user_rec.get("tenant_id") or username),
-            "username": str(user_rec.get("username") or username),
+            "username": username_out,
+            "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
         }
 
     # Routers

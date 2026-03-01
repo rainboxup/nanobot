@@ -8,6 +8,8 @@ import { Input } from "@/src/components/ui/input"
 import { Badge } from "@/src/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/src/components/ui/table"
 
+const MAX_UNLOCK_BATCH = 100
+
 function formatDateTime(value: any): string {
   try {
     return new Date(value).toLocaleString()
@@ -157,8 +159,11 @@ export function Security() {
       return
     }
     try {
-      await api.post("/api/security/login-locks/unlock-batch", { subject_keys: subjectKeys, reason })
-      addToast({ type: "success", message: "已批量解锁" })
+      for (let i = 0; i < subjectKeys.length; i += MAX_UNLOCK_BATCH) {
+        const chunk = subjectKeys.slice(i, i + MAX_UNLOCK_BATCH)
+        await api.post("/api/security/login-locks/unlock-batch", { subject_keys: chunk, reason })
+      }
+      addToast({ type: "success", message: `已批量解锁（${subjectKeys.length}）` })
       setSelectedLockKeys(new Set())
       await loadLocks()
       focusUnlockAudit({ reason, mode: "batch" })
@@ -374,6 +379,11 @@ export function Security() {
         {lockError && (
           <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
             {lockError}
+          </div>
+        )}
+        {selectedLockedCount > MAX_UNLOCK_BATCH && (
+          <div className="text-xs text-muted-foreground">
+            已选择 {selectedLockedCount} 项，提交时会按 {MAX_UNLOCK_BATCH} 条/批自动分批解锁。
           </div>
         )}
 

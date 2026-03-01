@@ -3,7 +3,10 @@ import { cn } from "@/src/lib/utils"
 import { Database, Network, Users, Shield, Key } from "lucide-react"
 import { useStore } from "@/src/store/useStore"
 
-function allowedSettingsTabs(role: string): Array<"providers" | "channels" | "beta" | "users" | "security"> {
+function allowedSettingsTabs(
+  role: string,
+  isBetaAdmin: boolean
+): Array<"providers" | "channels" | "beta" | "users" | "security"> {
   const r = String(role || "").toLowerCase()
   const isOwner = r === "owner"
   const isAdmin = r === "admin" || isOwner
@@ -13,8 +16,10 @@ function allowedSettingsTabs(role: string): Array<"providers" | "channels" | "be
     tabs.unshift("channels")
     tabs.unshift("providers")
   }
-  if (isOwner) {
+  if (isOwner && isBetaAdmin) {
     tabs.push("beta")
+  }
+  if (isOwner) {
     tabs.push("security")
   }
   return tabs
@@ -22,7 +27,7 @@ function allowedSettingsTabs(role: string): Array<"providers" | "channels" | "be
 
 export function SettingsIndex() {
   const { lastSettingsPath, user } = useStore()
-  const allowed = allowedSettingsTabs(user?.role || "member")
+  const allowed = allowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
   const desired = (lastSettingsPath || "").trim() as any
   const target = (desired && allowed.includes(desired)) ? desired : allowed[0]
   return <Navigate to={`/settings/${target}`} replace />
@@ -30,7 +35,7 @@ export function SettingsIndex() {
 
 export function Settings() {
   const { setLastSettingsPath, user } = useStore()
-  const allowed = allowedSettingsTabs(user?.role || "member")
+  const allowed = allowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
 
   const navItems = [
     ...(allowed.includes("providers") ? [{ name: "模型服务", path: "/settings/providers", icon: Database }] : []),

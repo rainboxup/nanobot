@@ -62,7 +62,7 @@ export function Ops() {
     addToast({ type: "success", message: "运维快照已复制到剪贴板" })
   }
 
-  if (!user || user.role !== "owner") {
+  if (!user || String(user.role || "").toLowerCase() !== "owner") {
     return (
       <div className="flex h-[calc(100vh-3.5rem)] flex-col items-center justify-center p-4">
         <div className="flex max-w-md flex-col items-center space-y-4 text-center">

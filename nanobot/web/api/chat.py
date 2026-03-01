@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import re
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
 from loguru import logger
+from pydantic import BaseModel, Field
 
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
@@ -14,6 +16,16 @@ from nanobot.web.auth import get_current_user, verify_token
 from nanobot.web.tenant import load_tenant_config, tenant_id_from_claims
 
 router = APIRouter()
+_SESSION_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
+_SESSION_TITLE_MAX_LEN = 200
+
+
+class ChatSessionCreateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=_SESSION_TITLE_MAX_LEN)
+
+
+class ChatSessionTitleUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=_SESSION_TITLE_MAX_LEN)
 
 
 def _get_bus(request_or_ws: Request | WebSocket) -> MessageBus:
@@ -38,6 +50,53 @@ def _get_session_manager(app) -> Any:
 
 def _session_prefix(claims: dict[str, Any]) -> str:
     return f"web:{tenant_id_from_claims(claims)}:"
+
+
+def _new_session_id(claims: dict[str, Any]) -> str:
+    return f"{_session_prefix(claims)}{uuid.uuid4().hex[:8]}"
+
+
+def _validate_session_id(session_id: str, claims: dict[str, Any]) -> str:
+    sid = str(session_id or "").strip()
+    if not sid:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="session_id required")
+
+    prefix = _session_prefix(claims)
+    if not sid.startswith(prefix):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    suffix = sid[len(prefix):]
+    if not _SESSION_SUFFIX_RE.fullmatch(suffix):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid session_id format",
+        )
+
+    return sid
+
+
+def _normalize_title(value: str | None) -> str | None:
+    title = str(value or "").strip()
+    if not title:
+        return None
+    if len(title) > _SESSION_TITLE_MAX_LEN:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"title too long (max {_SESSION_TITLE_MAX_LEN})",
+        )
+    return title
+
+
+def _session_view(session) -> dict[str, Any]:
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    title = str(metadata.get("title") or "").strip() or None
+    return {
+        "key": session.key,
+        "created_at": session.created_at.isoformat(),
+        "updated_at": session.updated_at.isoformat(),
+        "title": title,
+        "metadata": metadata,
+    }
 
 
 def _extract_ws_token(ws: WebSocket) -> tuple[str, str | None]:
@@ -79,7 +138,15 @@ async def ws_chat(ws: WebSocket) -> None:
         return
 
     user = tenant_id_from_claims(claims)
-    session_id = f"{_session_prefix(claims)}{uuid.uuid4().hex[:8]}"
+    requested_session_id = str(ws.query_params.get("session_id") or "").strip()
+    if requested_session_id:
+        try:
+            session_id = _validate_session_id(requested_session_id, claims)
+        except HTTPException:
+            await ws.close(code=1008)
+            return
+    else:
+        session_id = _new_session_id(claims)
 
     await ws.accept(subprotocol=negotiated_subprotocol)
 
@@ -134,13 +201,14 @@ async def chat_history(
     if not session_id:
         return []
 
-    if not session_id.startswith(_session_prefix(user)):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    session_id = _validate_session_id(session_id, user)
 
     max_messages = max(1, min(200, int(max_messages)))
 
     sm = _get_session_manager(request.app)
-    session = sm.get_or_create(session_id)
+    session = sm.get(session_id)
+    if session is None:
+        return []
 
     # Preserve timestamps for UI; keep shape stable for clients.
     recent = session.messages[-int(max_messages) :] if session.messages else []
@@ -148,6 +216,59 @@ async def chat_history(
         {"role": m.get("role"), "content": m.get("content"), "timestamp": m.get("timestamp")}
         for m in recent
     ]
+
+
+@router.post("/api/chat/sessions", status_code=status.HTTP_201_CREATED)
+async def create_chat_session(
+    request: Request,
+    payload: ChatSessionCreateRequest | None = None,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    sm = _get_session_manager(request.app)
+    title = _normalize_title((payload.title if payload else None))
+    metadata = {"title": title} if title else {}
+
+    for _ in range(8):
+        session_id = _new_session_id(user)
+        if sm.get(session_id) is not None:
+            continue
+        session = sm.create(session_id, metadata=metadata)
+        return _session_view(session)
+
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="Failed to allocate session_id",
+    )
+
+
+@router.patch("/api/chat/sessions/{session_id}")
+async def update_chat_session_title(
+    session_id: str,
+    payload: ChatSessionTitleUpdateRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    sid = _validate_session_id(session_id, user)
+    title = _normalize_title(payload.title)
+    sm = _get_session_manager(request.app)
+    session = sm.update_title(sid, title)
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    return _session_view(session)
+
+
+@router.delete("/api/chat/sessions/{session_id}")
+async def delete_chat_session(
+    session_id: str,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    sid = _validate_session_id(session_id, user)
+    sm = _get_session_manager(request.app)
+    deleted = sm.delete(sid)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    return {"deleted": True, "session_id": sid}
 
 
 @router.get("/api/chat/sessions")

@@ -55,6 +55,19 @@ export class ApiError extends Error {
   }
 }
 
+export function handleUnauthorized(detail: string = "Unauthorized"): ApiError {
+  clearAuthTokens();
+  try {
+    useStore.getState().setUser(null);
+  } catch {
+    // ignore store access failures
+  }
+  if (window.location.hash !== "#/login") {
+    window.location.hash = "#/login";
+  }
+  return new ApiError(401, detail);
+}
+
 let refreshInFlight: Promise<boolean> | null = null;
 
 async function refreshAccessToken(): Promise<boolean> {
@@ -125,6 +138,43 @@ async function _readResponseData(res: Response): Promise<any> {
   }
 }
 
+function _formatApiErrorDetail(data: any, fallback: string): string {
+  if (data == null) return fallback;
+  const detail = typeof data === "object" ? (data.detail ?? data.error) : data;
+
+  if (Array.isArray(detail)) {
+    const lines = detail
+      .map((item) => {
+        if (!item || typeof item !== "object") return String(item || "").trim();
+        const loc = Array.isArray((item as any).loc)
+          ? (item as any).loc.map((x: any) => String(x)).join(".")
+          : "";
+        const msg = String((item as any).msg || "").trim();
+        if (loc && msg) return `${loc}: ${msg}`;
+        return msg || loc;
+      })
+      .filter(Boolean);
+    return lines.join("; ") || fallback;
+  }
+
+  if (typeof detail === "string") {
+    return detail.trim() || fallback;
+  }
+
+  if (detail && typeof detail === "object") {
+    const msg = String((detail as any).msg || (detail as any).message || "").trim();
+    if (msg) return msg;
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return fallback;
+    }
+  }
+
+  const text = String(detail || "").trim();
+  return text || fallback;
+}
+
 async function requestResponse(
   method: string,
   path: string,
@@ -151,23 +201,12 @@ async function requestResponse(
   }
 
   if (res.status === 401) {
-    clearAuthTokens();
-    try {
-      useStore.getState().setUser(null);
-    } catch {
-      // ignore store access failures
-    }
-    // HashRouter: force redirect to login.
-    window.location.hash = "#/login";
-    throw new ApiError(401, "Unauthorized");
+    throw handleUnauthorized("Unauthorized");
   }
 
   if (!res.ok) {
     const data = await _readResponseData(res.clone());
-    const detail =
-      typeof data === "object" && data && (data.detail || data.error)
-        ? String(data.detail || data.error)
-        : String(res.statusText || `HTTP ${res.status}`);
+    const detail = _formatApiErrorDetail(data, String(res.statusText || `HTTP ${res.status}`));
     throw new ApiError(res.status, detail);
   }
 
@@ -188,6 +227,7 @@ async function request<T>(
 export const api = {
   get: <T>(path: string) => request<T>("GET", path),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
+  patch: <T>(path: string, body?: unknown) => request<T>("PATCH", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   delete: <T>(path: string) => request<T>("DELETE", path),
   fetch: (path: string, init?: RequestInit) =>

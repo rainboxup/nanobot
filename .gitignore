@@ -29,3 +29,9 @@ _bmad/
 _bmad-output/
 .spec-workflow/
 .workflow/
+
+# Local development artifacts
+.codex/
+.coverage
+superpowers-temp/
+tmp-cron-test/

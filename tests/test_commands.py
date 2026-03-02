@@ -110,6 +110,22 @@ def test_config_matches_openai_codex_with_hyphen_prefix():
     assert config.get_provider_name() == "openai_codex"
 
 
+def test_config_forced_provider_normalizes_hyphen_alias():
+    config = Config()
+    config.agents.defaults.provider = "openai-codex"
+
+    assert config.get_provider_name() == "openai_codex"
+
+
+def test_config_unknown_forced_provider_falls_back_to_auto_matching():
+    config = Config()
+    config.agents.defaults.provider = "legacy-provider"
+    config.agents.defaults.model = "openai/gpt-4o-mini"
+    config.providers.openai.api_key = "sk-test"
+
+    assert config.get_provider_name() == "openai"
+
+
 def test_find_by_model_prefers_explicit_prefix_over_generic_codex_keyword():
     spec = find_by_model("github-copilot/gpt-5.3-codex")
 

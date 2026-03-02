@@ -38,3 +38,32 @@ def test_load_config_strict_raises_on_invalid_json(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="Failed to load config"):
         load_config(config_path=bad, allow_env_override=False, strict=True)
+
+
+def test_load_config_non_strict_tolerates_invalid_tools_shape(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("NANOBOT_TOOLS__EXEC__TIMEOUT", "75")
+    bad = tmp_path / "broken-shape.json"
+    bad.write_text(json.dumps({"tools": "invalid-shape"}), encoding="utf-8")
+
+    cfg = load_config(config_path=bad, allow_env_override=True, strict=False)
+    assert cfg.tools.exec.timeout == 75
+
+
+def test_load_config_strict_raises_on_invalid_tools_shape(tmp_path) -> None:
+    bad = tmp_path / "broken-shape-strict.json"
+    bad.write_text(json.dumps({"tools": "invalid-shape"}), encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="Failed to validate config"):
+        load_config(config_path=bad, allow_env_override=True, strict=True)
+
+
+def test_load_config_strict_without_env_override_rejects_invalid_section_shape(tmp_path) -> None:
+    bad = tmp_path / "broken-shape-strict-no-env.json"
+    bad.write_text(json.dumps({"tools": "invalid-shape"}), encoding="utf-8")
+
+    import pytest
+
+    with pytest.raises(ValueError, match="config section 'tools' must be an object"):
+        load_config(config_path=bad, allow_env_override=False, strict=True)

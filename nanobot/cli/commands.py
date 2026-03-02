@@ -506,6 +506,7 @@ def gateway(
             bus,
             channel_manager=channels,
             session_manager=session_manager,
+            cron_service=cron,
         )
         web_server = uvicorn.Server(
             uvicorn.Config(web_app, host=web_host, port=web_port, log_level="info")
@@ -952,10 +953,21 @@ def cron_run(
     async def run():
         return await service.run_job(job_id, force=force)
 
-    if asyncio.run(run()):
-        console.print("[green]✓[/green] Job executed")
-    else:
+    if not asyncio.run(run()):
         console.print(f"[red]Failed to run job {job_id}[/red]")
+        return
+
+    job = next((j for j in service.list_jobs(include_disabled=True) if j.id == job_id), None)
+    status = str(getattr(getattr(job, "state", None), "last_status", "") or "").lower()
+    last_error = str(getattr(getattr(job, "state", None), "last_error", "") or "").strip()
+    if status == "skipped":
+        detail = f" ({last_error})" if last_error else ""
+        console.print(f"[yellow]![/yellow] Job skipped{detail}")
+    elif status == "error":
+        detail = f": {last_error}" if last_error else ""
+        console.print(f"[red]✗[/red] Job failed{detail}")
+    else:
+        console.print("[green]✓[/green] Job executed")
 
 
 # ============================================================================

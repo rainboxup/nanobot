@@ -8,9 +8,10 @@ import { useEffect } from "react"
 import { Layout } from "./components/layout/Layout"
 import { Login } from "./pages/Login"
 import { Chat } from "./pages/Chat"
-import { Settings, SettingsIndex } from "./pages/Settings"
+import { Settings, SettingsIndex, getAllowedSettingsTabs, getDefaultSettingsTab, type SettingsTab } from "./pages/Settings"
 import { Providers } from "./pages/settings/Providers"
 import { Channels } from "./pages/settings/Channels"
+import { Cron } from "./pages/settings/Cron"
 import { Beta } from "./pages/settings/Beta"
 import { Users } from "./pages/settings/Users"
 import { Security } from "./pages/settings/Security"
@@ -32,6 +33,15 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
     return <Navigate to="/login" replace />
   }
   return <>{children}</>
+}
+
+function SettingsRouteGuard({ tab, children }: { tab: SettingsTab; children: React.ReactNode }) {
+  const { user } = useStore()
+  const role = String(user?.role || "member")
+  const isBetaAdmin = Boolean(user?.is_beta_admin)
+  const allowed = getAllowedSettingsTabs(role, isBetaAdmin)
+  if (allowed.includes(tab)) return <>{children}</>
+  return <Navigate to={`/settings/${getDefaultSettingsTab(role, isBetaAdmin)}`} replace />
 }
 
 export default function App() {
@@ -93,11 +103,12 @@ export default function App() {
           
           <Route path="settings" element={<Settings />}>
             <Route index element={<SettingsIndex />} />
-            <Route path="providers" element={<Providers />} />
-            <Route path="channels" element={<Channels />} />
-            <Route path="beta" element={<Beta />} />
-            <Route path="users" element={<Users />} />
-            <Route path="security" element={<Security />} />
+            <Route path="providers" element={<SettingsRouteGuard tab="providers"><Providers /></SettingsRouteGuard>} />
+            <Route path="channels" element={<SettingsRouteGuard tab="channels"><Channels /></SettingsRouteGuard>} />
+            <Route path="cron" element={<SettingsRouteGuard tab="cron"><Cron /></SettingsRouteGuard>} />
+            <Route path="beta" element={<SettingsRouteGuard tab="beta"><Beta /></SettingsRouteGuard>} />
+            <Route path="users" element={<SettingsRouteGuard tab="users"><Users /></SettingsRouteGuard>} />
+            <Route path="security" element={<SettingsRouteGuard tab="security"><Security /></SettingsRouteGuard>} />
           </Route>
           
           <Route path="skills" element={<Skills />} />

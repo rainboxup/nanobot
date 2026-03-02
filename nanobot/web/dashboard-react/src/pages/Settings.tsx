@@ -1,20 +1,25 @@
 import { Outlet, NavLink, Navigate } from "react-router-dom"
 import { cn } from "@/src/lib/utils"
-import { Database, Network, Users, Shield, Key } from "lucide-react"
+import { Database, Network, Users, Shield, Key, CalendarClock } from "lucide-react"
 import { useStore } from "@/src/store/useStore"
 
-function allowedSettingsTabs(
+export type SettingsTab = "providers" | "channels" | "cron" | "beta" | "users" | "security"
+
+export function getAllowedSettingsTabs(
   role: string,
   isBetaAdmin: boolean
-): Array<"providers" | "channels" | "beta" | "users" | "security"> {
+): SettingsTab[] {
   const r = String(role || "").toLowerCase()
   const isOwner = r === "owner"
   const isAdmin = r === "admin" || isOwner
 
-  const tabs: Array<"providers" | "channels" | "beta" | "users" | "security"> = ["users"]
+  const tabs: SettingsTab[] = ["users"]
   if (isAdmin) {
     tabs.unshift("channels")
     tabs.unshift("providers")
+  }
+  if (isOwner) {
+    tabs.push("cron")
   }
   if (isOwner && isBetaAdmin) {
     tabs.push("beta")
@@ -25,9 +30,14 @@ function allowedSettingsTabs(
   return tabs
 }
 
+export function getDefaultSettingsTab(role: string, isBetaAdmin: boolean): SettingsTab {
+  const allowed = getAllowedSettingsTabs(role, isBetaAdmin)
+  return allowed[0] || "users"
+}
+
 export function SettingsIndex() {
   const { lastSettingsPath, user } = useStore()
-  const allowed = allowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
+  const allowed = getAllowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
   const desired = (lastSettingsPath || "").trim() as any
   const target = (desired && allowed.includes(desired)) ? desired : allowed[0]
   return <Navigate to={`/settings/${target}`} replace />
@@ -35,11 +45,12 @@ export function SettingsIndex() {
 
 export function Settings() {
   const { setLastSettingsPath, user } = useStore()
-  const allowed = allowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
+  const allowed = getAllowedSettingsTabs(user?.role || "member", Boolean(user?.is_beta_admin))
 
   const navItems = [
     ...(allowed.includes("providers") ? [{ name: "模型服务", path: "/settings/providers", icon: Database }] : []),
     ...(allowed.includes("channels") ? [{ name: "渠道管理", path: "/settings/channels", icon: Network }] : []),
+    ...(allowed.includes("cron") ? [{ name: "定时任务", path: "/settings/cron", icon: CalendarClock }] : []),
     ...(allowed.includes("beta") ? [{ name: "封闭 Beta", path: "/settings/beta", icon: Key }] : []),
     { name: "用户与权限", path: "/settings/users", icon: Users },
     ...(allowed.includes("security") ? [{ name: "安全与审计", path: "/settings/security", icon: Shield }] : []),

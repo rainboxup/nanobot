@@ -13,6 +13,10 @@ from loguru import logger
 from nanobot.cron.types import CronJob, CronJobState, CronPayload, CronSchedule, CronStore
 
 
+class CronStoreCorruptionError(RuntimeError):
+    """Raised when cron store cannot be parsed safely."""
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -48,8 +52,27 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
 def _validate_schedule_for_add(schedule: CronSchedule) -> None:
     """Validate schedule fields that would otherwise create non-runnable jobs."""
+    if schedule.kind == "at":
+        if not schedule.at_ms:
+            raise ValueError("at_ms is required for at schedules")
+        if int(schedule.at_ms) <= _now_ms():
+            raise ValueError("at_ms must be in the future")
+        return
+
+    if schedule.kind == "every":
+        if not schedule.every_ms:
+            raise ValueError("every_ms is required for every schedules")
+        if int(schedule.every_ms) <= 0:
+            raise ValueError("every_ms must be > 0")
+        return
+
     if schedule.tz and schedule.kind != "cron":
         raise ValueError("tz can only be used with cron schedules")
+
+    if schedule.kind == "cron":
+        expr = str(schedule.expr or "").strip()
+        if not expr:
+            raise ValueError("expr is required for cron schedules")
 
     if schedule.kind == "cron" and schedule.tz:
         try:
@@ -58,6 +81,22 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
             ZoneInfo(schedule.tz)
         except Exception:
             raise ValueError(f"unknown timezone '{schedule.tz}'") from None
+
+    if schedule.kind == "cron":
+        try:
+            from datetime import datetime
+            from zoneinfo import ZoneInfo
+
+            from croniter import croniter
+
+            tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+            base_dt = datetime.fromtimestamp(_now_ms() / 1000, tz=tz)
+            croniter(str(schedule.expr), base_dt).get_next(datetime)
+        except ValueError:
+            # Keep timezone validation errors from above unchanged.
+            raise
+        except Exception as exc:
+            raise ValueError(f"invalid cron expression '{schedule.expr}'") from exc
 
 
 class CronService:
@@ -120,8 +159,9 @@ class CronService:
                     ))
                 self._store = CronStore(jobs=jobs)
             except Exception as e:
-                logger.warning("Failed to load cron store: {}", e)
-                self._store = CronStore()
+                raise CronStoreCorruptionError(
+                    f"Failed to load cron store from '{self.store_path}': {e}"
+                ) from e
         else:
             self._store = CronStore()
 
@@ -169,7 +209,9 @@ class CronService:
             ]
         }
 
-        self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path = self.store_path.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(self.store_path)
         self._last_mtime = self.store_path.stat().st_mtime
     async def start(self) -> None:
         """Start the cron service."""
@@ -247,11 +289,14 @@ class CronService:
 
         try:
             if self.on_job:
-                response = await self.on_job(job)
-
-            job.state.last_status = "ok"
-            job.state.last_error = None
-            logger.info("Cron: job '{}' completed", job.name)
+                await self.on_job(job)
+                job.state.last_status = "ok"
+                job.state.last_error = None
+                logger.info("Cron: job '{}' completed", job.name)
+            else:
+                job.state.last_status = "skipped"
+                job.state.last_error = "cron on_job callback is not configured"
+                logger.warning("Cron: skipped job '{}' because on_job callback is not configured", job.name)
 
         except Exception as e:
             job.state.last_status = "error"

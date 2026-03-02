@@ -32,6 +32,7 @@ from nanobot.web.user_store import ROLE_MEMBER, ROLE_OWNER, UserStore, resolve_a
 
 if TYPE_CHECKING:
     from nanobot.channels.manager import ChannelManager
+    from nanobot.cron.service import CronService
     from nanobot.session.manager import SessionManager
     from nanobot.tenants.store import TenantStore
 
@@ -138,6 +139,7 @@ def create_app(
     channel_manager: "ChannelManager | None" = None,
     session_manager: "SessionManager | None" = None,
     tenant_store: "TenantStore | None" = None,
+    cron_service: "CronService | None" = None,
     config_path: Path | None = None,
 ) -> FastAPI:
     jwt_secret_from_env = bool(str(os.getenv("NANOBOT_JWT_SECRET") or "").strip())
@@ -162,6 +164,7 @@ def create_app(
     app.state.channel_manager = channel_manager
     app.state.session_manager = session_manager
     app.state.tenant_store = tenant_store
+    app.state.cron_service = cron_service
     app.state.config_path = config_path
     app.state.started_at = datetime.now(timezone.utc).isoformat()
     app.state.started_monotonic = float(time.monotonic())
@@ -196,6 +199,7 @@ def create_app(
     user_store = UserStore(auth_state_path)
     app.state.user_store = user_store
     app.state.bootstrap_owner = _bootstrap_owner_username()
+    app.state.cron_runtime_tenant_id = str(app.state.bootstrap_owner)
     bootstrap_password = _load_admin_password()
     if bootstrap_password:
         user_store.ensure_user(
@@ -465,6 +469,7 @@ def create_app(
     from nanobot.web.api.beta import router as beta_router
     from nanobot.web.api.channels import router as channels_router
     from nanobot.web.api.chat import router as chat_router
+    from nanobot.web.api.cron import router as cron_router
     from nanobot.web.api.providers import router as providers_router
     from nanobot.web.api.security import router as security_router
     from nanobot.web.api.skills import router as skills_router
@@ -473,6 +478,7 @@ def create_app(
     app.include_router(audit_router)
     app.include_router(providers_router)
     app.include_router(channels_router)
+    app.include_router(cron_router)
     app.include_router(beta_router)
     app.include_router(skills_router)
     app.include_router(security_router)

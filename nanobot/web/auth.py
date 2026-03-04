@@ -10,7 +10,7 @@ from fastapi import HTTPException, Request, status
 from fastapi.security.utils import get_authorization_scheme_param
 from jwt import ExpiredSignatureError, InvalidTokenError
 
-from nanobot.web.user_store import ROLE_MEMBER
+from nanobot.web.user_store import ROLE_MEMBER, UserStore
 
 
 def generate_token(
@@ -19,6 +19,7 @@ def generate_token(
     *,
     tenant_id: str | None = None,
     role: str = ROLE_MEMBER,
+    token_version: int = 1,
     token_type: str = "access",
     expires_in_s: int = 24 * 60 * 60,
 ) -> str:
@@ -27,6 +28,7 @@ def generate_token(
         "sub": str(username),
         "tenant_id": str(tenant_id or username),
         "role": str(role or ROLE_MEMBER),
+        "token_version": max(1, int(token_version or 1)),
         "token_type": str(token_type or "access"),
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(seconds=int(expires_in_s))).timestamp()),
@@ -61,6 +63,50 @@ def verify_token(
     return decoded
 
 
+def _normalize_username(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
+def enforce_token_freshness(app, claims: dict[str, Any]) -> dict[str, Any]:
+    store = getattr(app.state, "user_store", None)
+    if not isinstance(store, UserStore):
+        raise ValueError("auth_store_unavailable")
+
+    username = _normalize_username(str(claims.get("sub") or ""))
+    if not username:
+        raise ValueError("token_invalid")
+
+    rec = store.get_user(username)
+    if not isinstance(rec, dict):
+        raise ValueError("token_revoked")
+    if not bool(rec.get("active", True)):
+        raise ValueError("token_revoked")
+
+    current_role = str(rec.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+    current_tenant = str(rec.get("tenant_id") or username).strip().lower() or username
+    claim_role = str(claims.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+    claim_tenant = str(claims.get("tenant_id") or username).strip().lower() or username
+    if claim_role != current_role or claim_tenant != current_tenant:
+        raise ValueError("token_revoked")
+
+    try:
+        claim_token_version = int(claims.get("token_version") or 0)
+    except Exception:
+        claim_token_version = 0
+    try:
+        current_token_version = max(1, int(rec.get("token_version") or 1))
+    except Exception:
+        current_token_version = 1
+    if claim_token_version != current_token_version:
+        raise ValueError("token_revoked")
+
+    claims["sub"] = username
+    claims["role"] = current_role
+    claims["tenant_id"] = current_tenant
+    claims["token_version"] = current_token_version
+    return claims
+
+
 def get_current_user(request: Request) -> dict[str, Any]:
     """FastAPI dependency that validates Authorization: Bearer <token>."""
     auth = request.headers.get("Authorization") or ""
@@ -76,13 +122,19 @@ def get_current_user(request: Request) -> dict[str, Any]:
         claims = verify_token(param, secret, expected_token_type="access")
         if not claims.get("role"):
             claims["role"] = ROLE_MEMBER
-        return claims
+        return enforce_token_freshness(request.app, claims)
     except ValueError as e:
         code = str(e)
+        status_code = status.HTTP_401_UNAUTHORIZED
         detail = "Invalid token"
         if code == "token_expired":
             detail = "Token expired"
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=detail) from e
+        elif code == "token_revoked":
+            detail = "Token revoked"
+        elif code == "auth_store_unavailable":
+            status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+            detail = "Auth store unavailable"
+        raise HTTPException(status_code=status_code, detail=detail) from e
 
 
 def role_rank(role: str | None) -> int:

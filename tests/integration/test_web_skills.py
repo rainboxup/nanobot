@@ -1,8 +1,12 @@
 import io
 import zipfile
+from types import SimpleNamespace
 
 import pytest
 
+from nanobot.agent.multi_tenant import MultiTenantAgentLoop
+from nanobot.bus.events import InboundMessage, OutboundMessage
+from nanobot.bus.queue import MessageBus
 from nanobot.web.api import skills as skills_api
 
 
@@ -509,6 +513,330 @@ async def test_mcp_uninstall_success_and_404(http_client, auth_headers) -> None:
 
     remove_again = await http_client.delete("/api/mcp/servers/filesystem-to-remove", headers=auth_headers)
     assert remove_again.status_code == 404
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_layering_can_be_more_restrictive(http_client, auth_headers, web_ctx) -> None:
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = ["admin"]
+    web_ctx.app.state.config.tools.web.enabled = True
+
+    updated = await http_client.put(
+        "/api/tools/policy",
+        headers=auth_headers,
+        json={"exec_enabled": False, "web_enabled": False},
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert bool(body["system_cap"]["exec"]["enabled"]) is True
+    assert bool(body["user_setting"]["exec"]["enabled"]) is False
+    assert bool(body["effective"]["exec"]["enabled"]) is False
+    assert bool(body["effective"]["web"]["enabled"]) is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_cannot_exceed_system_cap(http_client, auth_headers, web_ctx) -> None:
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = ["telegram:other-user"]
+    web_ctx.app.state.config.tools.web.enabled = False
+
+    updated = await http_client.put(
+        "/api/tools/policy",
+        headers=auth_headers,
+        json={"exec_enabled": True, "web_enabled": True},
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    assert bool(body["user_setting"]["exec"]["enabled"]) is True
+    assert bool(body["user_setting"]["web"]["enabled"]) is True
+    assert bool(body["effective"]["exec"]["enabled"]) is False
+    assert bool(body["effective"]["web"]["enabled"]) is False
+    warnings = [str(item).lower() for item in (body.get("warnings") or [])]
+    assert any("capped" in item for item in warnings)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_get_requires_admin(http_client, auth_headers_for) -> None:
+    member_headers = await auth_headers_for("policy-member", role="member", tenant_id="policy-member")
+    denied = await http_client.get("/api/tools/policy", headers=member_headers)
+    assert denied.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_put_requires_admin(http_client, auth_headers_for) -> None:
+    member_headers = await auth_headers_for(
+        "policy-member-put", role="member", tenant_id="policy-member-put"
+    )
+    denied = await http_client.put(
+        "/api/tools/policy",
+        headers=member_headers,
+        json={"exec_enabled": True, "web_enabled": True},
+    )
+    assert denied.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_redacts_system_whitelist_for_non_owner(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = ["tenant-a", "web:alice"]
+
+    admin_headers = await auth_headers_for("policy-admin", role="admin", tenant_id="tenant-a")
+    owner_headers = await auth_headers_for("policy-owner", role="owner", tenant_id="tenant-a")
+
+    as_admin = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert as_admin.status_code == 200
+    admin_body = as_admin.json()
+    assert bool(admin_body["system_cap"]["exec"].get("whitelist_redacted")) is True
+    assert list(admin_body["system_cap"]["exec"].get("whitelist") or []) == []
+
+    as_owner = await http_client.get("/api/tools/policy", headers=owner_headers)
+    assert as_owner.status_code == 200
+    owner_body = as_owner.json()
+    assert bool(owner_body["system_cap"]["exec"].get("whitelist_redacted")) is False
+    assert sorted(list(owner_body["system_cap"]["exec"].get("whitelist") or [])) == [
+        "tenant-a",
+        "web:alice",
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_redacts_subject_identities_for_non_owner(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for("policy-admin-subject", role="admin", tenant_id="tenant-a")
+    owner_headers = await auth_headers_for("policy-owner-subject", role="owner", tenant_id="tenant-a")
+
+    as_admin = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert as_admin.status_code == 200
+    admin_body = as_admin.json()
+    admin_subject = dict(admin_body.get("subject") or {})
+    assert bool(admin_subject.get("identities_redacted")) is True
+    assert int(admin_subject.get("identity_count") or 0) == 2
+    assert list(admin_subject.get("identities") or []) == []
+    assert "web:policy-admin-subject" not in str(admin_body)
+    assert "policy-admin-subject" not in str(admin_body)
+
+    as_owner = await http_client.get("/api/tools/policy", headers=owner_headers)
+    assert as_owner.status_code == 200
+    owner_body = as_owner.json()
+    owner_subject = dict(owner_body.get("subject") or {})
+    assert bool(owner_subject.get("identities_redacted")) is False
+    owner_identities = list(owner_subject.get("identities") or [])
+    assert "tenant-a" in owner_identities
+    assert "web:policy-owner-subject" in owner_identities
+    assert int(owner_subject.get("identity_count") or 0) == len(owner_identities)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_effective_contract_matches_runtime_resolver(
+    web_ctx, http_client, auth_headers_for, monkeypatch
+) -> None:
+    tenant_id = "tenant-policy-contract"
+    owner_username = "policy-owner-contract"
+    owner_headers = await auth_headers_for(owner_username, role="owner", tenant_id=tenant_id)
+    web_ctx.tenant_store.link_identity(tenant_id, "web", owner_username)
+
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = [f"web:{owner_username}"]
+    web_ctx.app.state.config.tools.web.enabled = True
+
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.agents.defaults.model = "bedrock/anthropic.claude-3-haiku-20240307-v1:0"
+    tenant_cfg.tools.exec.enabled = True
+    tenant_cfg.tools.exec.whitelist = [f"web:{owner_username}"]
+    tenant_cfg.tools.web.enabled = True
+    web_ctx.tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    updated = await http_client.put(
+        "/api/tools/policy",
+        headers=owner_headers,
+        json={"exec_enabled": True, "web_enabled": True},
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+
+    runtime_loop = MultiTenantAgentLoop(
+        bus=MessageBus(),
+        system_config=web_ctx.app.state.config,
+        store=web_ctx.tenant_store,
+    )
+    observed: dict[str, bool] = {}
+
+    async def _fake_process_message(inbound: InboundMessage) -> OutboundMessage:
+        return OutboundMessage(channel=inbound.channel, chat_id=inbound.chat_id, content="ok")
+
+    def _fake_runtime_factory(_tenant, _tenant_cfg, *, enable_exec: bool, enable_web: bool = True):
+        observed["exec"] = bool(enable_exec)
+        observed["web"] = bool(enable_web)
+        return SimpleNamespace(agent=SimpleNamespace(_process_message=_fake_process_message))
+
+    monkeypatch.setattr(
+        "nanobot.agent.multi_tenant.try_handle",
+        lambda **_kwargs: SimpleNamespace(handled=False, reply=""),
+    )
+    monkeypatch.setattr(runtime_loop, "_get_or_create_runtime", _fake_runtime_factory)
+
+    tenant_ctx = web_ctx.tenant_store.ensure_tenant_files(tenant_id)
+    user_setting = dict(body.get("user_setting") or {})
+    msg = InboundMessage(
+        channel="web",
+        sender_id=owner_username,
+        chat_id=f"web:{tenant_id}:deadbeef",
+        content="hello",
+        session_id=f"web:{tenant_id}:deadbeef",
+        metadata={
+            "tenant_id": tenant_id,
+            "canonical_sender_id": owner_username,
+            "exec_enabled": bool((user_setting.get("exec") or {}).get("enabled")),
+            "web_enabled": bool((user_setting.get("web") or {}).get("enabled")),
+        },
+    )
+    out = await runtime_loop._process_for_tenant(msg, owner_username, tenant_id, tenant_ctx)
+    assert out is not None
+    assert out.content == "ok"
+
+    assert bool(((body.get("effective") or {}).get("exec") or {}).get("enabled")) is bool(
+        observed.get("exec")
+    )
+    assert bool(((body.get("effective") or {}).get("web") or {}).get("enabled")) is bool(
+        observed.get("web")
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_put_response_redacts_subject_identities_for_non_owner(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for("policy-admin-put-subject", role="admin", tenant_id="tenant-a")
+    updated = await http_client.put(
+        "/api/tools/policy",
+        headers=admin_headers,
+        json={"exec_enabled": True, "web_enabled": True},
+    )
+    assert updated.status_code == 200
+    body = updated.json()
+    subject = dict(body.get("subject") or {})
+    assert bool(subject.get("identities_redacted")) is True
+    assert int(subject.get("identity_count") or 0) == 2
+    assert list(subject.get("identities") or []) == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_exposes_runtime_and_write_metadata_in_single_mode(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+    admin_headers = await auth_headers_for("policy-admin-single", role="admin", tenant_id="tenant-single")
+
+    resp = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body.get("runtime_mode") == "single"
+    assert body.get("runtime_scope") == "global"
+    assert body.get("writable") is False
+    assert body.get("write_block_reason_code") == "single_tenant_runtime_mode"
+    assert "single-tenant runtime mode" in str(body.get("write_block_reason") or "").lower()
+    assert body.get("takes_effect") == {"exec": "runtime", "web": "runtime"}
+
+    denied = await http_client.put(
+        "/api/tools/policy",
+        headers=admin_headers,
+        json={"exec_enabled": True, "web_enabled": True},
+    )
+    assert denied.status_code == 409
+    assert "single-tenant runtime mode" in str(denied.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_effective_reason_codes(http_client, auth_headers_for, web_ctx) -> None:
+    tenant_id = "tenant-policy-reasons"
+    admin_headers = await auth_headers_for("policy-admin-reasons", role="admin", tenant_id=tenant_id)
+
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = [tenant_id]
+    web_ctx.app.state.config.tools.web.enabled = False
+
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.tools.exec.enabled = False
+    tenant_cfg.tools.exec.whitelist = [tenant_id]
+    tenant_cfg.tools.web.enabled = True
+    web_ctx.tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    resp = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    exec_effective = dict((body.get("effective") or {}).get("exec") or {})
+    web_effective = dict((body.get("effective") or {}).get("web") or {})
+
+    assert exec_effective.get("enabled") is False
+    assert "tenant_disabled" in list(exec_effective.get("reason_codes") or [])
+    assert web_effective.get("enabled") is False
+    assert "system_disabled" in list(web_effective.get("reason_codes") or [])
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_system_allowlist_requires_scoped_identity(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    tenant_id = "tenant-policy-principal"
+    admin_headers = await auth_headers_for(
+        "policy-admin-principal", role="admin", tenant_id=tenant_id
+    )
+
+    web_ctx.app.state.config.tools.exec.enabled = True
+    web_ctx.app.state.config.tools.exec.whitelist = ["policy-admin-principal"]
+
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.tools.exec.enabled = True
+    tenant_cfg.tools.exec.whitelist = []
+    web_ctx.tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    resp = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    exec_effective = dict((body.get("effective") or {}).get("exec") or {})
+    assert exec_effective.get("enabled") is False
+    assert "system_allowlist" in list(exec_effective.get("reason_codes") or [])
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skills_api_paths_are_sanitized(web_ctx, http_client, auth_headers) -> None:
+    listed = await http_client.get("/api/skills", headers=auth_headers)
+    assert listed.status_code == 200
+    rows = listed.json()
+    assert isinstance(rows, list)
+    assert rows
+
+    allowed_prefixes = ("workspace://", "builtin://", "store://")
+    workspace_path_text = str(web_ctx.workspace_dir).lower()
+
+    first_name = str(rows[0].get("name") or "")
+    assert first_name
+    for item in rows:
+        path = str(item.get("path") or "")
+        assert path.startswith(allowed_prefixes)
+        assert workspace_path_text not in path.lower()
+
+    detail = await http_client.get(f"/api/skills/{first_name}", headers=auth_headers)
+    assert detail.status_code == 200
+    body = detail.json()
+    detail_path = str(body.get("path") or "")
+    assert detail_path.startswith(allowed_prefixes)
+    assert workspace_path_text not in detail_path.lower()
 
 
 @pytest.mark.integration

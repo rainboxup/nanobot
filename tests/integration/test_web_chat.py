@@ -7,12 +7,27 @@ import websockets
 from nanobot.bus.events import OutboundMessage
 
 
+def _ws_uri(base: str, session_id: str | None = None, token: str | None = None) -> str:
+    if token:
+        # Compatibility path for explicit query-token tests only.
+        if session_id:
+            return f"{base}?token={token}&session_id={session_id}"
+        return f"{base}?token={token}"
+    if session_id:
+        return f"{base}?session_id={session_id}"
+    return base
+
+
+def _ws_subprotocols(token: str) -> list[str]:
+    return ["nanobot", token]
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_headers) -> None:
-    ws_uri = f"{web_ctx.ws_url}?token={auth_token}"
+    ws_uri = _ws_uri(web_ctx.ws_url)
 
-    async with websockets.connect(ws_uri) as ws:
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
         first = await asyncio.wait_for(ws.recv(), timeout=5.0)
         meta = json.loads(first)
         assert meta["type"] == "session"
@@ -25,6 +40,8 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
         assert inbound.chat_id == session_id
         assert inbound.session_id == session_id
         assert inbound.content == "hello"
+        assert inbound.metadata.get("tenant_id") == "admin"
+        assert inbound.metadata.get("canonical_sender_id") == "admin"
 
         ok = await web_ctx.bus.publish_outbound(
             OutboundMessage(channel="web", chat_id=session_id, content="hi from agent")
@@ -157,14 +174,14 @@ async def test_chat_session_crud_api(http_client, auth_headers) -> None:
 @pytest.mark.asyncio
 async def test_websocket_chat_reuses_session_when_session_id_passed(web_ctx, auth_token) -> None:
     first_session_id = ""
-    async with websockets.connect(f"{web_ctx.ws_url}?token={auth_token}") as ws:
+    async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(auth_token)) as ws:
         first = await asyncio.wait_for(ws.recv(), timeout=5.0)
         meta = json.loads(first)
         first_session_id = str(meta.get("session_id") or "")
         assert first_session_id
 
-    resume_uri = f"{web_ctx.ws_url}?token={auth_token}&session_id={first_session_id}"
-    async with websockets.connect(resume_uri) as ws:
+    resume_uri = _ws_uri(web_ctx.ws_url, session_id=first_session_id)
+    async with websockets.connect(resume_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
         first = await asyncio.wait_for(ws.recv(), timeout=5.0)
         meta = json.loads(first)
         assert str(meta.get("session_id") or "") == first_session_id
@@ -190,9 +207,9 @@ async def test_ws_rejects_missing_token(web_ctx) -> None:
 async def test_ws_rejects_invalid_or_cross_tenant_session_id(
     web_ctx, auth_token, auth_headers_for
 ) -> None:
-    bad_uri = f"{web_ctx.ws_url}?token={auth_token}&session_id=web:admin:not_hex"
+    bad_uri = _ws_uri(web_ctx.ws_url, session_id="web:admin:not_hex")
     with pytest.raises(Exception):
-        async with websockets.connect(bad_uri) as ws:
+        async with websockets.connect(bad_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
             await ws.recv()
 
     alice_headers = await auth_headers_for("alice")
@@ -201,16 +218,128 @@ async def test_ws_rejects_invalid_or_cross_tenant_session_id(
     bob_token = str(bob_headers["Authorization"]).split(" ", 1)[1]
 
     alice_session_id = ""
-    async with websockets.connect(f"{web_ctx.ws_url}?token={alice_token}") as ws:
+    async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(alice_token)) as ws:
         first = await asyncio.wait_for(ws.recv(), timeout=5.0)
         meta = json.loads(first)
         alice_session_id = str(meta.get("session_id") or "")
         assert alice_session_id.startswith("web:alice:")
 
-    cross_uri = f"{web_ctx.ws_url}?token={bob_token}&session_id={alice_session_id}"
+    cross_uri = _ws_uri(web_ctx.ws_url, session_id=alice_session_id)
     with pytest.raises(Exception):
-        async with websockets.connect(cross_uri) as ws:
+        async with websockets.connect(cross_uri, subprotocols=_ws_subprotocols(bob_token)) as ws:
             await ws.recv()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_rejects_stale_token_after_user_deactivation(
+    web_ctx, http_client, auth_headers
+) -> None:
+    created = await http_client.post(
+        "/api/auth/users",
+        headers=auth_headers,
+        json={
+            "username": "ws-stale-user",
+            "password": "ws-stale-pass",
+            "role": "member",
+        },
+    )
+    assert created.status_code == 200
+
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "ws-stale-user", "password": "ws-stale-pass"},
+    )
+    assert login.status_code == 200
+    stale_token = str(login.json().get("token") or "")
+    assert stale_token
+
+    disabled = await http_client.put(
+        "/api/auth/users/ws-stale-user/status",
+        headers=auth_headers,
+        json={"active": False},
+    )
+    assert disabled.status_code == 200
+
+    with pytest.raises(Exception):
+        async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(stale_token)) as ws:
+            await ws.recv()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_revokes_existing_connection_after_user_deactivation(
+    web_ctx, http_client, auth_headers
+) -> None:
+    created = await http_client.post(
+        "/api/auth/users",
+        headers=auth_headers,
+        json={
+            "username": "ws-live-revoke-user",
+            "password": "ws-live-revoke-pass",
+            "role": "member",
+        },
+    )
+    assert created.status_code == 200
+
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "ws-live-revoke-user", "password": "ws-live-revoke-pass"},
+    )
+    assert login.status_code == 200
+    live_token = str(login.json().get("token") or "")
+    assert live_token
+
+    async with websockets.connect(
+        _ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(live_token)
+    ) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        assert meta.get("type") == "session"
+
+        disabled = await http_client.put(
+            "/api/auth/users/ws-live-revoke-user/status",
+            headers=auth_headers,
+            json={"active": False},
+        )
+        assert disabled.status_code == 200
+
+        await ws.send("message after revoke")
+        with pytest.raises(Exception):
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_rejects_when_auth_store_unavailable(web_ctx, auth_token) -> None:
+    original_store = web_ctx.app.state.user_store
+    web_ctx.app.state.user_store = None
+    try:
+        with pytest.raises(Exception):
+            async with websockets.connect(
+                _ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(auth_token)
+            ) as ws:
+                await ws.recv()
+    finally:
+        web_ctx.app.state.user_store = original_store
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_rejects_query_token_by_default(web_ctx, auth_token) -> None:
+    with pytest.raises(Exception):
+        async with websockets.connect(_ws_uri(web_ctx.ws_url, token=auth_token)) as ws:
+            await ws.recv()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_allows_query_token_when_compat_enabled(web_ctx, auth_token) -> None:
+    web_ctx.app.state.ws_allow_query_token = True
+    async with websockets.connect(_ws_uri(web_ctx.ws_url, token=auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        assert meta.get("type") == "session"
 
 
 @pytest.mark.integration
@@ -223,7 +352,7 @@ async def test_chat_history_and_sessions_are_scoped_per_user(
     alice_token = alice_headers["Authorization"].split(" ", 1)[1]
 
     alice_session_id = ""
-    async with websockets.connect(f"{web_ctx.ws_url}?token={alice_token}") as ws:
+    async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(alice_token)) as ws:
         first = await asyncio.wait_for(ws.recv(), timeout=5.0)
         meta = json.loads(first)
         alice_session_id = str(meta["session_id"])
@@ -288,3 +417,66 @@ async def test_chat_status_detects_oauth_provider_when_model_prefixed(web_ctx, h
     body = r.json()
     assert body.get("provider") == "openai_codex"
     assert body.get("provider_kind") == "oauth"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_chat_sessions_are_user_scoped_within_same_tenant(
+    http_client, auth_headers_for
+) -> None:
+    member_a_headers = await auth_headers_for(
+        "member-a",
+        role="member",
+        tenant_id="team1",
+        password="member-a-pass",
+    )
+    member_b_headers = await auth_headers_for(
+        "member-b",
+        role="member",
+        tenant_id="team1",
+        password="member-b-pass",
+    )
+
+    created = await http_client.post(
+        "/api/chat/sessions",
+        headers=member_a_headers,
+        json={"title": "private-a"},
+    )
+    assert created.status_code == 201
+    session_id = str(created.json().get("key") or "")
+    assert session_id.startswith("web:team1:")
+
+    seed = await http_client.get(
+        f"/api/chat/history?session_id={session_id}",
+        headers=member_a_headers,
+    )
+    assert seed.status_code == 200
+
+    denied_history = await http_client.get(
+        f"/api/chat/history?session_id={session_id}",
+        headers=member_b_headers,
+    )
+    assert denied_history.status_code == 403
+
+    denied_update = await http_client.patch(
+        f"/api/chat/sessions/{session_id}",
+        headers=member_b_headers,
+        json={"title": "should-not-work"},
+    )
+    assert denied_update.status_code == 403
+
+    denied_delete = await http_client.delete(
+        f"/api/chat/sessions/{session_id}",
+        headers=member_b_headers,
+    )
+    assert denied_delete.status_code == 403
+
+    own_list = await http_client.get("/api/chat/sessions", headers=member_a_headers)
+    assert own_list.status_code == 200
+    own_keys = {str(item.get("key") or "") for item in own_list.json()}
+    assert session_id in own_keys
+
+    other_list = await http_client.get("/api/chat/sessions", headers=member_b_headers)
+    assert other_list.status_code == 200
+    other_keys = {str(item.get("key") or "") for item in other_list.json()}
+    assert session_id not in other_keys

@@ -12,6 +12,8 @@ Goals:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -25,6 +27,7 @@ from nanobot.tenants.store import TenantStore
 from nanobot.utils.metrics import METRICS
 
 BUSY_TEXT = "System busy, please try again later"
+_WEB_TENANT_PROOF_FIELD = "web_tenant_proof"
 
 
 def _canonical_sender_id(msg: InboundMessage) -> str:
@@ -59,6 +62,7 @@ class TenantIngressBroker:
         bus: MessageBus,
         store: TenantStore,
         store_lock: asyncio.Lock,
+        web_tenant_claim_secret: str | None = None,
         max_pending_per_tenant: int = 5,
         max_total_tenants: int = 5000,
         new_tenants_per_window: int = 20,
@@ -68,6 +72,7 @@ class TenantIngressBroker:
         self.bus = bus
         self.store = store
         self.store_lock = store_lock
+        self.web_tenant_claim_secret = str(web_tenant_claim_secret or "").strip()
         self.max_pending_per_tenant = max(1, int(max_pending_per_tenant))
         self.max_total_tenants = max(1, int(max_total_tenants))
         self.new_tenants_per_window = max(1, int(new_tenants_per_window))
@@ -144,15 +149,29 @@ class TenantIngressBroker:
             return AdmitResult(accepted=bool(ok), reason="" if ok else "inbound_queue_full")
 
         # Resolve tenant_id deterministically (and create if missing).
+        # Web dashboard messages are authenticated by JWT and can provide an explicit tenant_id.
+        claimed_tenant_id = ""
+        if msg.channel == "web":
+            claimed_tenant_id = get_tenant_id_from_metadata(
+                msg.metadata,
+                claim_secret=self.web_tenant_claim_secret,
+                canonical_sender_id=canonical_sender,
+                require_proof=True,
+            )
+
         async with self.store_lock:
-            tenant_id = self.store.resolve_tenant(msg.channel, canonical_sender)
-            if not tenant_id:
-                if self.store.count_tenants() >= self.max_total_tenants:
-                    return AdmitResult(accepted=False, reason="tenant_capacity_reached")
-                if not self._allow_new_tenant_creation():
-                    return AdmitResult(accepted=False, reason="new_tenant_rate_limited")
-                tenant_id = self.store.ensure_tenant(msg.channel, canonical_sender)
-                METRICS.inc("new_tenant_created_total")
+            if claimed_tenant_id:
+                tenant_id = str(claimed_tenant_id)
+                self.store.link_identity(tenant_id, msg.channel, canonical_sender)
+            else:
+                tenant_id = self.store.resolve_tenant(msg.channel, canonical_sender)
+                if not tenant_id:
+                    if self.store.count_tenants() >= self.max_total_tenants:
+                        return AdmitResult(accepted=False, reason="tenant_capacity_reached")
+                    if not self._allow_new_tenant_creation():
+                        return AdmitResult(accepted=False, reason="new_tenant_rate_limited")
+                    tenant_id = self.store.ensure_tenant(msg.channel, canonical_sender)
+                    METRICS.inc("new_tenant_created_total")
 
             # Ensure file layout exists; keeps downstream code simple.
             self.store.ensure_tenant_files(tenant_id)
@@ -182,9 +201,39 @@ class TenantIngressBroker:
         return AdmitResult(accepted=False, tenant_id=tenant_id, reason="inbound_queue_full")
 
 
-def get_tenant_id_from_metadata(metadata: Any) -> str:
+def build_web_tenant_claim_proof(
+    claim_secret: str | None, tenant_id: str, canonical_sender_id: str
+) -> str:
+    secret = str(claim_secret or "").strip()
+    tenant = str(tenant_id or "").strip()
+    sender = str(canonical_sender_id or "").strip()
+    if not secret or not tenant or not sender:
+        return ""
+    payload = f"{tenant}\n{sender}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+
+
+def get_tenant_id_from_metadata(
+    metadata: Any,
+    *,
+    claim_secret: str | None = None,
+    canonical_sender_id: str | None = None,
+    require_proof: bool = False,
+) -> str:
     """Helper for consumers to pull tenant_id from InboundMessage.metadata."""
     if not isinstance(metadata, dict):
         return ""
     t = metadata.get("tenant_id")
-    return str(t) if t else ""
+    tenant_id = str(t).strip() if t else ""
+    if not tenant_id:
+        return ""
+    if not require_proof:
+        return tenant_id
+
+    proof = str(metadata.get(_WEB_TENANT_PROOF_FIELD) or "").strip()
+    expected = build_web_tenant_claim_proof(claim_secret, tenant_id, str(canonical_sender_id or ""))
+    if not proof or not expected:
+        return ""
+    if not hmac.compare_digest(proof, expected):
+        return ""
+    return tenant_id

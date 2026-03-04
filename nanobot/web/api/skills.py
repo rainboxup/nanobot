@@ -17,7 +17,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from nanobot.agent.skills import SkillsLoader
 from nanobot.config.schema import MCPServerConfig
@@ -26,8 +26,13 @@ from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.services.clawhub_client import ClawHubClient, ClawHubClientError
 from nanobot.web.tenant import load_tenant_config
+from nanobot.web.user_store import ROLE_OWNER
 
 router = APIRouter()
+_SINGLE_TENANT_WRITE_BLOCK_DETAIL = (
+    "Tenant-scoped updates are disabled in single-tenant runtime mode; "
+    "update global runtime configuration instead."
+)
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _SKILL_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _SKILL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
@@ -83,6 +88,13 @@ class MCPInstallRequest(BaseModel):
     name: str | None = None
 
 
+class ToolPolicyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    exec_enabled: bool | None = None
+    web_enabled: bool | None = None
+
+
 def _skill_lock(key: str) -> asyncio.Lock:
     with _lock_registry_guard:
         lock = _skill_locks.get(key)
@@ -107,6 +119,192 @@ def _tenant_skills_loader(
     tenant_id, store, cfg = load_tenant_config(request, user)
     workspace = store.ensure_tenant_files(tenant_id).workspace
     return SkillsLoader(workspace=workspace), tenant_id, store, cfg, workspace
+
+
+def _runtime_mode(request: Request) -> str:
+    mode = str(getattr(request.app.state, "runtime_mode", "multi") or "multi").strip().lower()
+    return "single" if mode == "single" else "multi"
+
+
+def _runtime_scope(runtime_mode: str) -> str:
+    return "global" if runtime_mode == "single" else "tenant"
+
+
+def _runtime_warning(runtime_mode: str) -> str | None:
+    if runtime_mode == "single":
+        return _SINGLE_TENANT_WRITE_BLOCK_DETAIL
+    return None
+
+
+def _write_status(runtime_mode: str) -> dict[str, Any]:
+    if runtime_mode == "single":
+        return {
+            "writable": False,
+            "write_block_reason_code": "single_tenant_runtime_mode",
+            "write_block_reason": _SINGLE_TENANT_WRITE_BLOCK_DETAIL,
+        }
+    return {
+        "writable": True,
+        "write_block_reason_code": None,
+        "write_block_reason": None,
+    }
+
+
+def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
+    if _runtime_mode(request) == "single":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL)
+
+
+def _to_str_set(values: Any) -> set[str]:
+    out: set[str] = set()
+    if isinstance(values, (list, tuple, set)):
+        for item in values:
+            text = str(item or "").strip()
+            if text:
+                out.add(text)
+    return out
+
+
+def _allowlist_match(wl: set[str], tenant_id: str, identities: list[str]) -> bool:
+    if not wl:
+        return False
+    if tenant_id in wl:
+        return True
+    for ident in identities:
+        if str(ident) in wl:
+            return True
+    return False
+
+
+def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
+    identities: list[str] = []
+    subject = str(user.get("sub") or "").strip()
+    if subject:
+        identities.append(f"web:{subject}")
+    if tenant_id:
+        identities.append(tenant_id)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in identities:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _tool_policy_payload(
+    request: Request,
+    *,
+    user: dict[str, Any],
+    tenant_id: str,
+    cfg: Any,
+) -> dict[str, Any]:
+    runtime_mode = _runtime_mode(request)
+    runtime_scope = _runtime_scope(runtime_mode)
+    runtime_warn = _runtime_warning(runtime_mode)
+    write_status = _write_status(runtime_mode)
+
+    system_cfg = getattr(request.app.state, "config", None)
+    identities = _web_identities(user, tenant_id)
+    tools_cfg = getattr(cfg, "tools", None)
+    tenant_exec_cfg = getattr(tools_cfg, "exec", None)
+    tenant_web_cfg = getattr(tools_cfg, "web", None)
+
+    system_exec_enabled = bool(
+        getattr(getattr(getattr(system_cfg, "tools", None), "exec", None), "enabled", True)
+    )
+    system_exec_wl = _to_str_set(
+        getattr(getattr(getattr(system_cfg, "tools", None), "exec", None), "whitelist", None)
+    )
+    role = str(user.get("role") or "").strip().lower()
+    can_view_system_whitelist = role == ROLE_OWNER
+    can_view_subject_identities = role == ROLE_OWNER
+    system_exec_allowlisted = _allowlist_match(system_exec_wl, tenant_id, identities)
+
+    tenant_exec_wl = _to_str_set(getattr(tenant_exec_cfg, "whitelist", None))
+    tenant_exec_policy = True if not tenant_exec_wl else _allowlist_match(tenant_exec_wl, tenant_id, identities)
+    user_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
+    tenant_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
+    exec_reason_codes: list[str] = []
+    if not system_exec_enabled:
+        exec_reason_codes.append("system_disabled")
+    elif not system_exec_allowlisted:
+        exec_reason_codes.append("system_allowlist")
+    if not tenant_exec_enabled:
+        exec_reason_codes.append("tenant_disabled")
+    if tenant_exec_wl and not tenant_exec_policy:
+        exec_reason_codes.append("tenant_allowlist")
+    if not user_exec_enabled:
+        exec_reason_codes.append("user_disabled")
+    effective_exec = bool(len(exec_reason_codes) == 0)
+
+    system_web_enabled = bool(
+        getattr(getattr(getattr(system_cfg, "tools", None), "web", None), "enabled", True)
+    )
+    tenant_web_policy = True
+    user_web_enabled = bool(getattr(tenant_web_cfg, "enabled", True))
+    web_reason_codes: list[str] = []
+    if not system_web_enabled:
+        web_reason_codes.append("system_disabled")
+    if not tenant_web_policy:
+        web_reason_codes.append("tenant_policy")
+    if not user_web_enabled:
+        web_reason_codes.append("user_disabled")
+    effective_web = bool(len(web_reason_codes) == 0)
+
+    warnings: list[str] = []
+    if user_exec_enabled and not effective_exec:
+        warnings.append("exec is requested but capped by system or tenant policy")
+    if user_web_enabled and not effective_web:
+        warnings.append("web tools are requested but capped by system policy")
+
+    subject_identities = identities if can_view_subject_identities else []
+    payload: dict[str, Any] = {
+        "runtime_mode": runtime_mode,
+        "runtime_scope": runtime_scope,
+        "writable": bool(write_status["writable"]),
+        "write_block_reason_code": write_status["write_block_reason_code"],
+        "write_block_reason": write_status["write_block_reason"],
+        "takes_effect": {"exec": "runtime", "web": "runtime"},
+        "subject": {
+            "tenant_id": tenant_id,
+            "identities": subject_identities,
+            "identity_count": len(identities),
+            "identities_redacted": bool(not can_view_subject_identities and bool(identities)),
+        },
+        "system_cap": {
+            "exec": {
+                "enabled": bool(system_exec_enabled),
+                "whitelist": sorted(list(system_exec_wl)) if can_view_system_whitelist else [],
+                "whitelist_redacted": bool(not can_view_system_whitelist and bool(system_exec_wl)),
+            },
+            "web": {
+                "enabled": bool(system_web_enabled),
+            },
+        },
+        "tenant_policy": {
+            "exec": {
+                "whitelist": sorted(list(tenant_exec_wl)),
+                "allowlisted": bool(tenant_exec_policy),
+            },
+            "web": {
+                "allowlisted": bool(tenant_web_policy),
+            },
+        },
+        "user_setting": {
+            "exec": {"enabled": bool(user_exec_enabled)},
+            "web": {"enabled": bool(user_web_enabled)},
+        },
+        "effective": {
+            "exec": {"enabled": bool(effective_exec), "reason_codes": exec_reason_codes},
+            "web": {"enabled": bool(effective_web), "reason_codes": web_reason_codes},
+        },
+        "warnings": warnings,
+    }
+    if runtime_warn:
+        payload["runtime_warning"] = runtime_warn
+    return payload
 
 
 def _list_skill_dirs(root: Path | None) -> dict[str, Path]:
@@ -141,6 +339,20 @@ def _read_skill_description(skill_file: Path) -> str | None:
             desc = value.strip().strip("\"'")
             return desc or None
     return None
+
+
+def _skill_path_label(source: Any, skill_name: str) -> str:
+    src = str(source or "").strip().lower()
+    name = str(skill_name or "").strip()
+    if src == "workspace":
+        return f"workspace://skills/{name}"
+    if src == "store":
+        return f"store://{name}"
+    if src == "builtin":
+        return f"builtin://{name}"
+    if src == "clawhub":
+        return f"clawhub://{name}"
+    return f"skill://{name}"
 
 
 def _resolve_skill_store_dir(request: Request) -> Path:
@@ -702,11 +914,12 @@ async def list_skills(
     for s in skills:
         name = s.get("name", "")
         meta = loader.get_skill_metadata(name) or {}
+        source = s.get("source")
         result.append(
             {
                 "name": name,
-                "source": s.get("source"),
-                "path": s.get("path"),
+                "source": source,
+                "path": _skill_path_label(source, name),
                 "description": meta.get("description"),
                 "installed": name in installed_names,
             }
@@ -762,6 +975,7 @@ async def install_skill(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
     name = str(payload.name or "").strip()
     if not _SKILL_NAME_RE.fullmatch(name):
         raise HTTPException(
@@ -896,6 +1110,7 @@ async def uninstall_skill(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
     skill_name = str(name or "").strip()
     if not _SKILL_NAME_RE.fullmatch(skill_name):
         raise HTTPException(
@@ -956,6 +1171,37 @@ async def list_mcp_servers(
     return _mcp_list_payload(cfg)
 
 
+@router.get("/api/tools/policy")
+async def get_tools_policy(
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    tenant_id, _store, cfg = load_tenant_config(request, user)
+    return _tool_policy_payload(request, user=user, tenant_id=tenant_id, cfg=cfg)
+
+
+@router.put("/api/tools/policy")
+async def update_tools_policy(
+    payload: ToolPolicyUpdateRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
+
+    tenant_id, store, cfg = load_tenant_config(request, user)
+    data = payload.model_dump(exclude_unset=True)
+    if "exec_enabled" in data:
+        cfg.tools.exec.enabled = bool(data["exec_enabled"])
+    if "web_enabled" in data:
+        cfg.tools.web.enabled = bool(data["web_enabled"])
+    if data:
+        store.save_tenant_config(tenant_id, cfg)
+
+    return _tool_policy_payload(request, user=user, tenant_id=tenant_id, cfg=cfg)
+
+
 @router.post("/api/mcp/install", status_code=status.HTTP_201_CREATED)
 async def install_mcp_server(
     payload: MCPInstallRequest,
@@ -963,6 +1209,7 @@ async def install_mcp_server(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
     preset = _mcp_preset_by_id(payload.preset)
     if not preset:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MCP preset not found")
@@ -1012,6 +1259,7 @@ async def uninstall_mcp_server(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
     server_name = str(name or "").strip()
     if not _MCP_NAME_RE.fullmatch(server_name):
         raise HTTPException(
@@ -1043,20 +1291,18 @@ async def get_skill(
     if content is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found")
 
-    # Find source/path from list_skills output (authoritative for dashboard).
+    # Find source from list_skills output (authoritative for dashboard).
     source = None
-    path = None
     for s in loader.list_skills(filter_unavailable=False):
         if s.get("name") == skill_name:
             source = s.get("source")
-            path = s.get("path")
             break
 
     meta = loader.get_skill_metadata(skill_name) or {}
     return {
         "name": skill_name,
         "source": source,
-        "path": path,
+        "path": _skill_path_label(source, skill_name),
         "description": meta.get("description"),
         "content": content,
         "metadata": meta,

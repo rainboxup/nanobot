@@ -37,6 +37,7 @@ class _TenantRuntime:
     tenant_id: str
     config_mtime_ns: int
     enable_exec: bool
+    enable_web: bool
     agent: AgentLoop
     last_used_monotonic: float
 
@@ -58,6 +59,18 @@ def _tenant_session_id(msg: InboundMessage, canonical_sender: str) -> str:
     return f"{msg.channel}:{canonical_sender}"
 
 
+def _parse_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
 class MultiTenantAgentLoop:
     """Consumes bus inbound messages and routes them to tenant-specific AgentLoops."""
 
@@ -70,6 +83,7 @@ class MultiTenantAgentLoop:
         max_inflight: int = 4,
         store_lock: asyncio.Lock | None = None,
         ingress: Any | None = None,
+        web_tenant_claim_secret: str | None = None,
         runtime_cache_ttl_seconds: int = 1800,
         tenant_lock_ttl_seconds: int = 3600,
         max_cached_runtimes: int = 256,
@@ -80,6 +94,7 @@ class MultiTenantAgentLoop:
         self.skill_store_dir = skill_store_dir or (get_data_path() / "store" / "skills")
         self.max_inflight = max(1, int(max_inflight))
         self.ingress = ingress
+        self.web_tenant_claim_secret = str(web_tenant_claim_secret or "").strip()
 
         # Exec is intentionally opt-in (paid/whitelist) in multi-tenant mode.
         env_wl = to_set(parse_str_list(os.getenv("EXEC_WHITELIST")))
@@ -174,11 +189,7 @@ class MultiTenantAgentLoop:
             logger.warning("Ignoring system message in multi-tenant mode")
             return None
 
-        canonical_sender = ""
-        if isinstance(msg.metadata, dict) and msg.metadata.get("canonical_sender_id"):
-            canonical_sender = str(msg.metadata.get("canonical_sender_id") or "")
-        if not canonical_sender:
-            canonical_sender = _canonical_sender_id(msg)
+        canonical_sender = _canonical_sender_id(msg)
         if not canonical_sender:
             return OutboundMessage(
                 channel=msg.channel,
@@ -186,13 +197,27 @@ class MultiTenantAgentLoop:
                 content="Sorry, I couldn't identify you (missing sender_id).",
             )
 
-        tenant_id = get_tenant_id_from_metadata(msg.metadata)
+        tenant_id = ""
+        if msg.channel == "web":
+            tenant_id = get_tenant_id_from_metadata(
+                msg.metadata,
+                claim_secret=self.web_tenant_claim_secret,
+                canonical_sender_id=canonical_sender,
+                require_proof=True,
+            )
         async with self._store_lock:
             if not tenant_id:
                 tenant_id = self.store.resolve_tenant(
                     msg.channel, canonical_sender
                 ) or self.store.ensure_tenant(msg.channel, canonical_sender)
+            elif msg.channel == "web":
+                self.store.link_identity(tenant_id, msg.channel, canonical_sender)
             tenant = self.store.ensure_tenant_files(tenant_id)
+
+        if not isinstance(msg.metadata, dict):
+            msg.metadata = {}
+        msg.metadata["tenant_id"] = tenant_id
+        msg.metadata["canonical_sender_id"] = canonical_sender
 
         self._touch_tenant(tenant_id)
         lock = self._tenant_locks.setdefault(tenant_id, asyncio.Lock())
@@ -202,8 +227,10 @@ class MultiTenantAgentLoop:
     async def _process_for_tenant(
         self, msg: InboundMessage, canonical_sender: str, tenant_id: str, tenant: TenantContext
     ) -> OutboundMessage | None:
-        # Route session per identity within tenant
-        msg.session_id = _tenant_session_id(msg, canonical_sender)
+        # Route session per identity within tenant unless upstream already selected one
+        # (e.g. web dashboard explicit session_id for multi-window chats).
+        if not str(msg.session_id or "").strip():
+            msg.session_id = _tenant_session_id(msg, canonical_sender)
 
         # Command handling (deterministic; no LLM)
         session_manager = self._get_session_manager(tenant)
@@ -244,13 +271,37 @@ class MultiTenantAgentLoop:
                 ),
             )
 
-        enable_exec = False
-        if self._exec_whitelist:
+        tenant_exec_wl = to_set(getattr(tenant_cfg.tools.exec, "whitelist", None))
+        user_exec_setting = _parse_bool(
+            msg.metadata.get("exec_enabled") if isinstance(msg.metadata, dict) else None
+        )
+        identities: list[str] = []
+        if self._exec_whitelist or tenant_exec_wl:
             async with self._store_lock:
                 identities = self.store.list_identities(tenant_id)
-            enable_exec = self._is_exec_allowed(tenant_id, identities)
 
-        runtime = self._get_or_create_runtime(tenant, tenant_cfg, enable_exec=enable_exec)
+        enable_exec = self._resolve_exec_enabled(
+            tenant_id=tenant_id,
+            identities=identities,
+            tenant_exec_whitelist=tenant_exec_wl,
+            tenant_exec_enabled=bool(getattr(tenant_cfg.tools.exec, "enabled", True)),
+            user_exec_setting=user_exec_setting,
+        )
+
+        user_web_setting = _parse_bool(
+            msg.metadata.get("web_enabled") if isinstance(msg.metadata, dict) else None
+        )
+        enable_web = self._resolve_web_enabled(
+            tenant_web_enabled=bool(getattr(tenant_cfg.tools.web, "enabled", True)),
+            user_web_setting=user_web_setting,
+        )
+
+        runtime = self._get_or_create_runtime(
+            tenant,
+            tenant_cfg,
+            enable_exec=enable_exec,
+            enable_web=enable_web,
+        )
         return await runtime.agent._process_message(msg)  # reuse AgentLoop implementation
 
     def _touch_tenant(self, tenant_id: str) -> None:
@@ -303,25 +354,64 @@ class MultiTenantAgentLoop:
             return rt.agent.sessions
         return SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
 
-    def _is_exec_allowed(self, tenant_id: str, identities: list[str]) -> bool:
-        wl = self._exec_whitelist
+    @staticmethod
+    def _is_allowlist_match(wl: set[str], tenant_id: str, identities: list[str]) -> bool:
         if not wl:
             return False
         if tenant_id in wl:
             return True
         for ident in identities or []:
-            s = str(ident)
-            if s in wl:
+            if str(ident) in wl:
                 return True
-            # Allow bare sender_id entries as a convenience for MVP.
-            if ":" in s:
-                _, sender = s.split(":", 1)
-                if sender in wl:
-                    return True
         return False
 
+    def _is_exec_allowed(self, tenant_id: str, identities: list[str]) -> bool:
+        return self._is_allowlist_match(self._exec_whitelist, tenant_id, identities)
+
+    def _resolve_exec_enabled(
+        self,
+        *,
+        tenant_id: str,
+        identities: list[str],
+        tenant_exec_whitelist: set[str],
+        tenant_exec_enabled: bool,
+        user_exec_setting: bool | None,
+    ) -> bool:
+        # System cap is authoritative and cannot be bypassed.
+        if not bool(getattr(self.system_config.tools.exec, "enabled", True)):
+            return False
+        if not self._is_allowlist_match(self._exec_whitelist, tenant_id, identities):
+            return False
+
+        # Tenant policy may further narrow access.
+        if not tenant_exec_enabled:
+            return False
+        if tenant_exec_whitelist and not self._is_allowlist_match(
+            tenant_exec_whitelist, tenant_id, identities
+        ):
+            return False
+
+        # User/session override can only be more restrictive.
+        if user_exec_setting is False:
+            return False
+        return True
+
+    def _resolve_web_enabled(self, *, tenant_web_enabled: bool, user_web_setting: bool | None) -> bool:
+        if not bool(getattr(self.system_config.tools.web, "enabled", True)):
+            return False
+        if not bool(tenant_web_enabled):
+            return False
+        if user_web_setting is False:
+            return False
+        return True
+
     def _get_or_create_runtime(
-        self, tenant: TenantContext, tenant_cfg: Config, *, enable_exec: bool
+        self,
+        tenant: TenantContext,
+        tenant_cfg: Config,
+        *,
+        enable_exec: bool,
+        enable_web: bool = True,
     ) -> _TenantRuntime:
         config_mtime_ns = 0
         try:
@@ -334,6 +424,7 @@ class MultiTenantAgentLoop:
             existing
             and existing.config_mtime_ns == config_mtime_ns
             and existing.enable_exec == enable_exec
+            and existing.enable_web == enable_web
         ):
             existing.last_used_monotonic = time.monotonic()
             self._tenant_last_seen[tenant.tenant_id] = existing.last_used_monotonic
@@ -360,19 +451,23 @@ class MultiTenantAgentLoop:
         exec_cfg.timeout = 30
         exec_cfg.require_runtime = True
 
+        web_cfg = self.system_config.tools.web.model_copy(deep=True)
+        web_cfg.enabled = bool(enable_web)
+
         agent = AgentLoop(
             bus=self.bus,
             provider=provider,
             workspace=tenant.workspace,
             model=tenant_cfg.agents.defaults.model,
             max_iterations=tenant_cfg.agents.defaults.max_tool_iterations,
-            brave_api_key=self.system_config.tools.web.search.api_key or None,
-            web_config=self.system_config.tools.web,
+            brave_api_key=(self.system_config.tools.web.search.api_key or None) if enable_web else None,
+            web_config=web_cfg,
             exec_config=exec_cfg,
             filesystem_config=self.system_config.tools.filesystem,
             cron_service=None,
             restrict_to_workspace=True,
             session_manager=sessions,
+            mcp_servers=tenant_cfg.tools.mcp_servers,
             enable_spawn=False,
             enable_exec=enable_exec,
         )
@@ -382,6 +477,7 @@ class MultiTenantAgentLoop:
             tenant_id=tenant.tenant_id,
             config_mtime_ns=config_mtime_ns,
             enable_exec=enable_exec,
+            enable_web=enable_web,
             agent=agent,
             last_used_monotonic=now,
         )

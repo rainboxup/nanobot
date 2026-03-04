@@ -3,6 +3,7 @@
 import asyncio
 import ipaddress
 import os
+import secrets
 from contextlib import nullcontext
 from pathlib import Path
 from urllib.parse import urlparse
@@ -294,10 +295,14 @@ def gateway(
 
         store = TenantStore()
         store_lock = asyncio.Lock()
+        web_tenant_claim_secret = str(
+            os.getenv("NANOBOT_WEB_TENANT_CLAIM_SECRET") or secrets.token_urlsafe(32)
+        ).strip()
         ingress = TenantIngressBroker(
             bus=bus,
             store=store,
             store_lock=store_lock,
+            web_tenant_claim_secret=web_tenant_claim_secret,
             max_pending_per_tenant=config.traffic.tenant_burst_limit,
             max_total_tenants=config.traffic.max_total_tenants,
             new_tenants_per_window=config.traffic.new_tenants_per_window,
@@ -310,6 +315,7 @@ def gateway(
             store=store,
             store_lock=store_lock,
             ingress=ingress,
+            web_tenant_claim_secret=web_tenant_claim_secret,
             max_inflight=config.traffic.worker_concurrency,
             runtime_cache_ttl_seconds=config.traffic.runtime_cache_ttl_seconds,
             tenant_lock_ttl_seconds=config.traffic.tenant_lock_ttl_seconds,
@@ -323,7 +329,14 @@ def gateway(
 
             from nanobot.web.server import create_app
 
-            web_app = create_app(config, bus, channel_manager=channels, session_manager=None)
+            web_app = create_app(
+                config,
+                bus,
+                channel_manager=channels,
+                session_manager=None,
+                runtime_mode="multi",
+                web_tenant_claim_secret=web_tenant_claim_secret,
+            )
             web_server = uvicorn.Server(
                 uvicorn.Config(web_app, host=web_host, port=web_port, log_level="info")
             )
@@ -419,6 +432,7 @@ def gateway(
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
+        mcp_servers=config.tools.mcp_servers,
     )
 
     # Set cron callback (needs agent)
@@ -507,6 +521,7 @@ def gateway(
             channel_manager=channels,
             session_manager=session_manager,
             cron_service=cron,
+            runtime_mode="single",
         )
         web_server = uvicorn.Server(
             uvicorn.Config(web_app, host=web_host, port=web_port, log_level="info")
@@ -595,6 +610,7 @@ def serve(
         bus,
         channel_manager=channels,
         session_manager=session_manager,
+        runtime_mode="single",
     )
 
     web_host = str(host or getattr(config.gateway, "host", "0.0.0.0"))
@@ -650,6 +666,7 @@ def agent(
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
         restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
     )
 
     if message:

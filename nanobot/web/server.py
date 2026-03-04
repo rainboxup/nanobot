@@ -20,6 +20,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.web.audit import AuditLogger, request_ip, resolve_audit_log_path
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
+from nanobot.web.auth_cookie import set_refresh_cookie
 from nanobot.web.beta_access import (
     BetaAccessStore,
     is_beta_admin,
@@ -94,6 +95,13 @@ def _bootstrap_owner_username() -> str:
     return str(os.getenv("NANOBOT_WEB_BOOTSTRAP_OWNER") or "admin").strip().lower() or "admin"
 
 
+def _validate_jwt_secret_strength(secret: str, *, from_env: bool) -> None:
+    if not from_env:
+        return
+    if len(secret) < 32:
+        raise RuntimeError("NANOBOT_JWT_SECRET must be at least 32 characters")
+
+
 def _build_dashboard_unavailable_html(reason: str) -> str:
     safe_reason = str(reason or "dashboard assets missing")
     return (
@@ -110,6 +118,11 @@ def _build_dashboard_unavailable_html(reason: str) -> str:
 
 
 def _build_readiness_payload(app) -> dict[str, Any]:
+    runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
+    if runtime_mode not in {"single", "multi"}:
+        runtime_mode = "multi"
+    runtime_scope = "global" if runtime_mode == "single" else "tenant"
+
     checks = {
         "message_bus": isinstance(getattr(app.state, "bus", None), MessageBus),
         "auth_store": isinstance(getattr(app.state, "user_store", None), UserStore),
@@ -124,9 +137,17 @@ def _build_readiness_payload(app) -> dict[str, Any]:
         warnings.append(str(getattr(app.state, "web_static_error", "dashboard assets unavailable")))
     if not bool(checks["web_channel"]):
         warnings.append(str(getattr(app.state, "web_channel_error", "web channel unavailable")))
+    if runtime_mode == "single":
+        warnings.append(
+            "Single-tenant runtime mode: tenant-scoped web config writes are disabled to avoid non-runtime drift"
+        )
+    if bool(getattr(app.state, "ws_allow_query_token", False)):
+        warnings.append("Legacy WebSocket query token auth is enabled; prefer subprotocol/cookie auth")
     return {
         "status": "ready" if all(bool(v) for v in checks.values()) else "degraded",
         "version": str(__version__),
+        "runtime_mode": runtime_mode,
+        "runtime_scope": runtime_scope,
         "checks": checks,
         "warnings": warnings,
     }
@@ -141,9 +162,12 @@ def create_app(
     tenant_store: "TenantStore | None" = None,
     cron_service: "CronService | None" = None,
     config_path: Path | None = None,
+    runtime_mode: str = "multi",
+    web_tenant_claim_secret: str | None = None,
 ) -> FastAPI:
     jwt_secret_from_env = bool(str(os.getenv("NANOBOT_JWT_SECRET") or "").strip())
     jwt_secret = str(os.getenv("NANOBOT_JWT_SECRET") or "").strip() or secrets.token_urlsafe(32)
+    _validate_jwt_secret_strength(jwt_secret, from_env=jwt_secret_from_env)
     if not jwt_secret_from_env:
         logger.warning("NANOBOT_JWT_SECRET not set; generated an ephemeral secret for this run")
 
@@ -166,10 +190,17 @@ def create_app(
     app.state.tenant_store = tenant_store
     app.state.cron_service = cron_service
     app.state.config_path = config_path
+    normalized_runtime_mode = str(runtime_mode or "multi").strip().lower()
+    if normalized_runtime_mode not in {"single", "multi"}:
+        normalized_runtime_mode = "multi"
+    app.state.runtime_mode = normalized_runtime_mode
+    app.state.runtime_scope = "global" if normalized_runtime_mode == "single" else "tenant"
     app.state.started_at = datetime.now(timezone.utc).isoformat()
     app.state.started_monotonic = float(time.monotonic())
     app.state.jwt_secret = jwt_secret
     app.state.jwt_secret_from_env = jwt_secret_from_env
+    app.state.web_tenant_claim_secret = str(web_tenant_claim_secret or "").strip()
+    app.state.ws_allow_query_token = _env_bool("NANOBOT_WEB_WS_ALLOW_QUERY_TOKEN", False)
     app.state.beta_closed_beta = _closed_beta_enabled()
     beta_state_path = resolve_beta_state_path(
         config_path=config_path,
@@ -302,7 +333,7 @@ def create_app(
         }
 
     @app.post("/api/auth/login")
-    async def login(payload: dict[str, Any], request: Request) -> dict[str, Any]:
+    async def login(payload: dict[str, Any], request: Request) -> JSONResponse:
         username = str(payload.get("username") or "").strip()
         password = str(payload.get("password") or "")
         source_ip = request_ip(request)
@@ -439,6 +470,7 @@ def create_app(
             secret=jwt_secret,
             tenant_id=str(user_rec.get("tenant_id") or username),
             role=str(user_rec.get("role") or ROLE_MEMBER),
+            token_version=int(user_rec.get("token_version") or 1),
             token_type="access",
             expires_in_s=access_ttl,
         )
@@ -451,7 +483,7 @@ def create_app(
         _audit_login("succeeded", "ok")
         username_out = normalize_username(str(user_rec.get("username") or username))
         role_out = str(user_rec.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
-        return {
+        response_payload = {
             "token": access_token,
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -462,6 +494,9 @@ def create_app(
             "username": username_out,
             "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
         }
+        response = JSONResponse(content=response_payload)
+        set_refresh_cookie(response, refresh_token, request=request, max_age=refresh_ttl)
+        return response
 
     # Routers
     from nanobot.web.api.audit import router as audit_router

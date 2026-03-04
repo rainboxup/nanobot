@@ -4,20 +4,24 @@ from __future__ import annotations
 
 import re
 import uuid
+from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from nanobot.bus.broker import build_web_tenant_claim_proof
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.web.auth import get_current_user, verify_token
+from nanobot.web.auth import enforce_token_freshness, get_current_user, verify_token
 from nanobot.web.tenant import load_tenant_config, tenant_id_from_claims
 
 router = APIRouter()
 _SESSION_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
 _SESSION_TITLE_MAX_LEN = 200
+_OWNER_USER_KEY = "owner_user_id"
+_OWNER_TENANT_KEY = "owner_tenant_id"
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -99,9 +103,54 @@ def _session_view(session) -> dict[str, Any]:
     }
 
 
+def _current_user_identity(claims: dict[str, Any]) -> tuple[str, str]:
+    tenant_id = tenant_id_from_claims(claims)
+    username = str(claims.get("sub") or "").strip().lower() or tenant_id
+    return username, tenant_id
+
+
+def _enforce_session_owner(sm, session, claims: dict[str, Any]) -> None:
+    owner_user, owner_tenant = _current_user_identity(claims)
+    metadata = session.metadata if isinstance(session.metadata, dict) else {}
+    existing_owner = str(metadata.get(_OWNER_USER_KEY) or "").strip().lower()
+    if existing_owner and existing_owner != owner_user:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+
+    changed = False
+    if not existing_owner:
+        metadata[_OWNER_USER_KEY] = owner_user
+        changed = True
+    if not str(metadata.get(_OWNER_TENANT_KEY) or "").strip().lower():
+        metadata[_OWNER_TENANT_KEY] = owner_tenant
+        changed = True
+
+    if changed:
+        session.metadata = metadata
+        session.updated_at = datetime.now()
+        sm.save(session)
+
+
+def _bind_session_owner(sm, session_id: str, claims: dict[str, Any], *, title: str | None = None):
+    session = sm.get(session_id)
+    if session is None:
+        owner_user, owner_tenant = _current_user_identity(claims)
+        metadata = {
+            _OWNER_USER_KEY: owner_user,
+            _OWNER_TENANT_KEY: owner_tenant,
+        }
+        title_text = _normalize_title(title)
+        if title_text:
+            metadata["title"] = title_text
+        return sm.create(session_id, metadata=metadata)
+
+    _enforce_session_owner(sm, session, claims)
+    return session
+
+
 def _extract_ws_token(ws: WebSocket) -> tuple[str, str | None]:
     token = str(ws.query_params.get("token") or "").strip()
-    if token:
+    allow_query_token = bool(getattr(ws.app.state, "ws_allow_query_token", False))
+    if token and allow_query_token:
         return token, None
 
     header = str(ws.headers.get("sec-websocket-protocol") or "")
@@ -132,12 +181,16 @@ async def ws_chat(ws: WebSocket) -> None:
         return
 
     try:
-        claims = verify_token(token, secret)
+        claims = verify_token(token, secret, expected_token_type="access")
+        claims = enforce_token_freshness(ws.app, claims)
     except ValueError:
         await ws.close(code=1008)
         return
 
-    user = tenant_id_from_claims(claims)
+    tenant_id = tenant_id_from_claims(claims)
+    username = str(claims.get("sub") or tenant_id).strip() or tenant_id
+    claim_secret = str(getattr(ws.app.state, "web_tenant_claim_secret", "") or "").strip()
+    tenant_claim_proof = build_web_tenant_claim_proof(claim_secret, tenant_id, username)
     requested_session_id = str(ws.query_params.get("session_id") or "").strip()
     if requested_session_id:
         try:
@@ -147,6 +200,13 @@ async def ws_chat(ws: WebSocket) -> None:
             return
     else:
         session_id = _new_session_id(claims)
+
+    sm = _get_session_manager(ws.app)
+    try:
+        _bind_session_owner(sm, session_id, claims)
+    except HTTPException:
+        await ws.close(code=1008)
+        return
 
     await ws.accept(subprotocol=negotiated_subprotocol)
 
@@ -161,18 +221,43 @@ async def ws_chat(ws: WebSocket) -> None:
 
     try:
         await web_channel.add_connection(session_id, ws)
-        await ws.send_json({"type": "session", "session_id": session_id, "user": user})
+        await ws.send_json(
+            {
+                "type": "session",
+                "session_id": session_id,
+                "user": username,
+                "tenant_id": tenant_id,
+            }
+        )
 
         bus = _get_bus(ws)
         while True:
+            # Re-check token freshness on each loop iteration so long-lived WS sessions are
+            # revoked promptly after user status/role/tenant changes.
+            try:
+                claims = enforce_token_freshness(ws.app, claims)
+            except ValueError:
+                await ws.close(code=1008)
+                break
+
             text = await ws.receive_text()
+            try:
+                claims = enforce_token_freshness(ws.app, claims)
+            except ValueError:
+                await ws.close(code=1008)
+                break
             msg = InboundMessage(
                 channel="web",
-                sender_id=user,
+                sender_id=username,
                 chat_id=session_id,
                 content=text,
                 session_id=session_id,
-                metadata={"user": user},
+                metadata={
+                    "user": username,
+                    "tenant_id": tenant_id,
+                    "canonical_sender_id": username,
+                    "web_tenant_proof": tenant_claim_proof,
+                },
             )
             ok = await bus.publish_inbound(msg)
             if not ok:
@@ -209,6 +294,7 @@ async def chat_history(
     session = sm.get(session_id)
     if session is None:
         return []
+    _enforce_session_owner(sm, session, user)
 
     # Preserve timestamps for UI; keep shape stable for clients.
     recent = session.messages[-int(max_messages) :] if session.messages else []
@@ -226,13 +312,12 @@ async def create_chat_session(
 ) -> dict[str, Any]:
     sm = _get_session_manager(request.app)
     title = _normalize_title((payload.title if payload else None))
-    metadata = {"title": title} if title else {}
 
     for _ in range(8):
         session_id = _new_session_id(user)
         if sm.get(session_id) is not None:
             continue
-        session = sm.create(session_id, metadata=metadata)
+        session = _bind_session_owner(sm, session_id, user, title=title)
         return _session_view(session)
 
     raise HTTPException(
@@ -251,6 +336,10 @@ async def update_chat_session_title(
     sid = _validate_session_id(session_id, user)
     title = _normalize_title(payload.title)
     sm = _get_session_manager(request.app)
+    existing = sm.get(sid)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    _enforce_session_owner(sm, existing, user)
     session = sm.update_title(sid, title)
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
@@ -265,6 +354,10 @@ async def delete_chat_session(
 ) -> dict[str, Any]:
     sid = _validate_session_id(session_id, user)
     sm = _get_session_manager(request.app)
+    existing = sm.get(sid)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
+    _enforce_session_owner(sm, existing, user)
     deleted = sm.delete(sid)
     if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
@@ -278,7 +371,20 @@ async def chat_sessions(
     sm = _get_session_manager(request.app)
     sessions = sm.list_sessions()
     prefix = _session_prefix(user)
-    return [s for s in sessions if str(s.get("key") or "").startswith(prefix)]
+    out: list[dict[str, Any]] = []
+    for item in sessions:
+        key = str(item.get("key") or "")
+        if not key.startswith(prefix):
+            continue
+        session = sm.get(key)
+        if session is None:
+            continue
+        try:
+            _enforce_session_owner(sm, session, user)
+        except HTTPException:
+            continue
+        out.append(_session_view(session))
+    return out
 
 
 @router.get("/api/chat/status")

@@ -86,6 +86,57 @@ async def test_refresh_token_flow(http_client) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_login_sets_refresh_cookie(http_client) -> None:
+    r = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert r.status_code == 200
+    set_cookie = str(r.headers.get("set-cookie") or "")
+    assert "nanobot_refresh_token=" in set_cookie
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_accepts_cookie_without_body_token(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post("/api/auth/refresh", json={})
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_logout_clears_refresh_cookie(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    token = str(login.json().get("token") or "")
+    assert token
+
+    logout = await http_client.post(
+        "/api/auth/logout",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"revoke_all": True},
+    )
+    assert logout.status_code == 200
+    set_cookie = str(logout.headers.get("set-cookie") or "")
+    assert "nanobot_refresh_token=" in set_cookie
+    assert "Max-Age=0" in set_cookie or "expires=" in set_cookie.lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_member_role_cannot_update_provider(http_client, auth_headers) -> None:
     create = await http_client.post(
         "/api/auth/users",
@@ -324,6 +375,59 @@ async def test_owner_can_update_user_role_while_admin_cannot(http_client, auth_h
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_create_user_rejects_invalid_tenant_id(http_client, auth_headers) -> None:
+    r = await http_client.post(
+        "/api/auth/users",
+        headers=auth_headers,
+        json={
+            "username": "tenant-bad-user",
+            "password": "tenant-bad-pass",
+            "role": "member",
+            "tenant_id": "a:b",
+        },
+    )
+    assert r.status_code == 422
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_invalid_tenant_claim_rejected_on_tenant_scoped_endpoint(http_client) -> None:
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "sub": "admin",
+            "tenant_id": "a:b",
+            "role": "owner",
+            "token_type": "access",
+            "iat": now - 10,
+            "exp": now + 3600,
+        },
+        "test-jwt-secret",
+        algorithm="HS256",
+    )
+    r = await http_client.get(
+        "/api/providers",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert r.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_access_token_rejected_when_auth_store_unavailable(
+    http_client, auth_headers, web_ctx
+) -> None:
+    original_store = web_ctx.app.state.user_store
+    web_ctx.app.state.user_store = None
+    try:
+        r = await http_client.get("/api/me", headers=auth_headers)
+    finally:
+        web_ctx.app.state.user_store = original_store
+    assert r.status_code == 503
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_admin_reset_password_invalidates_old_password(http_client, auth_headers) -> None:
     create_user = await http_client.post(
         "/api/auth/users",
@@ -523,6 +627,90 @@ async def test_owner_can_deactivate_reactivate_and_delete_user(http_client, auth
         json={"username": "lifecycle-user", "password": "lifecycle-pass-1"},
     )
     assert login_after_delete.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_access_token_is_revoked_immediately_after_user_deactivation(
+    http_client, auth_headers
+) -> None:
+    created = await http_client.post(
+        "/api/auth/users",
+        headers=auth_headers,
+        json={
+            "username": "token-fresh-user",
+            "password": "token-fresh-pass",
+            "role": "member",
+        },
+    )
+    assert created.status_code == 200
+
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "token-fresh-user", "password": "token-fresh-pass"},
+    )
+    assert login.status_code == 200
+    stale_access = str(login.json().get("token") or "")
+    assert stale_access
+    stale_headers = {"Authorization": f"Bearer {stale_access}"}
+
+    before = await http_client.get("/api/auth/me", headers=stale_headers)
+    assert before.status_code == 200
+
+    disabled = await http_client.put(
+        "/api/auth/users/token-fresh-user/status",
+        headers=auth_headers,
+        json={"active": False},
+    )
+    assert disabled.status_code == 200
+
+    after = await http_client.get("/api/auth/me", headers=stale_headers)
+    assert after.status_code == 401
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_access_token_is_revoked_immediately_after_role_change(http_client, auth_headers) -> None:
+    created = await http_client.post(
+        "/api/auth/users",
+        headers=auth_headers,
+        json={
+            "username": "token-role-admin",
+            "password": "token-role-pass",
+            "role": "admin",
+        },
+    )
+    assert created.status_code == 200
+
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "token-role-admin", "password": "token-role-pass"},
+    )
+    assert login.status_code == 200
+    stale_access = str(login.json().get("token") or "")
+    assert stale_access
+    stale_headers = {"Authorization": f"Bearer {stale_access}"}
+
+    before = await http_client.put(
+        "/api/providers/defaults",
+        headers=stale_headers,
+        json={"model": "openai/gpt-4o-mini", "provider": "openai"},
+    )
+    assert before.status_code == 200
+
+    demote = await http_client.put(
+        "/api/auth/users/token-role-admin/role",
+        headers=auth_headers,
+        json={"role": "member"},
+    )
+    assert demote.status_code == 200
+
+    after = await http_client.put(
+        "/api/providers/defaults",
+        headers=stale_headers,
+        json={"model": "openai/gpt-4o-mini", "provider": "openai"},
+    )
+    assert after.status_code == 401
 
 
 @pytest.mark.integration

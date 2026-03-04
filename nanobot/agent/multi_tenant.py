@@ -26,6 +26,7 @@ from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.session.manager import SessionManager
 from nanobot.tenants.commands import configure_link_throttle, try_handle
+from nanobot.tenants.policy import allowlist_match, resolve_exec_effective, resolve_web_effective
 from nanobot.tenants.store import TenantStore
 from nanobot.tenants.types import TenantContext
 from nanobot.utils.helpers import get_data_path
@@ -356,14 +357,7 @@ class MultiTenantAgentLoop:
 
     @staticmethod
     def _is_allowlist_match(wl: set[str], tenant_id: str, identities: list[str]) -> bool:
-        if not wl:
-            return False
-        if tenant_id in wl:
-            return True
-        for ident in identities or []:
-            if str(ident) in wl:
-                return True
-        return False
+        return allowlist_match(wl, tenant_id, identities)
 
     def _is_exec_allowed(self, tenant_id: str, identities: list[str]) -> bool:
         return self._is_allowlist_match(self._exec_whitelist, tenant_id, identities)
@@ -377,33 +371,27 @@ class MultiTenantAgentLoop:
         tenant_exec_enabled: bool,
         user_exec_setting: bool | None,
     ) -> bool:
-        # System cap is authoritative and cannot be bypassed.
-        if not bool(getattr(self.system_config.tools.exec, "enabled", True)):
-            return False
-        if not self._is_allowlist_match(self._exec_whitelist, tenant_id, identities):
-            return False
-
-        # Tenant policy may further narrow access.
-        if not tenant_exec_enabled:
-            return False
-        if tenant_exec_whitelist and not self._is_allowlist_match(
-            tenant_exec_whitelist, tenant_id, identities
-        ):
-            return False
-
-        # User/session override can only be more restrictive.
-        if user_exec_setting is False:
-            return False
-        return True
+        effective, _reason_codes = resolve_exec_effective(
+            system_enabled=bool(getattr(self.system_config.tools.exec, "enabled", True)),
+            system_allowlisted=self._is_allowlist_match(self._exec_whitelist, tenant_id, identities),
+            tenant_enabled=bool(tenant_exec_enabled),
+            tenant_has_allowlist=bool(tenant_exec_whitelist),
+            tenant_allowlisted=(
+                True
+                if not tenant_exec_whitelist
+                else self._is_allowlist_match(tenant_exec_whitelist, tenant_id, identities)
+            ),
+            user_enabled=user_exec_setting,
+        )
+        return bool(effective)
 
     def _resolve_web_enabled(self, *, tenant_web_enabled: bool, user_web_setting: bool | None) -> bool:
-        if not bool(getattr(self.system_config.tools.web, "enabled", True)):
-            return False
-        if not bool(tenant_web_enabled):
-            return False
-        if user_web_setting is False:
-            return False
-        return True
+        effective, _reason_codes = resolve_web_effective(
+            system_enabled=bool(getattr(self.system_config.tools.web, "enabled", True)),
+            tenant_enabled=bool(tenant_web_enabled),
+            user_enabled=user_web_setting,
+        )
+        return bool(effective)
 
     def _get_or_create_runtime(
         self,

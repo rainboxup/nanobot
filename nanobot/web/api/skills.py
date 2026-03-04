@@ -21,6 +21,7 @@ from pydantic import BaseModel, ConfigDict
 
 from nanobot.agent.skills import SkillsLoader
 from nanobot.config.schema import MCPServerConfig
+from nanobot.tenants.policy import allowlist_match, resolve_exec_effective, resolve_web_effective
 from nanobot.utils.fs import dir_size_bytes
 from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
@@ -166,14 +167,7 @@ def _to_str_set(values: Any) -> set[str]:
 
 
 def _allowlist_match(wl: set[str], tenant_id: str, identities: list[str]) -> bool:
-    if not wl:
-        return False
-    if tenant_id in wl:
-        return True
-    for ident in identities:
-        if str(ident) in wl:
-            return True
-    return False
+    return allowlist_match(wl, tenant_id, identities)
 
 
 def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
@@ -226,32 +220,25 @@ def _tool_policy_payload(
     tenant_exec_policy = True if not tenant_exec_wl else _allowlist_match(tenant_exec_wl, tenant_id, identities)
     user_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
     tenant_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
-    exec_reason_codes: list[str] = []
-    if not system_exec_enabled:
-        exec_reason_codes.append("system_disabled")
-    elif not system_exec_allowlisted:
-        exec_reason_codes.append("system_allowlist")
-    if not tenant_exec_enabled:
-        exec_reason_codes.append("tenant_disabled")
-    if tenant_exec_wl and not tenant_exec_policy:
-        exec_reason_codes.append("tenant_allowlist")
-    if not user_exec_enabled:
-        exec_reason_codes.append("user_disabled")
-    effective_exec = bool(len(exec_reason_codes) == 0)
+    effective_exec, exec_reason_codes = resolve_exec_effective(
+        system_enabled=system_exec_enabled,
+        system_allowlisted=system_exec_allowlisted,
+        tenant_enabled=tenant_exec_enabled,
+        tenant_has_allowlist=bool(tenant_exec_wl),
+        tenant_allowlisted=tenant_exec_policy,
+        user_enabled=user_exec_enabled,
+    )
 
     system_web_enabled = bool(
         getattr(getattr(getattr(system_cfg, "tools", None), "web", None), "enabled", True)
     )
-    tenant_web_policy = True
+    tenant_web_policy = bool(getattr(tenant_web_cfg, "enabled", True))
     user_web_enabled = bool(getattr(tenant_web_cfg, "enabled", True))
-    web_reason_codes: list[str] = []
-    if not system_web_enabled:
-        web_reason_codes.append("system_disabled")
-    if not tenant_web_policy:
-        web_reason_codes.append("tenant_policy")
-    if not user_web_enabled:
-        web_reason_codes.append("user_disabled")
-    effective_web = bool(len(web_reason_codes) == 0)
+    effective_web, web_reason_codes = resolve_web_effective(
+        system_enabled=system_web_enabled,
+        tenant_enabled=tenant_web_policy,
+        user_enabled=user_web_enabled,
+    )
 
     warnings: list[str] = []
     if user_exec_enabled and not effective_exec:

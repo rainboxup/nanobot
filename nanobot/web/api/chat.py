@@ -22,6 +22,7 @@ _SESSION_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
 _SESSION_TITLE_MAX_LEN = 200
 _OWNER_USER_KEY = "owner_user_id"
 _OWNER_TENANT_KEY = "owner_tenant_id"
+_TENANT_SESSION_MANAGER_MAX_ENTRIES = 256
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -44,11 +45,33 @@ def _get_inbound_bus(request_or_ws: Request | WebSocket) -> Any:
     raise RuntimeError("Inbound publisher not configured")
 
 
+def _is_session_manager_like(value: Any) -> bool:
+    required_methods = (
+        "get",
+        "get_or_create",
+        "create",
+        "save",
+        "update_title",
+        "delete",
+        "list_sessions",
+    )
+    return all(callable(getattr(value, name, None)) for name in required_methods)
+
+
+def _tenant_session_manager_limit(app) -> int:
+    raw = getattr(app.state, "tenant_session_manager_max_entries", _TENANT_SESSION_MANAGER_MAX_ENTRIES)
+    try:
+        limit = int(raw)
+    except Exception:
+        return _TENANT_SESSION_MANAGER_MAX_ENTRIES
+    return max(1, limit)
+
+
 def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode == "single":
         sm = getattr(app.state, "session_manager", None)
-        if isinstance(sm, SessionManager):
+        if _is_session_manager_like(sm):
             return sm
 
         cfg = getattr(app.state, "config", None)
@@ -65,12 +88,18 @@ def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
 
     existing = cache.get(tenant_id)
     if isinstance(existing, SessionManager):
+        # Move to the end to model LRU recency on access.
+        cache.pop(tenant_id, None)
+        cache[tenant_id] = existing
         return existing
 
     store = get_tenant_store(app)
     tenant = store.ensure_tenant_files(tenant_id)
     sm = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
     cache[tenant_id] = sm
+    while len(cache) > _tenant_session_manager_limit(app):
+        oldest_tenant_id = next(iter(cache))
+        cache.pop(oldest_tenant_id, None)
     return sm
 
 

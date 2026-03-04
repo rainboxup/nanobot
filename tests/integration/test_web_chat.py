@@ -286,6 +286,104 @@ async def test_websocket_session_binding_persists_in_tenant_sessions_dir(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_chat_session_crud_persists_in_non_admin_tenant_sessions_dir(
+    web_ctx, http_client, auth_headers_for
+) -> None:
+    alice_headers = await auth_headers_for("alice")
+    created = await http_client.post(
+        "/api/chat/sessions",
+        headers=alice_headers,
+        json={"title": "alice scoped session"},
+    )
+    assert created.status_code == 201
+    session_id = str(created.json().get("key") or "")
+    assert session_id.startswith("web:alice:")
+
+    tenant = web_ctx.tenant_store.ensure_tenant_files("alice")
+    tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    assert tenant_sessions.get(session_id) is not None
+    assert web_ctx.session_manager.get(session_id) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_rejects_same_tenant_other_user_session_id(
+    web_ctx, auth_headers_for
+) -> None:
+    member_a_headers = await auth_headers_for(
+        "team1-member-a",
+        role="member",
+        tenant_id="team1",
+        password="team1-member-a-pass",
+    )
+    member_b_headers = await auth_headers_for(
+        "team1-member-b",
+        role="member",
+        tenant_id="team1",
+        password="team1-member-b-pass",
+    )
+    token_a = str(member_a_headers["Authorization"]).split(" ", 1)[1]
+    token_b = str(member_b_headers["Authorization"]).split(" ", 1)[1]
+
+    session_id = ""
+    async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(token_a)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        session_id = str(meta.get("session_id") or "")
+        assert session_id.startswith("web:team1:")
+
+    with pytest.raises(Exception):
+        async with websockets.connect(
+            _ws_uri(web_ctx.ws_url, session_id=session_id),
+            subprotocols=_ws_subprotocols(token_b),
+        ) as ws:
+            await ws.recv()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tenant_session_manager_cache_respects_max_entries(
+    web_ctx, http_client, auth_headers_for
+) -> None:
+    web_ctx.app.state.tenant_session_manager_max_entries = 2
+
+    headers_team1 = await auth_headers_for(
+        "cache-team1-user",
+        role="member",
+        tenant_id="cache-team1",
+        password="cache-team1-pass",
+    )
+    headers_team2 = await auth_headers_for(
+        "cache-team2-user",
+        role="member",
+        tenant_id="cache-team2",
+        password="cache-team2-pass",
+    )
+    headers_team3 = await auth_headers_for(
+        "cache-team3-user",
+        role="member",
+        tenant_id="cache-team3",
+        password="cache-team3-pass",
+    )
+
+    for headers in (headers_team1, headers_team2, headers_team3):
+        created = await http_client.post(
+            "/api/chat/sessions",
+            headers=headers,
+            json={"title": "cache test"},
+        )
+        assert created.status_code == 201
+
+    cache = getattr(web_ctx.app.state, "tenant_session_managers", {})
+    assert isinstance(cache, dict)
+    assert len(cache) == 2
+    assert "cache-team1" not in cache
+    assert "cache-team2" in cache
+    assert "cache-team3" in cache
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_websocket_chat_reuses_session_when_session_id_passed(web_ctx, auth_token) -> None:
     first_session_id = ""
     async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(auth_token)) as ws:

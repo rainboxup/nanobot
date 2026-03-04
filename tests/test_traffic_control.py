@@ -153,6 +153,37 @@ async def test_tenant_ingress_broker_ignores_untrusted_web_claimed_tenant_id(tmp
 
 
 @pytest.mark.asyncio
+async def test_tenant_ingress_broker_rejects_invalid_web_tenant_proof(tmp_path) -> None:
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    lock = asyncio.Lock()
+    broker = TenantIngressBroker(
+        bus=bus,
+        store=store,
+        store_lock=lock,
+        max_pending_per_tenant=5,
+        web_tenant_claim_secret="tenant-claim-secret",
+    )
+
+    claimed_tenant = "tenant-web-a"
+    await broker.publish_inbound(
+        InboundMessage(
+            channel="web",
+            sender_id="alice",
+            chat_id="web:alice:deadbeef",
+            content="hello",
+            metadata={"tenant_id": claimed_tenant, "web_tenant_proof": "bad-proof"},
+        )
+    )
+
+    inbound = await bus.consume_inbound()
+    resolved_tenant = str(inbound.metadata.get("tenant_id") or "")
+    assert resolved_tenant
+    assert resolved_tenant != claimed_tenant
+    assert store.resolve_tenant("web", "alice") == resolved_tenant
+
+
+@pytest.mark.asyncio
 async def test_tenant_ingress_broker_ignores_canonical_sender_override_metadata(
     tmp_path,
 ) -> None:

@@ -7,7 +7,7 @@ import pytest
 
 from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.agent.tools.shell import ExecTool
-from nanobot.bus.broker import build_web_tenant_claim_proof
+from nanobot.bus.broker import TenantIngressBroker, build_web_tenant_claim_proof
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
@@ -402,6 +402,44 @@ async def test_process_inbound_ignores_untrusted_explicit_tenant_id_for_web(
 
 
 @pytest.mark.asyncio
+async def test_process_inbound_ignores_invalid_web_tenant_proof(
+    tmp_path: Path, monkeypatch
+) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    bus = MessageBus()
+    loop = MultiTenantAgentLoop(
+        bus=bus,
+        system_config=Config(),
+        store=store,
+        skill_store_dir=tmp_path / "store",
+        web_tenant_claim_secret="tenant-claim-secret",
+    )
+
+    real_tenant = store.ensure_tenant("web", "alice")
+    spoofed_tenant = store.ensure_tenant("web", "mallory")
+    assert real_tenant != spoofed_tenant
+
+    observed: dict[str, str] = {}
+
+    async def _fake_process_for_tenant(msg, canonical_sender, tenant_id, tenant):
+        observed["tenant_id"] = tenant_id
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="ok")
+
+    monkeypatch.setattr(loop, "_process_for_tenant", _fake_process_for_tenant)
+
+    msg = InboundMessage(
+        channel="web",
+        sender_id="alice",
+        chat_id="web:tenant-web-a:deadbeef",
+        content="hello",
+        metadata={"tenant_id": spoofed_tenant, "web_tenant_proof": "bad-proof"},
+    )
+    out = await loop._process_inbound(msg)
+    assert out is not None
+    assert observed.get("tenant_id") == real_tenant
+
+
+@pytest.mark.asyncio
 async def test_process_inbound_ignores_canonical_sender_override_metadata_for_non_web(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -436,4 +474,55 @@ async def test_process_inbound_ignores_canonical_sender_override_metadata_for_no
     out = await loop._process_inbound(msg)
     assert out is not None
     assert observed.get("tenant_id") == real_tenant
+
+
+@pytest.mark.asyncio
+async def test_web_claim_proof_end_to_end_through_ingress_and_loop(
+    tmp_path: Path, monkeypatch
+) -> None:
+    claim_secret = "tenant-claim-secret"
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    lock = asyncio.Lock()
+
+    ingress = TenantIngressBroker(
+        bus=bus,
+        store=store,
+        store_lock=lock,
+        max_pending_per_tenant=5,
+        web_tenant_claim_secret=claim_secret,
+    )
+    loop = MultiTenantAgentLoop(
+        bus=bus,
+        system_config=Config(),
+        store=store,
+        store_lock=lock,
+        skill_store_dir=tmp_path / "store",
+        web_tenant_claim_secret=claim_secret,
+    )
+
+    claimed_tenant = "tenant-web-chain"
+    observed: dict[str, str] = {}
+
+    async def _fake_process_for_tenant(msg, canonical_sender, tenant_id, tenant):
+        observed["tenant_id"] = tenant_id
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="ok")
+
+    monkeypatch.setattr(loop, "_process_for_tenant", _fake_process_for_tenant)
+
+    proof = build_web_tenant_claim_proof(claim_secret, claimed_tenant, "alice")
+    await ingress.publish_inbound(
+        InboundMessage(
+            channel="web",
+            sender_id="alice",
+            chat_id="web:alice:deadbeef",
+            content="hello",
+            metadata={"tenant_id": claimed_tenant, "web_tenant_proof": proof},
+        )
+    )
+
+    inbound = await bus.consume_inbound()
+    out = await loop._process_inbound(inbound)
+    assert out is not None
+    assert observed.get("tenant_id") == claimed_tenant
 

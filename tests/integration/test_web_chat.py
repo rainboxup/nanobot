@@ -384,6 +384,29 @@ async def test_tenant_session_manager_cache_respects_max_entries(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_chat_sessions_use_global_manager_in_single_runtime_mode(
+    web_ctx, http_client, auth_headers
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+
+    created = await http_client.post(
+        "/api/chat/sessions",
+        headers=auth_headers,
+        json={"title": "single mode session"},
+    )
+    assert created.status_code == 201
+    session_id = str(created.json().get("key") or "")
+    assert session_id.startswith("web:admin:")
+
+    assert web_ctx.session_manager.get(session_id) is not None
+
+    tenant = web_ctx.tenant_store.ensure_tenant_files("admin")
+    tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    assert tenant_sessions.get(session_id) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_websocket_chat_reuses_session_when_session_id_passed(web_ctx, auth_token) -> None:
     first_session_id = ""
     async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(auth_token)) as ws:

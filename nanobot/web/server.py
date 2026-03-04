@@ -195,6 +195,9 @@ def create_app(
         normalized_runtime_mode = "multi"
     app.state.runtime_mode = normalized_runtime_mode
     app.state.runtime_scope = "global" if normalized_runtime_mode == "single" else "tenant"
+    app.state.tenant_session_manager_max_entries = int(
+        getattr(config.traffic, "web_tenant_session_manager_max_entries", 256)
+    )
     app.state.started_at = datetime.now(timezone.utc).isoformat()
     app.state.started_monotonic = float(time.monotonic())
     app.state.jwt_secret = jwt_secret

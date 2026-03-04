@@ -351,6 +351,7 @@ class TrafficConfig(Base):
     runtime_cache_ttl_seconds: int = Field(default=1800, ge=60)
     tenant_lock_ttl_seconds: int = Field(default=3600, ge=60)
     max_cached_tenant_runtimes: int = Field(default=256, ge=1)
+    web_tenant_session_manager_max_entries: int = Field(default=256, ge=1)
     link_attempt_window_seconds: int = Field(default=60, ge=1)
     link_max_attempts_per_window: int = Field(default=5, ge=1)
     link_failures_before_cooldown: int = Field(default=5, ge=1)

@@ -384,6 +384,15 @@ async def test_tenant_session_manager_cache_respects_max_entries(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_tenant_session_manager_cache_limit_initializes_from_config(web_ctx) -> None:
+    configured = int(getattr(web_ctx.app.state.config.traffic, "web_tenant_session_manager_max_entries", 0))
+    effective = int(getattr(web_ctx.app.state, "tenant_session_manager_max_entries", 0))
+    assert configured >= 1
+    assert effective == configured
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_chat_sessions_use_global_manager_in_single_runtime_mode(
     web_ctx, http_client, auth_headers
 ) -> None:
@@ -626,6 +635,12 @@ async def test_chat_history_and_sessions_are_scoped_per_user(
     assert r_bob.status_code == 200
     bob_keys = [str(item.get("key") or "") for item in r_bob.json()]
     assert alice_session_id not in bob_keys
+
+    alice_sm = _tenant_session_manager(web_ctx, "alice")
+    bob_sm = _tenant_session_manager(web_ctx, "bob")
+    assert alice_sm.get(alice_session_id) is not None
+    assert bob_sm.get(alice_session_id) is None
+    assert web_ctx.session_manager.get(alice_session_id) is None
 
 
 @pytest.mark.integration

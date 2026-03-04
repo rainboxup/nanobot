@@ -153,6 +153,27 @@ def _build_readiness_payload(app) -> dict[str, Any]:
     }
 
 
+def _web_session_cache_metrics(app) -> dict[str, Any]:
+    cache = getattr(app.state, "tenant_session_managers", None)
+    current = len(cache) if isinstance(cache, dict) else 0
+    raw_limit = getattr(app.state, "tenant_session_manager_max_entries", 0)
+    raw_evictions = getattr(app.state, "tenant_session_manager_evictions_total", 0)
+    try:
+        limit = max(1, int(raw_limit))
+    except Exception:
+        limit = 1
+    try:
+        evictions_total = max(0, int(raw_evictions))
+    except Exception:
+        evictions_total = 0
+    return {
+        "max_entries": limit,
+        "current_cached_tenant_session_managers": max(0, int(current)),
+        "evictions_total": evictions_total,
+        "utilization": round(max(0, int(current)) / limit, 4),
+    }
+
+
 def create_app(
     config: Config,
     bus: MessageBus,
@@ -198,6 +219,7 @@ def create_app(
     app.state.tenant_session_manager_max_entries = int(
         getattr(config.traffic, "web_tenant_session_manager_max_entries", 256)
     )
+    app.state.tenant_session_manager_evictions_total = 0
     app.state.started_at = datetime.now(timezone.utc).isoformat()
     app.state.started_monotonic = float(time.monotonic())
     app.state.jwt_secret = jwt_secret
@@ -301,6 +323,7 @@ def create_app(
         active_web_connections = 0
         if web_channel is not None:
             active_web_connections = int(len(getattr(web_channel, "connections", {}) or {}))
+        web_session_cache = _web_session_cache_metrics(request.app)
 
         started_at = str(getattr(request.app.state, "started_at", "") or "")
         started_monotonic = float(getattr(request.app.state, "started_monotonic", 0.0) or 0.0)
@@ -332,6 +355,7 @@ def create_app(
                     "status": channel_manager.get_status() if channel_manager is not None else {},
                     "active_web_connections": active_web_connections,
                 },
+                "web_session_cache": web_session_cache,
             },
         }
 

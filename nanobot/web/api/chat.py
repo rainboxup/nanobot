@@ -67,6 +67,21 @@ def _tenant_session_manager_limit(app) -> int:
     return max(1, limit)
 
 
+def _record_tenant_session_manager_evictions(app, count: int) -> None:
+    try:
+        delta = max(0, int(count))
+    except Exception:
+        delta = 0
+    if delta <= 0:
+        return
+    base = getattr(app.state, "tenant_session_manager_evictions_total", 0)
+    try:
+        current = int(base)
+    except Exception:
+        current = 0
+    app.state.tenant_session_manager_evictions_total = max(0, current) + delta
+
+
 def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode == "single":
@@ -97,9 +112,12 @@ def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
     tenant = store.ensure_tenant_files(tenant_id)
     sm = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
     cache[tenant_id] = sm
+    evicted = 0
     while len(cache) > _tenant_session_manager_limit(app):
         oldest_tenant_id = next(iter(cache))
         cache.pop(oldest_tenant_id, None)
+        evicted += 1
+    _record_tenant_session_manager_evictions(app, evicted)
     return sm
 
 

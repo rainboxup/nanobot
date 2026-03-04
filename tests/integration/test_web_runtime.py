@@ -89,6 +89,12 @@ async def test_web_ops_runtime_endpoint_exposes_runtime_snapshot_for_owner(http_
     assert isinstance(channels.get("status"), dict)
     assert int(channels.get("active_web_connections") or 0) >= 0
 
+    web_cache = runtime.get("web_session_cache") or {}
+    assert int(web_cache.get("max_entries") or 0) >= 1
+    assert int(web_cache.get("current_cached_tenant_session_managers") or 0) >= 0
+    assert int(web_cache.get("evictions_total") or 0) >= 0
+    assert float(web_cache.get("utilization") or 0.0) >= 0.0
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio

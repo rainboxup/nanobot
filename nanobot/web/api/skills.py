@@ -198,6 +198,18 @@ def _tool_policy_payload(
     runtime_scope = _runtime_scope(runtime_mode)
     runtime_warn = _runtime_warning(runtime_mode)
     write_status = _write_status(runtime_mode)
+    cache = getattr(request.app.state, "tenant_session_managers", None)
+    current_cache = len(cache) if isinstance(cache, dict) else 0
+    raw_limit = getattr(request.app.state, "tenant_session_manager_max_entries", 0)
+    raw_evictions = getattr(request.app.state, "tenant_session_manager_evictions_total", 0)
+    try:
+        cache_limit = max(1, int(raw_limit))
+    except Exception:
+        cache_limit = 1
+    try:
+        evictions_total = max(0, int(raw_evictions))
+    except Exception:
+        evictions_total = 0
 
     system_cfg = getattr(request.app.state, "config", None)
     identities = _web_identities(user, tenant_id)
@@ -250,6 +262,12 @@ def _tool_policy_payload(
     payload: dict[str, Any] = {
         "runtime_mode": runtime_mode,
         "runtime_scope": runtime_scope,
+        "runtime_cache": {
+            "max_entries": cache_limit,
+            "current_cached_tenant_session_managers": max(0, int(current_cache)),
+            "evictions_total": evictions_total,
+            "utilization": round(max(0, int(current_cache)) / cache_limit, 4),
+        },
         "writable": bool(write_status["writable"]),
         "write_block_reason_code": write_status["write_block_reason_code"],
         "write_block_reason": write_status["write_block_reason"],

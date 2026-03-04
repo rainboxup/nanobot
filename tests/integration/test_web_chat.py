@@ -380,6 +380,7 @@ async def test_tenant_session_manager_cache_respects_max_entries(
     assert "cache-team1" not in cache
     assert "cache-team2" in cache
     assert "cache-team3" in cache
+    assert int(getattr(web_ctx.app.state, "tenant_session_manager_evictions_total", 0)) == 1
 
 
 @pytest.mark.integration

@@ -760,6 +760,26 @@ async def test_tools_policy_exposes_runtime_and_write_metadata_in_single_mode(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_tools_policy_exposes_web_session_cache_runtime_metadata(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.tenant_session_manager_max_entries = 11
+    web_ctx.app.state.tenant_session_managers = {"t1": object(), "t2": object()}
+    web_ctx.app.state.tenant_session_manager_evictions_total = 4
+    admin_headers = await auth_headers_for("policy-admin-runtime-cache", role="admin", tenant_id="tenant-cache")
+
+    resp = await http_client.get("/api/tools/policy", headers=admin_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    runtime_cache = dict(body.get("runtime_cache") or {})
+    assert int(runtime_cache.get("max_entries") or 0) == 11
+    assert int(runtime_cache.get("current_cached_tenant_session_managers") or 0) == 2
+    assert int(runtime_cache.get("evictions_total") or 0) == 4
+    assert float(runtime_cache.get("utilization") or 0.0) >= 0.0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_tools_policy_effective_reason_codes(http_client, auth_headers_for, web_ctx) -> None:
     tenant_id = "tenant-policy-reasons"
     admin_headers = await auth_headers_for("policy-admin-reasons", role="admin", tenant_id=tenant_id)

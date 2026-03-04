@@ -4,6 +4,7 @@ import json
 import pytest
 import websockets
 
+from nanobot.bus.broker import TenantIngressBroker
 from nanobot.bus.events import OutboundMessage
 
 
@@ -92,6 +93,63 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
     await asyncio.sleep(0.1)
     web_channel = getattr(web_ctx.channel_manager, "channels").get("web")
     assert session_id not in getattr(web_channel, "connections", {})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_uses_channel_manager_inbound_bus(web_ctx, auth_token) -> None:
+    class _InboundSpy:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        async def publish_inbound(self, msg) -> bool:
+            self.calls.append(
+                {
+                    "channel": str(msg.channel or ""),
+                    "chat_id": str(msg.chat_id or ""),
+                    "tenant_id": str((msg.metadata or {}).get("tenant_id") or ""),
+                }
+            )
+            return True
+
+    spy = _InboundSpy()
+    web_ctx.channel_manager.inbound_bus = spy
+
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        await ws.send("hello from spy")
+
+    assert len(spy.calls) == 1
+    assert spy.calls[0]["channel"] == "web"
+    assert spy.calls[0]["tenant_id"] == "admin"
+    assert web_ctx.bus.inbound.qsize() == 0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_uses_ingress_proof_validation_on_claim_secret_mismatch(
+    web_ctx, auth_token
+) -> None:
+    web_ctx.app.state.web_tenant_claim_secret = "ws-secret"
+    ingress = TenantIngressBroker(
+        bus=web_ctx.bus,
+        store=web_ctx.tenant_store,
+        store_lock=asyncio.Lock(),
+        web_tenant_claim_secret="ingress-secret",
+    )
+    web_ctx.channel_manager.inbound_bus = ingress
+
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        await ws.send("hello mismatch")
+
+    inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+    resolved_tenant = str((inbound.metadata or {}).get("tenant_id") or "")
+    assert resolved_tenant
+    assert resolved_tenant != "admin"
+    assert web_ctx.tenant_store.resolve_tenant("web", "admin") == resolved_tenant
 
 
 @pytest.mark.integration

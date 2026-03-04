@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 
 from nanobot.bus.broker import build_web_tenant_claim_proof
 from nanobot.bus.events import InboundMessage
-from nanobot.bus.queue import MessageBus
 from nanobot.web.auth import enforce_token_freshness, get_current_user, verify_token
 from nanobot.web.tenant import load_tenant_config, tenant_id_from_claims
 
@@ -32,11 +31,16 @@ class ChatSessionTitleUpdateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=_SESSION_TITLE_MAX_LEN)
 
 
-def _get_bus(request_or_ws: Request | WebSocket) -> MessageBus:
+def _get_inbound_bus(request_or_ws: Request | WebSocket) -> Any:
+    channel_manager = getattr(request_or_ws.app.state, "channel_manager", None)
+    inbound_bus = getattr(channel_manager, "inbound_bus", None)
+    if callable(getattr(inbound_bus, "publish_inbound", None)):
+        return inbound_bus
+
     bus = getattr(request_or_ws.app.state, "bus", None)
-    if not isinstance(bus, MessageBus):
-        raise RuntimeError("MessageBus not configured")
-    return bus
+    if callable(getattr(bus, "publish_inbound", None)):
+        return bus
+    raise RuntimeError("Inbound publisher not configured")
 
 
 def _get_session_manager(app) -> Any:
@@ -230,7 +234,7 @@ async def ws_chat(ws: WebSocket) -> None:
             }
         )
 
-        bus = _get_bus(ws)
+        bus = _get_inbound_bus(ws)
         while True:
             # Re-check token freshness on each loop iteration so long-lived WS sessions are
             # revoked promptly after user status/role/tenant changes.

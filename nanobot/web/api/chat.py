@@ -13,8 +13,9 @@ from pydantic import BaseModel, Field
 
 from nanobot.bus.broker import build_web_tenant_claim_proof
 from nanobot.bus.events import InboundMessage
+from nanobot.session.manager import SessionManager
 from nanobot.web.auth import enforce_token_freshness, get_current_user, verify_token
-from nanobot.web.tenant import load_tenant_config, tenant_id_from_claims
+from nanobot.web.tenant import get_tenant_store, load_tenant_config, tenant_id_from_claims
 
 router = APIRouter()
 _SESSION_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
@@ -43,16 +44,33 @@ def _get_inbound_bus(request_or_ws: Request | WebSocket) -> Any:
     raise RuntimeError("Inbound publisher not configured")
 
 
-def _get_session_manager(app) -> Any:
-    sm = getattr(app.state, "session_manager", None)
-    if sm is not None:
-        return sm
-    from nanobot.session.manager import SessionManager
+def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
+    runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
+    if runtime_mode == "single":
+        sm = getattr(app.state, "session_manager", None)
+        if isinstance(sm, SessionManager):
+            return sm
 
-    cfg = getattr(app.state, "config", None)
-    workspace = getattr(cfg, "workspace_path", None)
-    sm = SessionManager(workspace)
-    app.state.session_manager = sm
+        cfg = getattr(app.state, "config", None)
+        workspace = getattr(cfg, "workspace_path", None)
+        sm = SessionManager(workspace)
+        app.state.session_manager = sm
+        return sm
+
+    tenant_id = tenant_id_from_claims(claims)
+    cache = getattr(app.state, "tenant_session_managers", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        app.state.tenant_session_managers = cache
+
+    existing = cache.get(tenant_id)
+    if isinstance(existing, SessionManager):
+        return existing
+
+    store = get_tenant_store(app)
+    tenant = store.ensure_tenant_files(tenant_id)
+    sm = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    cache[tenant_id] = sm
     return sm
 
 
@@ -205,7 +223,7 @@ async def ws_chat(ws: WebSocket) -> None:
     else:
         session_id = _new_session_id(claims)
 
-    sm = _get_session_manager(ws.app)
+    sm = _get_session_manager(ws.app, claims)
     try:
         _bind_session_owner(sm, session_id, claims)
     except HTTPException:
@@ -294,7 +312,7 @@ async def chat_history(
 
     max_messages = max(1, min(200, int(max_messages)))
 
-    sm = _get_session_manager(request.app)
+    sm = _get_session_manager(request.app, user)
     session = sm.get(session_id)
     if session is None:
         return []
@@ -314,7 +332,7 @@ async def create_chat_session(
     payload: ChatSessionCreateRequest | None = None,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    sm = _get_session_manager(request.app)
+    sm = _get_session_manager(request.app, user)
     title = _normalize_title((payload.title if payload else None))
 
     for _ in range(8):
@@ -339,7 +357,7 @@ async def update_chat_session_title(
 ) -> dict[str, Any]:
     sid = _validate_session_id(session_id, user)
     title = _normalize_title(payload.title)
-    sm = _get_session_manager(request.app)
+    sm = _get_session_manager(request.app, user)
     existing = sm.get(sid)
     if existing is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
@@ -357,7 +375,7 @@ async def delete_chat_session(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     sid = _validate_session_id(session_id, user)
-    sm = _get_session_manager(request.app)
+    sm = _get_session_manager(request.app, user)
     existing = sm.get(sid)
     if existing is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
@@ -372,7 +390,7 @@ async def delete_chat_session(
 async def chat_sessions(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
-    sm = _get_session_manager(request.app)
+    sm = _get_session_manager(request.app, user)
     sessions = sm.list_sessions()
     prefix = _session_prefix(user)
     out: list[dict[str, Any]] = []

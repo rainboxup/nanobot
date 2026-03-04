@@ -6,6 +6,7 @@ import websockets
 
 from nanobot.bus.broker import TenantIngressBroker
 from nanobot.bus.events import OutboundMessage
+from nanobot.session.manager import SessionManager
 
 
 def _ws_uri(base: str, session_id: str | None = None, token: str | None = None) -> str:
@@ -21,6 +22,22 @@ def _ws_uri(base: str, session_id: str | None = None, token: str | None = None) 
 
 def _ws_subprotocols(token: str) -> list[str]:
     return ["nanobot", token]
+
+
+def _tenant_session_manager(web_ctx, tenant_id: str) -> SessionManager:
+    cache = getattr(web_ctx.app.state, "tenant_session_managers", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        web_ctx.app.state.tenant_session_managers = cache
+
+    existing = cache.get(tenant_id)
+    if isinstance(existing, SessionManager):
+        return existing
+
+    tenant = web_ctx.tenant_store.ensure_tenant_files(tenant_id)
+    sm = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    cache[tenant_id] = sm
+    return sm
 
 
 @pytest.mark.integration
@@ -53,10 +70,11 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
         assert msg == "hi from agent"
 
         # Seed history (agent loop normally saves it).
-        session = web_ctx.session_manager.get_or_create(session_id)
+        session_manager = _tenant_session_manager(web_ctx, "admin")
+        session = session_manager.get_or_create(session_id)
         session.add_message("user", "hello")
         session.add_message("assistant", "hi from agent")
-        web_ctx.session_manager.save(session)
+        session_manager.save(session)
 
         r = await http_client.get(
             f"/api/chat/history?session_id={session_id}",
@@ -79,7 +97,7 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
         # Seed many messages to verify max_messages is clamped (upper bound).
         for i in range(250):
             session.add_message("assistant", f"m{i}")
-        web_ctx.session_manager.save(session)
+        session_manager.save(session)
 
         r_big = await http_client.get(
             f"/api/chat/history?session_id={session_id}&max_messages=9999",
@@ -158,7 +176,7 @@ async def test_chat_history_missing_session_does_not_create_cache_entry(
     web_ctx, http_client, auth_headers
 ) -> None:
     missing_session_id = "web:admin:deadbeef"
-    sm = web_ctx.session_manager
+    sm = _tenant_session_manager(web_ctx, "admin")
     cache_before = len(getattr(sm, "_cache", {}))
 
     r = await http_client.get(
@@ -226,6 +244,44 @@ async def test_chat_session_crud_api(http_client, auth_headers) -> None:
         headers=auth_headers,
     )
     assert r_missing.status_code == 404
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_chat_session_crud_persists_in_tenant_sessions_dir(
+    web_ctx, http_client, auth_headers
+) -> None:
+    created = await http_client.post(
+        "/api/chat/sessions",
+        headers=auth_headers,
+        json={"title": "tenant scoped session"},
+    )
+    assert created.status_code == 201
+    session_id = str(created.json().get("key") or "")
+    assert session_id.startswith("web:admin:")
+
+    tenant = web_ctx.tenant_store.ensure_tenant_files("admin")
+    tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    assert tenant_sessions.get(session_id) is not None
+    assert web_ctx.session_manager.get(session_id) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_session_binding_persists_in_tenant_sessions_dir(
+    web_ctx, auth_token
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        session_id = str(meta.get("session_id") or "")
+        assert session_id.startswith("web:admin:")
+
+    tenant = web_ctx.tenant_store.ensure_tenant_files("admin")
+    tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    assert tenant_sessions.get(session_id) is not None
+    assert web_ctx.session_manager.get(session_id) is None
 
 
 @pytest.mark.integration
@@ -416,9 +472,10 @@ async def test_chat_history_and_sessions_are_scoped_per_user(
         alice_session_id = str(meta["session_id"])
 
         # Seed history for alice.
-        session = web_ctx.session_manager.get_or_create(alice_session_id)
+        session_manager = _tenant_session_manager(web_ctx, "alice")
+        session = session_manager.get_or_create(alice_session_id)
         session.add_message("user", "alice hello")
-        web_ctx.session_manager.save(session)
+        session_manager.save(session)
 
     r_forbidden = await http_client.get(
         f"/api/chat/history?session_id={alice_session_id}",

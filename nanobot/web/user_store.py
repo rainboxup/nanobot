@@ -13,6 +13,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from nanobot.tenants.store import validate_tenant_id
+
 ROLE_OWNER = "owner"
 ROLE_ADMIN = "admin"
 ROLE_MEMBER = "member"
@@ -33,6 +35,27 @@ def _from_iso(value: str) -> datetime:
 
 def _normalize_username(value: str) -> str:
     return str(value or "").strip().lower()
+
+
+def _derive_default_tenant_id(username: str) -> str:
+    normalized = _normalize_username(username)
+    if not normalized:
+        raise ValueError("tenant_id_required")
+    try:
+        return validate_tenant_id(normalized)
+    except Exception:
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        return f"u-{digest}"
+
+
+def _normalize_tenant_id(value: str | None, *, username: str) -> str:
+    raw = str(value or "").strip().lower()
+    if raw:
+        try:
+            return validate_tenant_id(raw)
+        except Exception as e:
+            raise ValueError("invalid tenant_id") from e
+    return _derive_default_tenant_id(username)
 
 
 def _b64(value: bytes) -> str:
@@ -121,9 +144,7 @@ class UserStore:
         role = str(role or ROLE_MEMBER).strip().lower()
         if role not in VALID_ROLES:
             raise ValueError("invalid role")
-        tenant = str(tenant_id or user).strip().lower()
-        if not tenant:
-            raise ValueError("tenant_id required")
+        tenant = _normalize_tenant_id(tenant_id, username=user)
 
         with self._lock:
             data = self._load_locked()
@@ -137,6 +158,7 @@ class UserStore:
                 "tenant_id": tenant,
                 "role": role,
                 "active": True,
+                "token_version": 1,
                 "password_hash": hash_password(password),
                 "created_at": now,
                 "updated_at": now,
@@ -186,6 +208,7 @@ class UserStore:
             if not isinstance(rec, dict):
                 return False
             rec["password_hash"] = hash_password(new_password)
+            rec["token_version"] = max(1, int(rec.get("token_version") or 1)) + 1
             rec["updated_at"] = _to_iso(_utc_now())
             data["users"][user] = rec
             self._save_locked(data)
@@ -201,6 +224,7 @@ class UserStore:
             if not isinstance(rec, dict):
                 return None
             rec["active"] = bool(active)
+            rec["token_version"] = max(1, int(rec.get("token_version") or 1)) + 1
             rec["updated_at"] = _to_iso(_utc_now())
             data["users"][user] = rec
             revoked = 0
@@ -220,6 +244,7 @@ class UserStore:
             if not isinstance(rec, dict):
                 return False
             rec["role"] = role
+            rec["token_version"] = max(1, int(rec.get("token_version") or 1)) + 1
             rec["updated_at"] = _to_iso(_utc_now())
             data["users"][user] = rec
             self._save_locked(data)
@@ -472,6 +497,28 @@ class UserStore:
 
         if not isinstance(data.get("users"), dict):
             data["users"] = {}
+        else:
+            for username, rec in list(data["users"].items()):
+                if not isinstance(rec, dict):
+                    data["users"].pop(username, None)
+                    continue
+                try:
+                    token_version = max(1, int(rec.get("token_version") or 1))
+                except Exception:
+                    token_version = 1
+                normalized_username = _normalize_username(str(rec.get("username") or username))
+                if not normalized_username:
+                    data["users"].pop(username, None)
+                    continue
+                rec["username"] = normalized_username
+                try:
+                    rec["tenant_id"] = _normalize_tenant_id(rec.get("tenant_id"), username=normalized_username)
+                except ValueError:
+                    rec["tenant_id"] = _derive_default_tenant_id(normalized_username)
+                rec["token_version"] = int(token_version)
+                data["users"][normalized_username] = rec
+                if normalized_username != username:
+                    data["users"].pop(username, None)
         if not isinstance(data.get("refresh_tokens"), dict):
             data["refresh_tokens"] = {}
         return data

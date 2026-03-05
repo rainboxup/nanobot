@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import shutil
 import threading
@@ -56,6 +57,50 @@ class TenantStoreCorruptionError(RuntimeError):
     """Raised when tenants index is corrupted and startup must abort."""
 
 
+_TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_RESERVED_TENANT_IDS = {
+    ".",
+    "..",
+    "con",
+    "prn",
+    "aux",
+    "nul",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9",
+}
+
+
+def normalize_tenant_id(value: str) -> str:
+    return str(value or "").strip().lower()
+
+
+def validate_tenant_id(value: str) -> str:
+    tenant_id = normalize_tenant_id(value)
+    if not tenant_id:
+        raise ValueError("tenant_id_required")
+    if tenant_id in _RESERVED_TENANT_IDS:
+        raise ValueError("tenant_id_reserved")
+    if not _TENANT_ID_RE.fullmatch(tenant_id):
+        raise ValueError("tenant_id_invalid")
+    return tenant_id
+
+
 class TenantStore:
     """A tiny JSON store for tenant identities and link codes."""
 
@@ -75,8 +120,15 @@ class TenantStore:
             self._load()
 
     def tenant_dir(self, tenant_id: str) -> Path:
-        safe_id = safe_filename(tenant_id)
-        return self.base_dir / safe_id
+        valid_id = validate_tenant_id(tenant_id)
+        safe_id = safe_filename(valid_id)
+        path = (self.base_dir / safe_id).resolve()
+        base = self.base_dir.resolve()
+        try:
+            path.relative_to(base)
+        except ValueError as e:
+            raise ValueError("tenant_id_path_escape") from e
+        return path
 
     def tenant_config_path(self, tenant_id: str) -> Path:
         return self.tenant_dir(tenant_id) / "config.json"
@@ -143,6 +195,7 @@ class TenantStore:
         )
 
     def list_identities(self, tenant_id: str) -> list[str]:
+        tenant_id = validate_tenant_id(tenant_id)
         with self._index_lock:
             data = self._load()
             t = data["tenants"].get(tenant_id) or {}
@@ -159,6 +212,7 @@ class TenantStore:
             return len(tenants)
 
     def create_link_code(self, tenant_id: str, ttl_s: int = 10 * 60) -> str:
+        tenant_id = validate_tenant_id(tenant_id)
         with self._index_lock:
             data = self._load()
             code = _make_link_code()
@@ -197,6 +251,7 @@ class TenantStore:
 
     def link_identity(self, tenant_id: str, channel: str, sender_id: str) -> None:
         """Attach an identity to a tenant (idempotent)."""
+        tenant_id = validate_tenant_id(tenant_id)
         key = f"{channel}:{sender_id}"
         with self._index_lock:
             data = self._load()
@@ -221,10 +276,12 @@ class TenantStore:
         self.ensure_tenant_files(tenant_id)
 
     def load_tenant_config(self, tenant_id: str) -> Config:
+        tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
         return load_config(config_path=ctx.config_path, allow_env_override=False, strict=True)
 
     def save_tenant_config(self, tenant_id: str, config: Config) -> None:
+        tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
         save_config(config, config_path=ctx.config_path)
 

@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 
 _PROMPT_SESSION = None
+_UVICORN_WS_BACKENDS = {"auto", "none", "websockets", "wsproto"}
 
 app = typer.Typer(
     name="nanobot",
@@ -42,6 +43,14 @@ def version_callback(value: bool):
     if value:
         console.print(f"{__logo__} nanobot v{__version__}")
         raise typer.Exit()
+
+
+def _uvicorn_ws_backend() -> str:
+    raw = str(os.getenv("NANOBOT_WEB_UVICORN_WS_BACKEND") or "").strip().lower()
+    if raw in _UVICORN_WS_BACKENDS:
+        return raw
+    # Prefer wsproto to avoid websockets legacy protocol coupling.
+    return "wsproto"
 
 
 @app.callback()
@@ -338,7 +347,13 @@ def gateway(
                 web_tenant_claim_secret=web_tenant_claim_secret,
             )
             web_server = uvicorn.Server(
-                uvicorn.Config(web_app, host=web_host, port=web_port, log_level="info")
+                uvicorn.Config(
+                    web_app,
+                    host=web_host,
+                    port=web_port,
+                    log_level="info",
+                    ws=_uvicorn_ws_backend(),
+                )
             )
             console.print(
                 f"[green]✓[/green] Web dashboard available at http://{web_host}:{web_port}/"
@@ -524,7 +539,13 @@ def gateway(
             runtime_mode="single",
         )
         web_server = uvicorn.Server(
-            uvicorn.Config(web_app, host=web_host, port=web_port, log_level="info")
+            uvicorn.Config(
+                web_app,
+                host=web_host,
+                port=web_port,
+                log_level="info",
+                ws=_uvicorn_ws_backend(),
+            )
         )
         console.print(f"[green]✓[/green] Web dashboard available at http://{web_host}:{web_port}/")
 
@@ -619,7 +640,15 @@ def serve(
 
     import uvicorn
 
-    server = uvicorn.Server(uvicorn.Config(app_web, host=web_host, port=web_port, log_level="info"))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            app_web,
+            host=web_host,
+            port=web_port,
+            log_level="info",
+            ws=_uvicorn_ws_backend(),
+        )
+    )
 
     async def run():
         try:

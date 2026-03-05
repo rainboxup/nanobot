@@ -38,6 +38,11 @@ class ReadFileTool(Tool):
         self._allowed_dir = allowed_dir
         self._max_read_bytes = max(1, int(max_read_bytes))
 
+    def set_allowed_dir(self, allowed_dir: Path | None, *, workspace: Path | None = None) -> None:
+        self._allowed_dir = allowed_dir
+        if workspace is not None:
+            self._workspace = workspace
+
     @property
     def name(self) -> str:
         return "read_file"
@@ -96,6 +101,11 @@ class WriteFileTool(Tool):
         self._allowed_dir = allowed_dir
         self._max_write_bytes = max(1, int(max_write_bytes))
         self._workspace_quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
+
+    def set_allowed_dir(self, allowed_dir: Path | None, *, workspace: Path | None = None) -> None:
+        self._allowed_dir = allowed_dir
+        if workspace is not None:
+            self._workspace = workspace
 
     @property
     def name(self) -> str:
@@ -170,6 +180,11 @@ class EditFileTool(Tool):
         # Allow edits up to the edit limit by default, even if write_file is stricter.
         self._max_result_bytes = max(self._max_edit_bytes, self._max_write_bytes)
         self._workspace_quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
+
+    def set_allowed_dir(self, allowed_dir: Path | None, *, workspace: Path | None = None) -> None:
+        self._allowed_dir = allowed_dir
+        if workspace is not None:
+            self._workspace = workspace
 
     @property
     def name(self) -> str:
@@ -279,6 +294,11 @@ class ListDirTool(Tool):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
         self._max_entries = max(1, int(max_entries))
+
+    def set_allowed_dir(self, allowed_dir: Path | None, *, workspace: Path | None = None) -> None:
+        self._allowed_dir = allowed_dir
+        if workspace is not None:
+            self._workspace = workspace
 
     @property
     def name(self) -> str:

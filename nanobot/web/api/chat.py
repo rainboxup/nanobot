@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from datetime import datetime
@@ -10,11 +11,13 @@ from typing import Any
 from fastapi import APIRouter, Depends, HTTPException, Request, WebSocket, status
 from loguru import logger
 from pydantic import BaseModel, Field
+from starlette.websockets import WebSocketDisconnect
 
 from nanobot.bus.broker import build_web_tenant_claim_proof
 from nanobot.bus.events import InboundMessage
 from nanobot.session.manager import SessionManager
 from nanobot.web.auth import enforce_token_freshness, get_current_user, verify_token
+from nanobot.web.session_cache import get_or_create_tenant_session_manager
 from nanobot.web.tenant import get_tenant_store, load_tenant_config, tenant_id_from_claims
 
 router = APIRouter()
@@ -22,7 +25,8 @@ _SESSION_SUFFIX_RE = re.compile(r"^[a-f0-9]{8}$")
 _SESSION_TITLE_MAX_LEN = 200
 _OWNER_USER_KEY = "owner_user_id"
 _OWNER_TENANT_KEY = "owner_tenant_id"
-_TENANT_SESSION_MANAGER_MAX_ENTRIES = 256
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
+_WS_CLOSE_CODE_SESSION_REPLACED = 4009
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -58,30 +62,6 @@ def _is_session_manager_like(value: Any) -> bool:
     return all(callable(getattr(value, name, None)) for name in required_methods)
 
 
-def _tenant_session_manager_limit(app) -> int:
-    raw = getattr(app.state, "tenant_session_manager_max_entries", _TENANT_SESSION_MANAGER_MAX_ENTRIES)
-    try:
-        limit = int(raw)
-    except Exception:
-        return _TENANT_SESSION_MANAGER_MAX_ENTRIES
-    return max(1, limit)
-
-
-def _record_tenant_session_manager_evictions(app, count: int) -> None:
-    try:
-        delta = max(0, int(count))
-    except Exception:
-        delta = 0
-    if delta <= 0:
-        return
-    base = getattr(app.state, "tenant_session_manager_evictions_total", 0)
-    try:
-        current = int(base)
-    except Exception:
-        current = 0
-    app.state.tenant_session_manager_evictions_total = max(0, current) + delta
-
-
 def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode == "single":
@@ -96,29 +76,17 @@ def _get_session_manager(app, claims: dict[str, Any]) -> SessionManager:
         return sm
 
     tenant_id = tenant_id_from_claims(claims)
-    cache = getattr(app.state, "tenant_session_managers", None)
-    if not isinstance(cache, dict):
-        cache = {}
-        app.state.tenant_session_managers = cache
-
-    existing = cache.get(tenant_id)
-    if isinstance(existing, SessionManager):
-        # Move to the end to model LRU recency on access.
-        cache.pop(tenant_id, None)
-        cache[tenant_id] = existing
-        return existing
-
     store = get_tenant_store(app)
-    tenant = store.ensure_tenant_files(tenant_id)
-    sm = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
-    cache[tenant_id] = sm
-    evicted = 0
-    while len(cache) > _tenant_session_manager_limit(app):
-        oldest_tenant_id = next(iter(cache))
-        cache.pop(oldest_tenant_id, None)
-        evicted += 1
-    _record_tenant_session_manager_evictions(app, evicted)
-    return sm
+
+    def _factory() -> SessionManager:
+        tenant = store.ensure_tenant_files(tenant_id)
+        return SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+
+    return get_or_create_tenant_session_manager(
+        app,
+        tenant_id,
+        _factory,
+    )
 
 
 def _session_prefix(claims: dict[str, Any]) -> str:
@@ -158,6 +126,78 @@ def _normalize_title(value: str | None) -> str | None:
             detail=f"title too long (max {_SESSION_TITLE_MAX_LEN})",
         )
     return title
+
+
+def _normalize_request_id(value: str | None) -> str:
+    text = str(value or "").strip()
+    if _REQUEST_ID_RE.fullmatch(text):
+        return text
+    return uuid.uuid4().hex
+
+
+def _normalize_optional_request_id(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if _REQUEST_ID_RE.fullmatch(text):
+        return text
+    return ""
+
+
+def _parse_ws_inbound_payload(raw_text: str) -> tuple[str, str, dict[str, str]]:
+    text = str(raw_text or "").strip()
+    request_id = uuid.uuid4().hex
+    stop_target_request_id = ""
+    inbound_type = "chat"
+
+    parsed_json = False
+    try:
+        payload = json.loads(raw_text)
+        parsed_json = True
+    except Exception:
+        payload = None
+
+    if parsed_json and not isinstance(payload, dict):
+        inbound_type = "unsupported"
+        text = ""
+    elif isinstance(payload, dict):
+        request_id = _normalize_request_id(str(payload.get("request_id") or ""))
+        raw_type = str(payload.get("type") or "").strip().lower()
+        inbound_type = "chat" if raw_type in {"chat", "message"} else "unsupported"
+        stop_target_request_id = _normalize_optional_request_id(
+            str(payload.get("target_request_id") or "")
+        )
+        if payload.get("content") is not None:
+            text = str(payload.get("content") or "").strip()
+        elif payload.get("message") is not None:
+            text = str(payload.get("message") or "").strip()
+        elif payload.get("command") is not None:
+            text = str(payload.get("command") or "").strip()
+        else:
+            text = ""
+
+    metadata = {"web_request_id": request_id}
+    if stop_target_request_id:
+        metadata["web_stop_target_request_id"] = stop_target_request_id
+    return inbound_type, text, metadata
+
+
+def _ws_error_payload(
+    detail: str,
+    session_id: str,
+    request_id: str = "",
+    *,
+    error_code: str,
+) -> dict[str, str]:
+    payload = {
+        "type": "error",
+        "detail": detail,
+        "session_id": session_id,
+        "error_code": error_code,
+    }
+    if request_id:
+        payload["request_id"] = request_id
+    return payload
 
 
 def _session_view(session) -> dict[str, Any]:
@@ -222,16 +262,22 @@ def _extract_ws_token(ws: WebSocket) -> tuple[str, str | None]:
     if token and allow_query_token:
         return token, None
 
-    header = str(ws.headers.get("sec-websocket-protocol") or "")
-    if not header:
-        return "", None
-
     # Browser clients can't set custom headers on WebSocket requests. As a safer alternative to putting
     # the JWT in the URL query string, clients may pass it as one of the offered subprotocol values:
     # `new WebSocket(url, ["nanobot", "<jwt>"])`.
     #
-    # We accept "nanobot" as the negotiated subprotocol and read the JWT from the offered list.
-    offered = [item.strip() for item in header.split(",") if item.strip()]
+    # Prefer ASGI scope-provided subprotocols for backend portability (wsproto/websockets),
+    # and fall back to raw header parsing for compatibility.
+    offered_raw = ws.scope.get("subprotocols")
+    offered: list[str] = []
+    if isinstance(offered_raw, list):
+        offered = [str(item or "").strip() for item in offered_raw if str(item or "").strip()]
+    if not offered:
+        header = str(ws.headers.get("sec-websocket-protocol") or "")
+        offered = [item.strip() for item in header.split(",") if item.strip()]
+    if not offered:
+        return "", None
+
     jwt = ""
     for item in offered:
         if item.startswith("eyJ") and item.count(".") >= 2:
@@ -282,24 +328,45 @@ async def ws_chat(ws: WebSocket) -> None:
     web_channel = getattr(ws.app.state, "web_channel", None)
     if web_channel is None:
         try:
-            await ws.send_json({"type": "error", "detail": "web channel unavailable"})
+            await ws.send_json(
+                _ws_error_payload(
+                    "web channel unavailable",
+                    session_id,
+                    error_code="web_channel_unavailable",
+                )
+            )
         except Exception:
             pass
         await ws.close(code=1011)
         return
 
     try:
-        await web_channel.add_connection(session_id, ws)
-        await ws.send_json(
-            {
+        bus = _get_inbound_bus(ws)
+    except Exception:
+        try:
+            await ws.send_json(
+                _ws_error_payload(
+                    "inbound publisher unavailable",
+                    session_id,
+                    error_code="inbound_publisher_unavailable",
+                )
+            )
+        except Exception:
+            pass
+        await ws.close(code=1011)
+        return
+
+    try:
+        await web_channel.add_connection(
+            session_id,
+            ws,
+            session_payload={
                 "type": "session",
                 "session_id": session_id,
                 "user": username,
                 "tenant_id": tenant_id,
-            }
+            },
         )
-
-        bus = _get_inbound_bus(ws)
         while True:
             # Re-check token freshness on each loop iteration so long-lived WS sessions are
             # revoked promptly after user status/role/tenant changes.
@@ -309,7 +376,43 @@ async def ws_chat(ws: WebSocket) -> None:
                 await ws.close(code=1008)
                 break
 
-            text = await ws.receive_text()
+            raw_text = await ws.receive_text()
+            inbound_type, text, request_meta = _parse_ws_inbound_payload(raw_text)
+            request_id = str(request_meta.get("web_request_id") or "").strip()
+            if not await web_channel.is_current_connection(session_id, ws):
+                try:
+                    await ws.send_json(
+                        _ws_error_payload(
+                            "session replaced by a newer connection",
+                            session_id,
+                            request_id,
+                            error_code="session_replaced",
+                        )
+                    )
+                except Exception:
+                    pass
+                await ws.close(code=_WS_CLOSE_CODE_SESSION_REPLACED)
+                break
+            if inbound_type != "chat":
+                await ws.send_json(
+                    _ws_error_payload(
+                        "unsupported message type",
+                        session_id,
+                        request_id,
+                        error_code="unsupported_message_type",
+                    )
+                )
+                continue
+            if not text:
+                await ws.send_json(
+                    _ws_error_payload(
+                        "empty message",
+                        session_id,
+                        request_id,
+                        error_code="empty_message",
+                    )
+                )
+                continue
             try:
                 claims = enforce_token_freshness(ws.app, claims)
             except ValueError:
@@ -326,16 +429,61 @@ async def ws_chat(ws: WebSocket) -> None:
                     "tenant_id": tenant_id,
                     "canonical_sender_id": username,
                     "web_tenant_proof": tenant_claim_proof,
+                    **request_meta,
                 },
             )
-            ok = await bus.publish_inbound(msg)
+            async def _publish_current() -> bool:
+                return await bus.publish_inbound(msg)
+
+            is_current, ok = await web_channel.publish_inbound_if_current(
+                session_id,
+                ws,
+                _publish_current,
+            )
+            if not is_current:
+                try:
+                    await ws.send_json(
+                        _ws_error_payload(
+                            "session replaced by a newer connection",
+                            session_id,
+                            request_id,
+                            error_code="session_replaced",
+                        )
+                    )
+                except Exception:
+                    pass
+                await ws.close(code=_WS_CLOSE_CODE_SESSION_REPLACED)
+                break
             if not ok:
-                await ws.send_text("System busy, please try again later")
+                await ws.send_json(
+                    _ws_error_payload(
+                        "System busy, please try again later",
+                        session_id,
+                        request_id,
+                        error_code="system_busy",
+                    )
+                )
+                continue
+            if request_id:
+                try:
+                    await ws.send_json(
+                        {
+                            "type": "request",
+                            "status": "accepted",
+                            "request_id": request_id,
+                            "session_id": session_id,
+                        }
+                    )
+                except Exception:
+                    # Client may disconnect right after sending; message is already accepted.
+                    pass
+    except WebSocketDisconnect:
+        pass
     except Exception as e:
         logger.warning(f"WebSocket error (session={session_id}): {e}")
     finally:
         try:
-            await web_channel.remove_connection(session_id)
+            await web_channel.remove_connection(session_id, ws)
         except Exception:
             pass
         try:

@@ -1,8 +1,43 @@
+import asyncio
 import json
 import time
+from urllib.parse import urlsplit
 
 import jwt
 import pytest
+import websockets
+
+_TEST_JWT_SECRET = "test-jwt-secret-32-bytes-minimum-0001"
+
+
+def _same_origin_headers(http_client) -> dict[str, str]:
+    return {"Origin": str(http_client.base_url).rstrip("/")}
+
+
+def _forwarded_origin_headers(origin: str) -> dict[str, str]:
+    parsed = urlsplit(origin)
+    scheme = str(parsed.scheme or "https")
+    host = str(parsed.netloc or "")
+    return {
+        "Origin": origin,
+        "X-Forwarded-Proto": scheme,
+        "X-Forwarded-Host": host,
+        "Forwarded": f"proto={scheme};host={host}",
+    }
+
+
+def _forwarded_only_origin_headers(origin: str) -> dict[str, str]:
+    parsed = urlsplit(origin)
+    scheme = str(parsed.scheme or "https")
+    host = str(parsed.netloc or "")
+    return {
+        "Origin": origin,
+        "Forwarded": f"proto={scheme};host={host}",
+    }
+
+
+def _ws_uri_with_token(ws_url: str, token: str) -> str:
+    return f"{ws_url}?token={token}"
 
 
 @pytest.mark.integration
@@ -46,7 +81,7 @@ async def test_protected_endpoint_requires_auth(http_client) -> None:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_expired_token_rejected(http_client) -> None:
-    secret = "test-jwt-secret"
+    secret = _TEST_JWT_SECRET
     now = int(time.time())
     token = jwt.encode({"sub": "admin", "tenant_id": "admin", "iat": now - 10, "exp": now - 1}, secret, algorithm="HS256")
     r = await http_client.get("/api/me", headers={"Authorization": f"Bearer {token}"})
@@ -66,14 +101,24 @@ async def test_refresh_token_flow(http_client) -> None:
     assert body.get("refresh_token")
 
     refresh_1 = str(body["refresh_token"])
-    r2 = await http_client.post("/api/auth/refresh", json={"refresh_token": refresh_1})
+    r2 = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_1},
+        headers=_same_origin_headers(http_client),
+    )
     assert r2.status_code == 200
     body2 = r2.json()
     assert body2.get("access_token")
     refresh_2 = str(body2.get("refresh_token") or "")
     assert refresh_2 and refresh_2 != refresh_1
 
-    r_old = await http_client.post("/api/auth/refresh", json={"refresh_token": refresh_1})
+    # Clear cookie so this assertion verifies token rotation semantics directly.
+    http_client.cookies.clear()
+    r_old = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_1},
+        headers=_same_origin_headers(http_client),
+    )
     assert r_old.status_code == 401
 
     r_me = await http_client.get(
@@ -93,7 +138,34 @@ async def test_login_sets_refresh_cookie(http_client) -> None:
     )
     assert r.status_code == 200
     set_cookie = str(r.headers.get("set-cookie") or "")
+    cookie_lower = set_cookie.lower()
     assert "nanobot_refresh_token=" in set_cookie
+    assert "httponly" in cookie_lower
+    assert "path=/api/auth" in cookie_lower
+    assert "samesite=lax" in cookie_lower
+    assert "secure" not in cookie_lower
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_login_sets_secure_cookie_when_samesite_none(
+    http_client,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NANOBOT_WEB_REFRESH_COOKIE_SAMESITE", "none")
+    monkeypatch.setenv("NANOBOT_WEB_REFRESH_COOKIE_SECURE", "0")
+    r = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert r.status_code == 200
+    set_cookie = str(r.headers.get("set-cookie") or "")
+    cookie_lower = set_cookie.lower()
+    assert "nanobot_refresh_token=" in set_cookie
+    assert "httponly" in cookie_lower
+    assert "path=/api/auth" in cookie_lower
+    assert "samesite=none" in cookie_lower
+    assert "secure" in cookie_lower
 
 
 @pytest.mark.integration
@@ -106,11 +178,333 @@ async def test_refresh_accepts_cookie_without_body_token(http_client) -> None:
     assert login.status_code == 200
     assert "nanobot_refresh_token" in http_client.cookies
 
-    refreshed = await http_client.post("/api/auth/refresh", json={})
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers=_same_origin_headers(http_client),
+    )
     assert refreshed.status_code == 200
     data = refreshed.json()
     assert data.get("access_token")
     assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_cross_origin_when_cookie_is_used(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_prefers_cookie_token_over_body_token(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": "rt_legacy_invalid_token_1234567890"},
+        headers=_same_origin_headers(http_client),
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_forged_proxy_forwarded_headers_from_untrusted_source(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers=_forwarded_origin_headers("https://app.example.com"),
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_allows_proxy_forwarded_same_origin_cookie_request_from_trusted_proxy(
+    http_client,
+    web_ctx,
+) -> None:
+    web_ctx.app.state.refresh_trusted_proxy_cidrs = ("127.0.0.1/32",)
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers=_forwarded_origin_headers("https://app.example.com"),
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_allows_forwarded_only_same_origin_cookie_request_from_trusted_proxy(
+    http_client,
+    web_ctx,
+) -> None:
+    web_ctx.app.state.refresh_trusted_proxy_cidrs = ("127.0.0.1/32",)
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers=_forwarded_only_origin_headers("https://app.example.com"),
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_untrusted_prefix_values_in_forwarded_chain(http_client, web_ctx) -> None:
+    web_ctx.app.state.refresh_trusted_proxy_cidrs = ("127.0.0.1/32",)
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers={
+            "Origin": "https://evil.example",
+            "X-Forwarded-Proto": "https,https",
+            "X-Forwarded-Host": "evil.example,app.example.com",
+            "X-Forwarded-Port": "443,443",
+            "Forwarded": "proto=https;host=evil.example, proto=https;host=app.example.com",
+        },
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_untrusted_prefix_values_in_forwarded_only_chain(http_client, web_ctx) -> None:
+    web_ctx.app.state.refresh_trusted_proxy_cidrs = ("127.0.0.1/32",)
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers={
+            "Origin": "https://evil.example",
+            "Forwarded": "proto=https;host=evil.example, proto=https;host=app.example.com",
+        },
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_allows_explicitly_configured_origin_when_cookie_used(http_client, web_ctx) -> None:
+    web_ctx.app.state.refresh_allowed_origins = ("https://trusted.example.com",)
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={},
+        headers={"Origin": "https://trusted.example.com"},
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_falls_back_to_body_when_cookie_token_is_invalid(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    valid_body_refresh = str(login.json().get("refresh_token") or "")
+    assert valid_body_refresh
+
+    host = str(urlsplit(str(http_client.base_url)).hostname or "127.0.0.1")
+    http_client.cookies.set(
+        "nanobot_refresh_token",
+        "rt_cookie_invalid_for_fallback_1234567890",
+        domain=host,
+        path="/api/auth",
+    )
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": valid_body_refresh},
+        headers=_same_origin_headers(http_client),
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_cross_origin_even_with_body_token_when_cookie_present(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    refresh_token = str(login.json().get("refresh_token") or "")
+    assert refresh_token
+    assert "nanobot_refresh_token" in http_client.cookies
+
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_token},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_rejects_cross_origin_body_refresh_without_cookie_by_default(http_client) -> None:
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    refresh_token = str(login.json().get("refresh_token") or "")
+    assert refresh_token
+
+    http_client.cookies.clear()
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_token},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refreshed.status_code == 403
+    assert "origin" in str(refreshed.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_body_only_policy_still_rejects_cross_origin_when_origin_check_enabled(
+    http_client,
+    web_ctx,
+) -> None:
+    web_ctx.app.state.refresh_token_source_policy = "body_only"
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    refresh_token = str(login.json().get("refresh_token") or "")
+    assert refresh_token
+
+    http_client.cookies.clear()
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_token},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refreshed.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_refresh_allows_cross_origin_body_refresh_when_compat_mode_enabled(http_client, web_ctx) -> None:
+    web_ctx.app.state.refresh_body_require_same_origin = False
+    login = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert login.status_code == 200
+    refresh_token = str(login.json().get("refresh_token") or "")
+    assert refresh_token
+
+    http_client.cookies.clear()
+    refreshed = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh_token},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert refreshed.status_code == 200
+    data = refreshed.json()
+    assert data.get("access_token")
+    assert data.get("refresh_token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_query_token_rejected_when_compat_disabled(web_ctx, auth_token) -> None:
+    with pytest.raises(Exception):
+        async with websockets.connect(_ws_uri_with_token(web_ctx.ws_url, auth_token)) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_ws_query_token_allowed_when_compat_enabled(web_ctx, auth_token) -> None:
+    web_ctx.app.state.ws_allow_query_token = True
+    async with websockets.connect(_ws_uri_with_token(web_ctx.ws_url, auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        payload = json.loads(first)
+        assert payload.get("type") == "session"
 
 
 @pytest.mark.integration
@@ -298,6 +692,7 @@ async def test_logout_cannot_revoke_other_users_refresh_token(http_client, auth_
     still_valid = await http_client.post(
         "/api/auth/refresh",
         json={"refresh_token": member_refresh},
+        headers=_same_origin_headers(http_client),
     )
     assert still_valid.status_code == 200
 
@@ -402,7 +797,7 @@ async def test_invalid_tenant_claim_rejected_on_tenant_scoped_endpoint(http_clie
             "iat": now - 10,
             "exp": now + 3600,
         },
-        "test-jwt-secret",
+        _TEST_JWT_SECRET,
         algorithm="HS256",
     )
     r = await http_client.get(
@@ -593,6 +988,7 @@ async def test_owner_can_deactivate_reactivate_and_delete_user(http_client, auth
     refresh_blocked = await http_client.post(
         "/api/auth/refresh",
         json={"refresh_token": refresh_token},
+        headers=_same_origin_headers(http_client),
     )
     assert refresh_blocked.status_code == 401
 
@@ -963,9 +1359,17 @@ async def test_owner_can_list_and_revoke_user_sessions(http_client, auth_headers
         for item in revoke_all_rows
     )
 
-    refresh_after_1 = await http_client.post("/api/auth/refresh", json={"refresh_token": refresh1})
+    refresh_after_1 = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh1},
+        headers=_same_origin_headers(http_client),
+    )
     assert refresh_after_1.status_code == 401
-    refresh_after_2 = await http_client.post("/api/auth/refresh", json={"refresh_token": refresh2})
+    refresh_after_2 = await http_client.post(
+        "/api/auth/refresh",
+        json={"refresh_token": refresh2},
+        headers=_same_origin_headers(http_client),
+    )
     assert refresh_after_2.status_code == 401
 
 

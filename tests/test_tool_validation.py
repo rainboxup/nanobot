@@ -1,8 +1,15 @@
+from pathlib import Path
 from typing import Any
 
+from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
+from nanobot.bus.events import OutboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import Config
+from nanobot.tenants.store import TenantStore
 
 
 class SampleTool(Tool):
@@ -106,3 +113,78 @@ def test_exec_extract_absolute_paths_captures_posix_absolute_paths() -> None:
     paths = ExecTool._extract_absolute_paths(cmd)
     assert "/tmp/data.txt" in paths
     assert "/tmp/out.txt" in paths
+
+
+def test_multi_tenant_runtime_passes_tenant_mcp_servers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    tenant_cfg = Config.model_validate(
+        {
+            "tools": {
+                "mcp_servers": {
+                    "tenant_demo": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-memory"],
+                    }
+                }
+            }
+        }
+    )
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    bus = MessageBus()
+    loop = MultiTenantAgentLoop(
+        bus=bus,
+        system_config=Config(),
+        store=store,
+        skill_store_dir=tmp_path / "store",
+    )
+
+    tenant_id = store.ensure_tenant("telegram", "u-123")
+    tenant_ctx = store.ensure_tenant_files(tenant_id)
+    captured: dict[str, object] = {}
+
+    class StubAgentLoop:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr("nanobot.agent.multi_tenant.AgentLoop", StubAgentLoop)
+
+    loop._get_or_create_runtime(tenant_ctx, tenant_cfg, enable_exec=False)
+
+    assert captured.get("mcp_servers") == tenant_cfg.tools.mcp_servers
+
+
+async def test_message_tool_web_override_blocks_cross_tenant_target() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(
+        send_callback=_send,
+        default_channel="web",
+        default_chat_id="web:alice:deadbeef",
+        allow_target_override=True,
+    )
+
+    result = await tool.execute("hello", channel="web", chat_id="web:bob:cafebabe")
+    assert result == "Error: Cross-tenant message target override is blocked"
+    assert sent == []
+
+
+async def test_message_tool_web_override_is_fail_closed_for_invalid_target() -> None:
+    sent: list[OutboundMessage] = []
+
+    async def _send(msg: OutboundMessage) -> None:
+        sent.append(msg)
+
+    tool = MessageTool(
+        send_callback=_send,
+        default_channel="web",
+        default_chat_id="web:alice:deadbeef",
+        allow_target_override=True,
+    )
+
+    result = await tool.execute("hello", channel="web", chat_id="not-a-web-chat-id")
+    assert result == "Error: Invalid web message target"
+    assert sent == []

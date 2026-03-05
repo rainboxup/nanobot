@@ -1,9 +1,9 @@
 import { Outlet, NavLink, Navigate } from "react-router-dom"
 import { cn } from "@/src/lib/utils"
-import { Database, Network, Users, Shield, Key, CalendarClock } from "lucide-react"
+import { Database, Network, Users, Shield, Key, CalendarClock, SlidersHorizontal } from "lucide-react"
 import { useStore } from "@/src/store/useStore"
 
-export type SettingsTab = "providers" | "channels" | "cron" | "beta" | "users" | "security"
+export type SettingsTab = "providers" | "channels" | "tools" | "cron" | "beta" | "users" | "security"
 
 export function getAllowedSettingsTabs(
   role: string,
@@ -15,6 +15,7 @@ export function getAllowedSettingsTabs(
 
   const tabs: SettingsTab[] = ["users"]
   if (isAdmin) {
+    tabs.unshift("tools")
     tabs.unshift("channels")
     tabs.unshift("providers")
   }
@@ -50,6 +51,7 @@ export function Settings() {
   const navItems = [
     ...(allowed.includes("providers") ? [{ name: "模型服务", path: "/settings/providers", icon: Database }] : []),
     ...(allowed.includes("channels") ? [{ name: "渠道管理", path: "/settings/channels", icon: Network }] : []),
+    ...(allowed.includes("tools") ? [{ name: "工具权限", path: "/settings/tools", icon: SlidersHorizontal }] : []),
     ...(allowed.includes("cron") ? [{ name: "定时任务", path: "/settings/cron", icon: CalendarClock }] : []),
     ...(allowed.includes("beta") ? [{ name: "封闭 Beta", path: "/settings/beta", icon: Key }] : []),
     { name: "用户与权限", path: "/settings/users", icon: Users },

@@ -178,6 +178,12 @@ class TestSessionPersistence:
         session.clear()
         assert len(session.messages) == 0
 
+    def test_session_path_is_collision_safe(self, temp_manager):
+        """Different session keys must map to different on-disk paths."""
+        p1 = temp_manager._get_session_path("web:tenant-a:ab_cd12")
+        p2 = temp_manager._get_session_path("web:tenant-a:ab:cd12")
+        assert p1 != p2
+
 
 class TestConsolidationTriggerConditions:
     """Test consolidation trigger conditions and logic."""
@@ -820,3 +826,77 @@ class TestConsolidationDeduplicationGuard:
         assert response is not None
         assert "new session started" in response.content.lower()
         assert loop.sessions.get_or_create("cli:test").messages == []
+
+
+class TestConsolidationMemoryWorkspace:
+    @pytest.mark.asyncio
+    async def test_web_session_uses_tenant_scoped_memory_workspace(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            enable_spawn=False,
+            enable_exec=False,
+        )
+
+        seen: dict[str, Path] = {}
+
+        class _FakeMemoryStore:
+            def __init__(self, workspace: Path):
+                seen["workspace"] = workspace
+
+            async def consolidate(self, *_args, **_kwargs) -> bool:
+                return True
+
+        monkeypatch.setattr("nanobot.agent.loop.MemoryStore", _FakeMemoryStore)
+
+        session = Session(key="web:alice:deadbeef")
+        ok = await loop._consolidate_memory(session)
+
+        assert ok is True
+        assert seen["workspace"] == tmp_path / "tenants" / "alice"
+
+    @pytest.mark.asyncio
+    async def test_non_web_session_keeps_default_memory_workspace(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            enable_spawn=False,
+            enable_exec=False,
+        )
+
+        seen: dict[str, Path] = {}
+
+        class _FakeMemoryStore:
+            def __init__(self, workspace: Path):
+                seen["workspace"] = workspace
+
+            async def consolidate(self, *_args, **_kwargs) -> bool:
+                return True
+
+        monkeypatch.setattr("nanobot.agent.loop.MemoryStore", _FakeMemoryStore)
+
+        session = Session(key="cli:direct")
+        ok = await loop._consolidate_memory(session)
+
+        assert ok is True
+        assert seen["workspace"] == tmp_path

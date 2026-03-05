@@ -223,7 +223,7 @@ class AgentsConfig(Base):
 class ProviderConfig(Base):
     """LLM provider configuration."""
 
-    api_key: str = ""
+    api_key: str = ""  # For API-key providers only; OAuth providers do not use this field.
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
 
@@ -246,8 +246,8 @@ class ProvidersConfig(Base):
     aihubmix: ProviderConfig = Field(default_factory=ProviderConfig)  # AiHubMix API gateway
     siliconflow: ProviderConfig = Field(default_factory=ProviderConfig)  # SiliconFlow (硅基流动) API gateway
     volcengine: ProviderConfig = Field(default_factory=ProviderConfig)  # VolcEngine (火山引擎) API gateway
-    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth)
-    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth)
+    openai_codex: ProviderConfig = Field(default_factory=ProviderConfig)  # OpenAI Codex (OAuth-only)
+    github_copilot: ProviderConfig = Field(default_factory=ProviderConfig)  # Github Copilot (OAuth-only)
 
 
 class HeartbeatConfig(Base):
@@ -285,6 +285,7 @@ class WebFetchConfig(Base):
 class WebToolsConfig(Base):
     """Web tools configuration."""
 
+    enabled: bool = True
     search: WebSearchConfig = Field(default_factory=WebSearchConfig)
     fetch: WebFetchConfig = Field(default_factory=WebFetchConfig)
 
@@ -302,8 +303,11 @@ class FilesystemToolConfig(Base):
 class ExecToolConfig(Base):
     """Shell exec tool configuration."""
 
+    # Safer default for SaaS: opt-in before granting shell execution.
+    enabled: bool = False
     timeout: int = 60
-    mode: Literal["host", "docker"] = "host"
+    # Prefer sandboxed execution mode when exec is enabled.
+    mode: Literal["host", "docker"] = "docker"
     docker_image: str = "python:3.11-slim"
     docker_runtime: str | None = "runsc"  # Preferred runtime for docker mode
     require_runtime: bool = False  # If true, do not fallback when docker_runtime is unavailable

@@ -144,3 +144,120 @@ def test_litellm_provider_canonicalizes_github_copilot_hyphen_prefix():
 def test_openai_codex_strip_prefix_supports_hyphen_and_underscore():
     assert _strip_model_prefix("openai-codex/gpt-5.1-codex") == "gpt-5.1-codex"
     assert _strip_model_prefix("openai_codex/gpt-5.1-codex") == "gpt-5.1-codex"
+
+
+def _config_with_mcp() -> Config:
+    return Config.model_validate(
+        {
+            "tools": {
+                "mcp_servers": {
+                    "demo": {
+                        "command": "npx",
+                        "args": ["-y", "@modelcontextprotocol/server-memory"],
+                    }
+                }
+            }
+        }
+    )
+
+
+def test_gateway_passes_mcp_servers_to_agent_loop(monkeypatch, tmp_path):
+    config = _config_with_mcp()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+
+    captured: dict[str, object] = {}
+
+    class StubAgentLoop:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.model = "test-model"
+
+        async def run(self):
+            return None
+
+        async def process_direct(self, *_args, **_kwargs):
+            return "ok"
+
+        def stop(self):
+            return None
+
+    class StubSessionManager:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def list_sessions(self):
+            return []
+
+    class StubCronService:
+        def __init__(self, *_args, **_kwargs):
+            self.on_job = None
+
+        def status(self):
+            return {"jobs": 0}
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    class StubHeartbeatService:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+    class StubChannelManager:
+        def __init__(self, *_args, **_kwargs):
+            self.enabled_channels = []
+
+        async def start_all(self):
+            return None
+
+        async def stop_all(self):
+            return None
+
+    def _fake_run(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: config)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _cfg: object())
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", StubAgentLoop)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", StubSessionManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", StubCronService)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", StubHeartbeatService)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", StubChannelManager)
+    monkeypatch.setattr("nanobot.cli.commands.asyncio.run", _fake_run)
+
+    result = runner.invoke(app, ["gateway", "--port", "18790"])
+
+    assert result.exit_code == 0
+    assert captured.get("mcp_servers") == config.tools.mcp_servers
+
+
+def test_agent_command_passes_mcp_servers_to_agent_loop(monkeypatch, tmp_path):
+    config = _config_with_mcp()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+
+    captured: dict[str, object] = {}
+
+    class StubAgentLoop:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def process_direct(self, *_args, **_kwargs):
+            return "ok"
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: config)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _cfg: object())
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", StubAgentLoop)
+
+    result = runner.invoke(app, ["agent", "--message", "hello"])
+
+    assert result.exit_code == 0
+    assert captured.get("mcp_servers") == config.tools.mcp_servers

@@ -410,6 +410,13 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
     )
     assert bad_name.status_code == 422
 
+    unknown_fields = await http_client.post(
+        "/api/skills/install",
+        headers=await auth_headers_for("admin-skill-extra", role="admin", tenant_id="admin-skill-extra"),
+        json={"name": "not-exists-skill", "unexpected_field": True},
+    )
+    assert unknown_fields.status_code == 422
+
     missing = await http_client.post(
         "/api/skills/install",
         headers=await auth_headers_for("admin-skill2", role="admin", tenant_id="admin-skill2"),
@@ -478,6 +485,13 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "missing-preset"},
     )
     assert bad_preset.status_code == 404
+
+    unknown_fields = await http_client.post(
+        "/api/mcp/install",
+        headers=await auth_headers_for("admin-mcp-extra", role="admin", tenant_id="admin-mcp-extra"),
+        json={"preset": "missing-preset", "unexpected_field": True},
+    )
+    assert unknown_fields.status_code == 422
 
     first = await http_client.post(
         "/api/mcp/install",
@@ -729,6 +743,12 @@ async def test_tools_policy_put_response_redacts_subject_identities_for_non_owne
     assert bool(subject.get("identities_redacted")) is True
     assert int(subject.get("identity_count") or 0) == 2
     assert list(subject.get("identities") or []) == []
+    assert bool(body.get("runtime_cache_redacted")) is True
+    runtime_cache = dict(body.get("runtime_cache") or {})
+    assert int(runtime_cache.get("max_entries", -1)) == 0
+    assert int(runtime_cache.get("current_cached_tenant_session_managers", -1)) == 0
+    assert int(runtime_cache.get("evictions_total", -1)) == 0
+    assert float(runtime_cache.get("utilization", 1.0)) == 0.0
 
 
 @pytest.mark.integration
@@ -760,7 +780,29 @@ async def test_tools_policy_exposes_runtime_and_write_metadata_in_single_mode(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_tools_policy_exposes_web_session_cache_runtime_metadata(
+async def test_tools_policy_exposes_web_session_cache_runtime_metadata_for_owner(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.tenant_session_manager_max_entries = 11
+    web_ctx.app.state.tenant_session_managers = {"t1": object(), "t2": object()}
+    web_ctx.app.state.tenant_session_manager_evictions_total = 4
+    owner_headers = await auth_headers_for("policy-owner-runtime-cache", role="owner", tenant_id="tenant-cache")
+
+    resp = await http_client.get("/api/tools/policy", headers=owner_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert bool(body.get("runtime_cache_redacted")) is False
+    runtime_cache = dict(body.get("runtime_cache") or {})
+    assert dict(body.get("web_session_cache") or {}) == runtime_cache
+    assert int(runtime_cache.get("max_entries") or 0) == 11
+    assert int(runtime_cache.get("current_cached_tenant_session_managers") or 0) == 2
+    assert int(runtime_cache.get("evictions_total") or 0) == 4
+    assert float(runtime_cache.get("utilization") or 0.0) >= 0.0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_redacts_web_session_cache_runtime_metadata_for_admin(
     http_client, auth_headers_for, web_ctx
 ) -> None:
     web_ctx.app.state.tenant_session_manager_max_entries = 11
@@ -771,11 +813,14 @@ async def test_tools_policy_exposes_web_session_cache_runtime_metadata(
     resp = await http_client.get("/api/tools/policy", headers=admin_headers)
     assert resp.status_code == 200
     body = resp.json()
+    assert bool(body.get("runtime_cache_redacted")) is True
     runtime_cache = dict(body.get("runtime_cache") or {})
-    assert int(runtime_cache.get("max_entries") or 0) == 11
-    assert int(runtime_cache.get("current_cached_tenant_session_managers") or 0) == 2
-    assert int(runtime_cache.get("evictions_total") or 0) == 4
-    assert float(runtime_cache.get("utilization") or 0.0) >= 0.0
+    web_cache = dict(body.get("web_session_cache") or {})
+    assert runtime_cache == web_cache
+    assert int(runtime_cache.get("max_entries", -1)) == 0
+    assert int(runtime_cache.get("current_cached_tenant_session_managers", -1)) == 0
+    assert int(runtime_cache.get("evictions_total", -1)) == 0
+    assert float(runtime_cache.get("utilization", 1.0)) == 0.0
 
 
 @pytest.mark.integration

@@ -26,6 +26,7 @@ from nanobot.utils.fs import dir_size_bytes
 from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.services.clawhub_client import ClawHubClient, ClawHubClientError
+from nanobot.web.session_cache import web_session_cache_metrics
 from nanobot.web.tenant import load_tenant_config
 from nanobot.web.user_store import ROLE_OWNER
 
@@ -78,6 +79,8 @@ _MCP_PRESETS: list[dict[str, Any]] = [
 
 
 class SkillInstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str
     source: str | None = None
     slug: str | None = None
@@ -85,6 +88,8 @@ class SkillInstallRequest(BaseModel):
 
 
 class MCPInstallRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     preset: str
     name: str | None = None
 
@@ -187,6 +192,15 @@ def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
     return deduped
 
 
+def _redacted_runtime_cache_payload() -> dict[str, Any]:
+    return {
+        "max_entries": 0,
+        "current_cached_tenant_session_managers": 0,
+        "evictions_total": 0,
+        "utilization": 0.0,
+    }
+
+
 def _tool_policy_payload(
     request: Request,
     *,
@@ -198,18 +212,6 @@ def _tool_policy_payload(
     runtime_scope = _runtime_scope(runtime_mode)
     runtime_warn = _runtime_warning(runtime_mode)
     write_status = _write_status(runtime_mode)
-    cache = getattr(request.app.state, "tenant_session_managers", None)
-    current_cache = len(cache) if isinstance(cache, dict) else 0
-    raw_limit = getattr(request.app.state, "tenant_session_manager_max_entries", 0)
-    raw_evictions = getattr(request.app.state, "tenant_session_manager_evictions_total", 0)
-    try:
-        cache_limit = max(1, int(raw_limit))
-    except Exception:
-        cache_limit = 1
-    try:
-        evictions_total = max(0, int(raw_evictions))
-    except Exception:
-        evictions_total = 0
 
     system_cfg = getattr(request.app.state, "config", None)
     identities = _web_identities(user, tenant_id)
@@ -224,6 +226,7 @@ def _tool_policy_payload(
         getattr(getattr(getattr(system_cfg, "tools", None), "exec", None), "whitelist", None)
     )
     role = str(user.get("role") or "").strip().lower()
+    can_view_runtime_cache = role == ROLE_OWNER
     can_view_system_whitelist = role == ROLE_OWNER
     can_view_subject_identities = role == ROLE_OWNER
     system_exec_allowlisted = _allowlist_match(system_exec_wl, tenant_id, identities)
@@ -259,15 +262,18 @@ def _tool_policy_payload(
         warnings.append("web tools are requested but capped by system policy")
 
     subject_identities = identities if can_view_subject_identities else []
+    runtime_cache = (
+        web_session_cache_metrics(request.app)
+        if can_view_runtime_cache
+        else _redacted_runtime_cache_payload()
+    )
     payload: dict[str, Any] = {
         "runtime_mode": runtime_mode,
         "runtime_scope": runtime_scope,
-        "runtime_cache": {
-            "max_entries": cache_limit,
-            "current_cached_tenant_session_managers": max(0, int(current_cache)),
-            "evictions_total": evictions_total,
-            "utilization": round(max(0, int(current_cache)) / cache_limit, 4),
-        },
+        "runtime_cache": runtime_cache,
+        # Compatibility alias with ops/runtime naming.
+        "web_session_cache": runtime_cache,
+        "runtime_cache_redacted": bool(not can_view_runtime_cache),
         "writable": bool(write_status["writable"]),
         "write_block_reason_code": write_status["write_block_reason_code"],
         "write_block_reason": write_status["write_block_reason"],

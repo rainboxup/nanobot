@@ -7,15 +7,18 @@ from typing import Any
 from fastapi import HTTPException, status
 
 from nanobot.config.schema import Config
-from nanobot.tenants.store import TenantStore
+from nanobot.tenants.store import TenantStore, validate_tenant_id
 
 
 def tenant_id_from_claims(claims: dict[str, Any]) -> str:
     """Extract a stable tenant id from validated JWT claims."""
-    tenant_id = str(claims.get("tenant_id") or claims.get("sub") or "").strip()
-    if not tenant_id:
+    tenant_id = str(claims.get("tenant_id") or claims.get("sub") or "")
+    if not str(tenant_id).strip():
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token claims")
-    return tenant_id
+    try:
+        return validate_tenant_id(tenant_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token claims") from e
 
 
 def get_tenant_store(app) -> TenantStore:

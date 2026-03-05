@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { Edit2, Search, PlayCircle, StopCircle } from "lucide-react"
+import { Activity, AlertTriangle, Edit2, Search, PlayCircle, StopCircle } from "lucide-react"
 
 import { api, ApiError } from "@/src/lib/api"
 import { useStore } from "@/src/store/useStore"
@@ -8,7 +8,7 @@ import { Drawer } from "@/src/components/ui/drawer"
 import { Input } from "@/src/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/src/components/ui/table"
 
-const SENSITIVE_KEYS = new Set([
+const DEFAULT_SENSITIVE_KEYS = new Set([
   "token",
   "secret",
   "app_secret",
@@ -20,6 +20,11 @@ const SENSITIVE_KEYS = new Set([
   "bot_token",
   "app_token",
 ])
+
+function buildSensitiveKeySet(keys?: string[] | null): Set<string> {
+  const source = Array.isArray(keys) && keys.length > 0 ? keys : Array.from(DEFAULT_SENSITIVE_KEYS)
+  return new Set(source.map((k) => String(k || "").trim().toLowerCase()).filter(Boolean))
+}
 
 function isPlainObject(value: any): value is Record<string, any> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
@@ -40,11 +45,43 @@ interface ChannelItem {
   name: string
   enabled: boolean
   config_summary?: Record<string, any>
+  config_ready?: boolean
+  missing_required_fields?: string[]
+  runtime_registered?: boolean
+  runtime_running?: boolean
+  runtime_mode?: string
+  runtime_scope?: string
+  runtime_warning?: string
+  writable?: boolean
+  write_block_reason_code?: string | null
+  write_block_reason?: string | null
 }
 
 interface ChannelDetail {
   name: string
   config: Record<string, any>
+  sensitive_keys?: string[]
+  runtime_mode?: string
+  runtime_scope?: string
+  runtime_warning?: string
+  writable?: boolean
+  write_block_reason_code?: string | null
+  write_block_reason?: string | null
+}
+
+interface ChannelStatus {
+  name: string
+  enabled: boolean
+  config_ready: boolean
+  missing_required_fields: string[]
+  runtime_registered: boolean
+  runtime_running: boolean
+  runtime_mode?: string
+  runtime_scope?: string
+  runtime_warning?: string
+  writable?: boolean
+  write_block_reason_code?: string | null
+  write_block_reason?: string | null
 }
 
 type FieldKind = "bool" | "number" | "array" | "string" | "sensitive"
@@ -64,6 +101,24 @@ export function Channels() {
   const [values, setValues] = useState<Record<string, any>>({})
   const [saving, setSaving] = useState(false)
   const [detailError, setDetailError] = useState("")
+
+  const runtimeState = useMemo(() => {
+    const probe = channels.find(
+      (item) => typeof item.writable === "boolean" || String(item.runtime_mode || "").trim() !== ""
+    )
+    if (!probe) return { known: false, writable: true, reason: "" }
+    const writable =
+      typeof probe.writable === "boolean"
+        ? probe.writable
+        : String(probe.runtime_mode || "").trim().toLowerCase() !== "single"
+    const reason = String(probe.write_block_reason || probe.runtime_warning || "").trim()
+    return { known: true, writable, reason }
+  }, [channels])
+
+  const writeBlocked = runtimeState.known && !runtimeState.writable
+  const writeBlockedReason = runtimeState.reason || "当前运行模式禁止修改租户级渠道配置。"
+  const canWrite = canEdit && !writeBlocked
+  const writeDeniedTitle = !canEdit ? "仅 Admin/Owner 可操作" : writeBlockedReason
 
   async function loadList() {
     setLoading(true)
@@ -89,7 +144,12 @@ export function Channels() {
     return channels.filter((c) => String(c.name || "").toLowerCase().includes(q))
   }, [channels, searchQuery])
 
-  function initValuesFromConfig(config: Record<string, any>) {
+  const activeSensitiveKeys = useMemo(
+    () => buildSensitiveKeySet(activeChannel?.sensitive_keys || null),
+    [activeChannel]
+  )
+
+  function initValuesFromConfig(config: Record<string, any>, sensitiveKeys: Set<string>) {
     const next: Record<string, any> = {}
 
     function walk(obj: any, prefix: string) {
@@ -104,7 +164,7 @@ export function Channels() {
         else if (typeof v === "number") next[path] = String(v)
         else if (Array.isArray(v)) next[path] = v.join(", ")
         else {
-          const isSensitive = SENSITIVE_KEYS.has(k)
+          const isSensitive = sensitiveKeys.has(String(k || "").toLowerCase())
           next[path] = isSensitive ? "" : String(v ?? "")
         }
       }
@@ -122,8 +182,9 @@ export function Channels() {
     setValues({})
     try {
       const detail = await api.get<ChannelDetail>(`/api/channels/${encodeURIComponent(name)}`)
+      const sensitiveKeys = buildSensitiveKeySet(detail.sensitive_keys || null)
       setActiveChannel(detail)
-      initValuesFromConfig(detail.config || {})
+      initValuesFromConfig(detail.config || {}, sensitiveKeys)
     } catch (err) {
       const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "加载失败")
       setDetailError(msg)
@@ -132,6 +193,10 @@ export function Channels() {
 
   async function toggleChannel(name: string) {
     if (!canEdit) return
+    if (writeBlocked) {
+      addToast({ id: `channel:toggle:${name}`, type: "error", message: writeBlockedReason })
+      return
+    }
     try {
       await api.post(`/api/channels/${encodeURIComponent(name)}/toggle`, {})
       await loadList()
@@ -141,11 +206,86 @@ export function Channels() {
     }
   }
 
-  function fieldKindForValue(value: any, key: string): FieldKind {
+  async function checkChannelStatus(name: string) {
+    try {
+      const status = await api.get<ChannelStatus>(`/api/channels/${encodeURIComponent(name)}/status`)
+      setChannels((prev) =>
+        prev.map((item) =>
+          item.name === name
+            ? {
+                ...item,
+                enabled: status.enabled,
+                config_ready: status.config_ready,
+                missing_required_fields: status.missing_required_fields,
+                runtime_registered: status.runtime_registered,
+                runtime_running: status.runtime_running,
+                runtime_mode: status.runtime_mode,
+                runtime_scope: status.runtime_scope,
+                runtime_warning: status.runtime_warning,
+                writable: status.writable,
+                write_block_reason_code: status.write_block_reason_code,
+                write_block_reason: status.write_block_reason,
+              }
+            : item
+        )
+      )
+
+      const readyMsg =
+        status.config_ready
+          ? "配置已就绪"
+          : `缺少字段：${(status.missing_required_fields || []).slice(0, 3).join(", ")}${(status.missing_required_fields || []).length > 3 ? ", ..." : ""}`
+      const runtimeMsg = status.runtime_running
+        ? "运行中"
+        : status.runtime_registered
+          ? "已注册未运行"
+          : "未注册（通常需重启服务）"
+      addToast({ id: `channel:check:${name}`, type: status.config_ready ? "success" : "error", message: `${name} 检查结果：${readyMsg}；${runtimeMsg}` })
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "检查失败")
+      addToast({ id: `channel:check:${name}`, type: "error", message: msg })
+    }
+  }
+
+  function renderStatusSummary(channel: ChannelItem) {
+    const enabled = Boolean(channel.enabled)
+    const configReady = Boolean(channel.config_ready)
+    const runtimeRunning = Boolean(channel.runtime_running)
+    const runtimeRegistered = Boolean(channel.runtime_registered)
+    const missingCount = Array.isArray(channel.missing_required_fields)
+      ? channel.missing_required_fields.length
+      : 0
+
+    const configText = configReady ? "配置就绪" : `配置待补全（${missingCount}）`
+    const runtimeText = runtimeRunning
+      ? "运行中"
+      : runtimeRegistered
+        ? "已注册未运行"
+        : "未注册"
+
+    return (
+      <div className="space-y-1">
+        <div className="inline-flex items-center gap-2 text-sm text-muted-foreground">
+          {enabled ? (
+            <>
+              <PlayCircle className="h-4 w-4 text-green-600" /> 已启用
+            </>
+          ) : (
+            <>
+              <StopCircle className="h-4 w-4 text-muted-foreground" /> 未启用
+            </>
+          )}
+        </div>
+        <div className="text-xs text-muted-foreground">接入：{configText}</div>
+        <div className="text-xs text-muted-foreground">运行：{runtimeText}</div>
+      </div>
+    )
+  }
+
+  function fieldKindForValue(value: any, key: string, sensitiveKeys: Set<string>): FieldKind {
     if (typeof value === "boolean") return "bool"
     if (typeof value === "number") return "number"
     if (Array.isArray(value)) return "array"
-    if (SENSITIVE_KEYS.has(key)) return "sensitive"
+    if (sensitiveKeys.has(String(key || "").toLowerCase())) return "sensitive"
     return "string"
   }
 
@@ -161,7 +301,7 @@ export function Channels() {
           continue
         }
 
-        const kind = fieldKindForValue(v, k)
+        const kind = fieldKindForValue(v, k, activeSensitiveKeys)
         const nextVal = values[path]
 
         if (kind === "sensitive") {
@@ -211,6 +351,11 @@ export function Channels() {
   async function saveConfig() {
     if (!activeChannel) return
     if (!canEdit) return
+    if (writeBlocked) {
+      setDetailError(writeBlockedReason)
+      addToast({ id: `channel:${activeChannel.name}`, type: "error", message: writeBlockedReason })
+      return
+    }
     if (saving) return
     setSaving(true)
     setDetailError("")
@@ -262,7 +407,7 @@ export function Channels() {
 
       if (!matchesField(path)) continue
 
-      const kind = fieldKindForValue(v, k)
+      const kind = fieldKindForValue(v, k, activeSensitiveKeys)
       const value = values[path]
       const isSensitive = kind === "sensitive"
 
@@ -275,7 +420,7 @@ export function Channels() {
                 type="checkbox"
                 checked={Boolean(value)}
                 onChange={(e) => setValues((prev) => ({ ...prev, [path]: Boolean(e.target.checked) }))}
-                disabled={!canEdit}
+                disabled={!canWrite}
               />
               启用
             </label>
@@ -285,7 +430,7 @@ export function Channels() {
               value={String(value ?? "")}
               onChange={(e) => setValues((prev) => ({ ...prev, [path]: e.target.value }))}
               placeholder={isSensitive ? "保持不变" : ""}
-              disabled={!canEdit}
+              disabled={!canWrite}
               autoComplete="off"
             />
           )}
@@ -303,7 +448,7 @@ export function Channels() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">渠道</h2>
-          <p className="text-muted-foreground">启用/禁用渠道并编辑配置（敏感字段不回填）。</p>
+          <p className="text-muted-foreground">启用/禁用渠道并编辑配置，可直接检查接入就绪与运行状态。</p>
         </div>
       </div>
 
@@ -325,6 +470,14 @@ export function Channels() {
       {error && (
         <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
           {error}
+        </div>
+      )}
+      {writeBlocked && (
+        <div className="rounded-md border border-warning/30 bg-yellow-500/10 p-3 text-sm text-yellow-800 dark:text-yellow-300">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4" />
+            {writeBlockedReason}
+          </div>
         </div>
       )}
 
@@ -358,27 +511,23 @@ export function Channels() {
                   <TableCell className="text-xs text-muted-foreground font-mono truncate">
                     {channel.config_summary ? JSON.stringify(channel.config_summary) : "{}"}
                   </TableCell>
-                  <TableCell>
-                    <span className="inline-flex items-center gap-2 text-sm text-muted-foreground">
-                      {channel.enabled ? (
-                        <>
-                          <PlayCircle className="h-4 w-4 text-green-600" /> 已启用
-                        </>
-                      ) : (
-                        <>
-                          <StopCircle className="h-4 w-4 text-muted-foreground" /> 未启用
-                        </>
-                      )}
-                    </span>
-                  </TableCell>
+                  <TableCell>{renderStatusSummary(channel)}</TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-2">
                       <Button
                         variant="ghost"
                         size="sm"
+                        onClick={() => checkChannelStatus(channel.name).catch(() => {})}
+                        title="检查接入与运行状态"
+                      >
+                        <Activity className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
                         onClick={() => toggleChannel(channel.name).catch(() => {})}
-                        disabled={!canEdit}
-                        title={!canEdit ? "仅 Admin/Owner 可操作" : channel.enabled ? "禁用" : "启用"}
+                        disabled={!canWrite}
+                        title={canWrite ? (channel.enabled ? "禁用" : "启用") : writeDeniedTitle}
                       >
                         {channel.enabled ? (
                           <StopCircle className="h-4 w-4 text-destructive" />
@@ -390,8 +539,8 @@ export function Channels() {
                         variant="ghost"
                         size="sm"
                         onClick={() => openEditor(channel.name).catch(() => {})}
-                        disabled={!canEdit}
-                        title={!canEdit ? "仅 Admin/Owner 可编辑" : "编辑配置"}
+                        disabled={!canWrite}
+                        title={canWrite ? "编辑配置" : writeDeniedTitle}
                       >
                         <Edit2 className="h-4 w-4" />
                       </Button>
@@ -424,7 +573,7 @@ export function Channels() {
             >
               取消
             </Button>
-            <Button onClick={() => saveConfig().catch(() => {})} disabled={!activeChannel || !canEdit || saving}>
+            <Button onClick={() => saveConfig().catch(() => {})} disabled={!activeChannel || !canWrite || saving}>
               {saving ? "保存中..." : "保存"}
             </Button>
           </>
@@ -451,6 +600,9 @@ export function Channels() {
             </div>
             <div className="space-y-4">{renderFields(activeChannel.config || {}, "")}</div>
             {!canEdit && <div className="text-sm text-muted-foreground">仅 Admin/Owner 可以修改渠道配置。</div>}
+            {canEdit && writeBlocked && (
+              <div className="text-sm text-muted-foreground">{writeBlockedReason}</div>
+            )}
           </div>
         )}
       </Drawer>

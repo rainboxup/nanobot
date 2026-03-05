@@ -3,17 +3,32 @@
 from __future__ import annotations
 
 import os
+from ipaddress import ip_address, ip_network
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from nanobot.tenants.store import validate_tenant_id
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
+from nanobot.web.auth_cookie import clear_refresh_cookie, get_refresh_cookie, set_refresh_cookie
 from nanobot.web.beta_access import get_beta_store, is_beta_admin, normalize_username
 from nanobot.web.user_store import ROLE_MEMBER, ROLE_OWNER, VALID_ROLES, UserStore
 
 router = APIRouter()
+
+_REFRESH_TOKEN_SOURCE_POLICIES = {
+    "cookie_only",
+    "body_only",
+    "hybrid_prefer_cookie",
+    "hybrid_prefer_body",
+}
+_DEFAULT_REFRESH_TOKEN_SOURCE_POLICY = "hybrid_prefer_cookie"
+_MIN_TRUSTED_PROXY_PREFIX_V4 = 16
+_MIN_TRUSTED_PROXY_PREFIX_V6 = 48
 
 
 def _parse_positive_int_env(name: str, default: int) -> int:
@@ -48,6 +63,7 @@ def _token_response(secret: str, rec: dict[str, Any], refresh_token: str) -> dic
         secret=secret,
         tenant_id=str(rec.get("tenant_id") or ""),
         role=str(rec.get("role") or ROLE_MEMBER),
+        token_version=int(rec.get("token_version") or 1),
         token_type="access",
         expires_in_s=access_ttl,
     )
@@ -86,13 +102,322 @@ def _audit(
     )
 
 
+def _normalized_origin(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    scheme = str(parsed.scheme or "").strip().lower()
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not scheme or not hostname:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    if port is None or port == default_port:
+        return f"{scheme}://{hostname}"
+    return f"{scheme}://{hostname}:{int(port)}"
+
+
+def _parse_forwarded_port(value: str | None) -> int | None:
+    raw = str(value or "").strip().strip('"')
+    if not raw:
+        return None
+    try:
+        parsed = int(raw)
+    except Exception:
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _split_header_csv(value: str | None) -> list[str]:
+    return [part.strip() for part in str(value or "").split(",") if str(part or "").strip()]
+
+
+def _normalized_trusted_proxy_cidr(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = raw
+    if "/" not in candidate:
+        try:
+            parsed_ip = ip_address(candidate)
+        except ValueError:
+            return ""
+        host_mask = "32" if parsed_ip.version == 4 else "128"
+        candidate = f"{parsed_ip}/{host_mask}"
+    try:
+        return str(ip_network(candidate, strict=False))
+    except ValueError:
+        return ""
+
+
+def _trusted_proxy_cidr_is_too_broad(cidr: str) -> bool:
+    try:
+        network = ip_network(cidr, strict=False)
+    except ValueError:
+        return True
+    if network.version == 4:
+        return int(network.prefixlen) < _MIN_TRUSTED_PROXY_PREFIX_V4
+    return int(network.prefixlen) < _MIN_TRUSTED_PROXY_PREFIX_V6
+
+
+def _configured_refresh_trusted_proxy_cidrs(request: Request) -> tuple[str, ...]:
+    configured = getattr(request.app.state, "refresh_trusted_proxy_cidrs", ())
+    if not isinstance(configured, (list, tuple, set)):
+        return ()
+    cidrs: list[str] = []
+    seen: set[str] = set()
+    for item in configured:
+        cidr = _normalized_trusted_proxy_cidr(str(item or ""))
+        if not cidr or _trusted_proxy_cidr_is_too_broad(cidr) or cidr in seen:
+            continue
+        seen.add(cidr)
+        cidrs.append(cidr)
+    return tuple(cidrs)
+
+
+def _request_from_trusted_proxy(request: Request) -> bool:
+    cidrs = _configured_refresh_trusted_proxy_cidrs(request)
+    if not cidrs:
+        return False
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", "") or "").strip()
+    if not host:
+        return False
+    try:
+        client_ip = ip_address(host)
+    except ValueError:
+        return False
+    for cidr in cidrs:
+        try:
+            if client_ip in ip_network(cidr, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _normalized_origin_from_parts(
+    *,
+    scheme: str | None,
+    host: str | None,
+    port: int | None = None,
+) -> str:
+    scheme_text = str(scheme or "").strip().strip('"').lower()
+    if scheme_text not in {"http", "https"}:
+        return ""
+
+    host_text = str(host or "").strip().strip('"')
+    if not host_text:
+        return ""
+    if "://" in host_text:
+        direct = _normalized_origin(host_text)
+        if direct:
+            return direct
+        parsed_direct = urlsplit(host_text)
+        host_text = str(parsed_direct.netloc or "").strip()
+        if not host_text:
+            return ""
+
+    parsed = urlsplit(f"{scheme_text}://{host_text}")
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not hostname:
+        return ""
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        parsed_port = None
+    effective_port = parsed_port if parsed_port is not None else port
+    default_port = 443 if scheme_text == "https" else 80
+    if effective_port is None or int(effective_port) == default_port:
+        return f"{scheme_text}://{hostname}"
+    return f"{scheme_text}://{hostname}:{int(effective_port)}"
+
+
+def _expected_refresh_origins_from_x_forwarded_headers(request: Request) -> set[str]:
+    headers = request.headers
+    hosts = _split_header_csv(headers.get("x-forwarded-host"))
+    if not hosts:
+        return set()
+
+    proto_candidates = _split_header_csv(headers.get("x-forwarded-proto")) or _split_header_csv(
+        headers.get("x-forwarded-scheme")
+    )
+    port_candidates = _split_header_csv(headers.get("x-forwarded-port"))
+    fallback_scheme = str(request.url.scheme or "").strip().lower()
+    # Trust only the last hop from proxy headers to avoid client-injected prefix values
+    # when upstream proxies append header chains.
+    host = hosts[-1]
+    proto = proto_candidates[-1] if proto_candidates else fallback_scheme
+    port = _parse_forwarded_port(port_candidates[-1] if port_candidates else None)
+    origin = _normalized_origin_from_parts(scheme=proto, host=host, port=port)
+    return {origin} if origin else set()
+
+
+def _expected_refresh_origins_from_forwarded_header(request: Request) -> set[str]:
+    raw = request.headers.get("forwarded")
+    if not raw:
+        return set()
+    items = _split_header_csv(raw)
+    if not items:
+        return set()
+    fallback_scheme = str(request.url.scheme or "").strip().lower()
+    host = ""
+    proto = ""
+    for part in items[-1].split(";"):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key_text = str(key or "").strip().lower()
+        value_text = str(value or "").strip().strip('"')
+        if key_text == "host":
+            host = value_text
+        elif key_text == "proto":
+            proto = value_text
+    if not host:
+        return set()
+    origin = _normalized_origin_from_parts(
+        scheme=proto or fallback_scheme,
+        host=host,
+    )
+    return {origin} if origin else set()
+
+
+def _configured_refresh_allowed_origins(request: Request) -> set[str]:
+    configured = getattr(request.app.state, "refresh_allowed_origins", ())
+    if not isinstance(configured, (list, tuple, set)):
+        return set()
+    origins: set[str] = set()
+    for item in configured:
+        normalized = _normalized_origin(str(item or ""))
+        if normalized:
+            origins.add(normalized)
+    return origins
+
+
+def _expected_refresh_origins(request: Request) -> set[str]:
+    origins: set[str] = set()
+    base_origin = _normalized_origin(str(request.base_url))
+    if base_origin:
+        origins.add(base_origin)
+    host_origin = _normalized_origin_from_parts(
+        scheme=str(request.url.scheme or "").strip().lower(),
+        host=request.headers.get("host"),
+    )
+    if host_origin:
+        origins.add(host_origin)
+    if _request_from_trusted_proxy(request):
+        origins.update(_expected_refresh_origins_from_x_forwarded_headers(request))
+        origins.update(_expected_refresh_origins_from_forwarded_header(request))
+    origins.update(_configured_refresh_allowed_origins(request))
+    return origins
+
+
+def _request_origin(request: Request) -> str:
+    origin = _normalized_origin(request.headers.get("origin"))
+    if origin:
+        return origin
+    return _normalized_origin(request.headers.get("referer"))
+
+
+def _is_same_origin_refresh_request(request: Request) -> bool:
+    origin = _request_origin(request)
+    if not origin:
+        return False
+    return origin in _expected_refresh_origins(request)
+
+
+def _normalize_refresh_token_source_policy(value: str | None) -> str:
+    raw = str(value or "").strip().lower()
+    if raw in _REFRESH_TOKEN_SOURCE_POLICIES:
+        return raw
+    return _DEFAULT_REFRESH_TOKEN_SOURCE_POLICY
+
+
+def _refresh_token_source_policy(request: Request) -> str:
+    configured = getattr(request.app.state, "refresh_token_source_policy", None)
+    return _normalize_refresh_token_source_policy(str(configured or ""))
+
+
+def _refresh_body_require_same_origin(request: Request) -> bool:
+    configured = getattr(request.app.state, "refresh_body_require_same_origin", True)
+    if isinstance(configured, bool):
+        return configured
+    raw = str(configured or "").strip().lower()
+    if not raw:
+        return True
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return True
+
+
+def _refresh_attempt_requires_same_origin(request: Request, *, from_cookie: bool) -> bool:
+    if from_cookie:
+        return True
+    return _refresh_body_require_same_origin(request)
+
+
+def _refresh_token_candidates(
+    request: Request,
+    payload_token: str | None = None,
+) -> list[tuple[str, bool]]:
+    cookie_token = str(get_refresh_cookie(request) or "").strip()
+    body_token = str(payload_token or "").strip()
+    policy = _refresh_token_source_policy(request)
+
+    ordered: list[tuple[str, bool]]
+    if policy == "cookie_only":
+        ordered = [(cookie_token, True)]
+    elif policy == "body_only":
+        ordered = [(body_token, False)]
+    elif policy == "hybrid_prefer_body":
+        ordered = [(body_token, False), (cookie_token, True)]
+    else:
+        ordered = [(cookie_token, True), (body_token, False)]
+
+    deduped: list[tuple[str, bool]] = []
+    seen: set[str] = set()
+    for token, from_cookie in ordered:
+        normalized_token = str(token or "").strip()
+        if not normalized_token or normalized_token in seen:
+            continue
+        seen.add(normalized_token)
+        deduped.append((normalized_token, from_cookie))
+    return deduped
+
+
 class RefreshRequest(BaseModel):
-    refresh_token: str = Field(min_length=10)
+    refresh_token: str | None = Field(default=None, min_length=10)
 
 
 class LogoutRequest(BaseModel):
     refresh_token: str | None = None
     revoke_all: bool = False
+
+
+def _extract_refresh_token(
+    request: Request,
+    payload_token: str | None = None,
+    *,
+    cookie_first: bool = False,
+) -> tuple[str, bool]:
+    cookie_token = get_refresh_cookie(request)
+    body_token = str(payload_token or "").strip()
+
+    if cookie_first and cookie_token:
+        return cookie_token, True
+    if body_token:
+        return body_token, False
+    if cookie_token:
+        return cookie_token, True
+    return "", False
 
 
 class UserCreateRequest(BaseModel):
@@ -183,9 +508,48 @@ async def auth_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str,
 
 
 @router.post("/api/auth/refresh")
-async def refresh_token(payload: RefreshRequest, request: Request) -> dict[str, Any]:
+async def refresh_token(request: Request, payload: RefreshRequest | None = None) -> JSONResponse:
     store = _get_user_store(request.app)
-    rotated = store.rotate_refresh_token(payload.refresh_token, expires_in_s=_refresh_token_ttl())
+    payload_token = payload.refresh_token if payload is not None else None
+    refresh_attempts = _refresh_token_candidates(request, payload_token=payload_token)
+    if not refresh_attempts:
+        _audit(
+            request,
+            event="auth.refresh",
+            status_text="failed",
+            user=None,
+            metadata={"reason": "missing_refresh_token"},
+        )
+        failed = JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Invalid refresh token"},
+        )
+        clear_refresh_cookie(failed, request=request)
+        return failed
+
+    rotated: tuple[dict[str, Any], str] | None = None
+    same_origin: bool | None = None
+    for refresh_token_value, from_cookie in refresh_attempts:
+        if _refresh_attempt_requires_same_origin(request, from_cookie=from_cookie):
+            if same_origin is None:
+                same_origin = _is_same_origin_refresh_request(request)
+            if not same_origin:
+                reason = "cross_origin_cookie_refresh" if from_cookie else "cross_origin_body_refresh"
+                _audit(
+                    request,
+                    event="auth.refresh",
+                    status_text="failed",
+                    user=None,
+                    metadata={"reason": reason},
+                )
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content={"detail": "Cross-origin refresh is not allowed"},
+                )
+        rotated = store.rotate_refresh_token(refresh_token_value, expires_in_s=_refresh_token_ttl())
+        if rotated is not None:
+            break
+
     if rotated is None:
         _audit(
             request,
@@ -194,7 +558,12 @@ async def refresh_token(payload: RefreshRequest, request: Request) -> dict[str, 
             user=None,
             metadata={"reason": "invalid_refresh_token"},
         )
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid refresh token")
+        failed = JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Invalid refresh token"},
+        )
+        clear_refresh_cookie(failed, request=request)
+        return failed
 
     rec, new_refresh = rotated
     secret = getattr(request.app.state, "jwt_secret", None)
@@ -207,7 +576,9 @@ async def refresh_token(payload: RefreshRequest, request: Request) -> dict[str, 
         user={"sub": str(rec.get("username") or ""), "tenant_id": str(rec.get("tenant_id") or "")},
         metadata={},
     )
-    return _token_response(secret, rec, new_refresh)
+    response = JSONResponse(content=_token_response(secret, rec, new_refresh))
+    set_refresh_cookie(response, new_refresh, request=request, max_age=_refresh_token_ttl())
+    return response
 
 
 @router.post("/api/auth/logout")
@@ -215,13 +586,14 @@ async def logout(
     payload: LogoutRequest,
     request: Request,
     user: dict[str, Any] = Depends(get_current_user),
-) -> dict[str, Any]:
+) -> JSONResponse:
     store = _get_user_store(request.app)
     username = str(user.get("sub") or "")
-    if payload.revoke_all or not payload.refresh_token:
+    refresh_token_value, _from_cookie = _extract_refresh_token(request, payload_token=payload.refresh_token)
+    if payload.revoke_all or not refresh_token_value:
         revoked = store.revoke_all_user_refresh_tokens(username)
     else:
-        revoked = 1 if store.revoke_refresh_token_for_user(payload.refresh_token, username) else 0
+        revoked = 1 if store.revoke_refresh_token_for_user(refresh_token_value, username) else 0
     _audit(
         request,
         event="auth.logout",
@@ -229,7 +601,9 @@ async def logout(
         user=user,
         metadata={"revoked": int(revoked), "revoke_all": bool(payload.revoke_all)},
     )
-    return {"revoked": int(revoked)}
+    response = JSONResponse(content={"revoked": int(revoked)})
+    clear_refresh_cookie(response, request=request)
+    return response
 
 
 @router.get("/api/auth/users")
@@ -255,11 +629,11 @@ async def create_user(
 
     target_user = str(payload.username or "").strip().lower()
     if not target_user:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="username required")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="username required")
 
     role = str(payload.role or ROLE_MEMBER).strip().lower()
     if role not in VALID_ROLES:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid role")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid role")
 
     actor_role = str(user.get("role") or ROLE_MEMBER).strip().lower()
     actor_tenant = str(user.get("tenant_id") or "").strip().lower()
@@ -271,6 +645,10 @@ async def create_user(
         target_tenant = target_user
     else:
         target_tenant = actor_tenant or target_user
+    try:
+        target_tenant = validate_tenant_id(target_tenant)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid tenant_id") from e
     if actor_role != "owner":
         if role == "owner":
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only owner can create owner")
@@ -335,7 +713,7 @@ async def update_user_role(
     target = str(username or "").strip().lower()
     role = str(payload.role or "").strip().lower()
     if role not in VALID_ROLES:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid role")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="invalid role")
     if target == str(user.get("sub") or "").strip().lower():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="cannot change own role")
 

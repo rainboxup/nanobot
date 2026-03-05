@@ -111,3 +111,23 @@ def test_invalid_index_shape_is_quarantined_and_raises(tmp_path: Path) -> None:
     assert len(quarantined) == 1
     assert not index_path.exists()
 
+
+@pytest.mark.parametrize(
+    "tenant_id",
+    [
+        "",
+        ".",
+        "..",
+        "a:b",
+        "con",
+        "NUL",
+        "a" * 65,
+        "space tenant",
+        "tenant/one",
+    ],
+)
+def test_tenant_dir_rejects_invalid_tenant_id(tmp_path: Path, tenant_id: str) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    with pytest.raises(ValueError):
+        _ = store.tenant_dir(tenant_id)
+

@@ -1,5 +1,6 @@
 """Session management for conversation history."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -98,13 +99,22 @@ class SessionManager:
 
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
+        digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
+        return self.sessions_dir / f"{digest}.jsonl"
+
+    @staticmethod
+    def _legacy_mapped_session_path(base_dir: Path, key: str) -> Path:
+        """Legacy filename mapping used before hash-based paths."""
         safe_key = safe_filename(key.replace(":", "_"))
-        return self.sessions_dir / f"{safe_key}.jsonl"
+        return base_dir / f"{safe_key}.jsonl"
+
+    def _get_local_legacy_session_path(self, key: str) -> Path:
+        """Legacy path in current sessions_dir (pre-hash local files)."""
+        return self._legacy_mapped_session_path(self.sessions_dir, key)
 
     def _get_legacy_session_path(self, key: str) -> Path:
         """Legacy global session path (~/.nanobot/sessions/)."""
-        safe_key = safe_filename(key.replace(":", "_"))
-        return self.legacy_sessions_dir / f"{safe_key}.jsonl"
+        return self._legacy_mapped_session_path(self.legacy_sessions_dir, key)
 
     def get_or_create(self, key: str) -> Session:
         """
@@ -157,6 +167,14 @@ class SessionManager:
     def _load(self, key: str) -> Session | None:
         """Load a session from disk."""
         path = self._get_session_path(key)
+        local_legacy_path = self._get_local_legacy_session_path(key)
+        if not path.exists() and local_legacy_path.exists():
+            try:
+                shutil.move(str(local_legacy_path), str(path))
+                logger.info("Migrated session {} from legacy local filename", key)
+            except Exception:
+                logger.exception("Failed to migrate local legacy session {}", key)
+
         if not path.exists() and self._migrate_legacy:
             legacy_path = self._get_legacy_session_path(key)
             if legacy_path.exists():
@@ -267,6 +285,11 @@ class SessionManager:
                 path = self._get_session_path(key)
                 if path.exists():
                     path.unlink()
+                    deleted = True
+
+                local_legacy_path = self._get_local_legacy_session_path(key)
+                if local_legacy_path.exists():
+                    local_legacy_path.unlink()
                     deleted = True
 
                 if self._migrate_legacy:

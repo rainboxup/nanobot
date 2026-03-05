@@ -2,6 +2,7 @@
 
 from typing import Any, Awaitable, Callable
 
+from nanobot.agent.tenant_workspace import require_web_tenant_id
 from nanobot.agent.tools.base import Tool
 from nanobot.bus.events import OutboundMessage
 
@@ -78,6 +79,21 @@ class MessageTool(Tool):
             "required": ["content"],
         }
 
+    def _validate_web_target_boundary(self, channel: str, chat_id: str) -> str | None:
+        """Block cross-tenant message routing in web contexts."""
+        if self._default_channel != "web":
+            return None
+        if channel != "web":
+            return "Error: Web message target override is blocked"
+        try:
+            source_tenant = require_web_tenant_id(self._default_chat_id, label="default chat_id")
+            target_tenant = require_web_tenant_id(chat_id, label="chat_id")
+        except ValueError:
+            return "Error: Invalid web message target"
+        if target_tenant != source_tenant:
+            return "Error: Cross-tenant message target override is blocked"
+        return None
+
     async def execute(
         self,
         content: str,
@@ -96,6 +112,10 @@ class MessageTool(Tool):
         channel = channel or self._default_channel
         chat_id = chat_id or self._default_chat_id
         message_id = message_id or self._default_message_id
+
+        boundary_error = self._validate_web_target_boundary(channel, chat_id)
+        if boundary_error:
+            return boundary_error
 
         if not channel or not chat_id:
             return "Error: No target channel/chat specified"

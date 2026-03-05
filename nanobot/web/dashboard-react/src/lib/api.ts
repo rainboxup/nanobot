@@ -22,9 +22,10 @@ export function getRefreshToken(): string {
 export function setAuthTokens(accessToken: string, refreshToken?: string): void {
   try {
     localStorage.setItem(TOKEN_KEY, accessToken || "");
-    if (refreshToken) {
-      localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
-    }
+    // Keep refresh token out of localStorage; cookie mode is preferred.
+    localStorage.removeItem(REFRESH_TOKEN_KEY);
+    // Accept the second parameter for backward-compatible call sites.
+    void refreshToken;
   } catch {
     // ignore storage failures
   }
@@ -71,13 +72,12 @@ export function handleUnauthorized(detail: string = "Unauthorized"): ApiError {
 let refreshInFlight: Promise<boolean> | null = null;
 
 async function refreshAccessToken(): Promise<boolean> {
-  const refreshToken = getRefreshToken();
-  if (!refreshToken) return false;
-
+  // Cookie is the source of truth for refresh; ignore legacy localStorage refresh tokens.
   const res = await fetch("/api/auth/refresh", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ refresh_token: refreshToken }),
+    credentials: "include",
+    body: JSON.stringify({}),
   });
 
   if (!res.ok) return false;
@@ -189,6 +189,7 @@ async function requestResponse(
   const res = await fetch(path, {
     ...init,
     method,
+    credentials: init?.credentials ?? "include",
     headers,
     body: _bodyInit((init as any)?.body, headers),
   });

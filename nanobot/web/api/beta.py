@@ -80,7 +80,7 @@ async def add_allowlist_user(
     store = get_beta_store(request.app)
     username = normalize_username(payload.username)
     if not username:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="username required")
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="username required")
     added = store.add_user(username)
     users = store.list_allowed_users()
     _audit(

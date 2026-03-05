@@ -40,7 +40,7 @@ class WebTestContext:
 @pytest.fixture()
 async def web_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebTestContext:
     monkeypatch.setenv("NANOBOT_ADMIN_PASSWORD", "test-password")
-    monkeypatch.setenv("NANOBOT_JWT_SECRET", "test-jwt-secret")
+    monkeypatch.setenv("NANOBOT_JWT_SECRET", "test-jwt-secret-32-bytes-minimum-0001")
     monkeypatch.setenv("NANOBOT_WEB_CLOSED_BETA", "1")
     monkeypatch.setenv("NANOBOT_WEB_ALLOWED_USERS", "admin,alice,bob")
     monkeypatch.setenv("NANOBOT_WEB_RATE_LIMIT", "100000")
@@ -106,7 +106,14 @@ async def web_ctx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> WebTestCon
     host = "127.0.0.1"
     port = _get_free_port()
     server = uvicorn.Server(
-        uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
+        uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="warning",
+            access_log=False,
+            ws="wsproto",
+        )
     )
     task = asyncio.create_task(server.serve())
 

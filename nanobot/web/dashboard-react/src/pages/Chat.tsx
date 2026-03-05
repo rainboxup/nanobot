@@ -9,10 +9,13 @@ import {
   Bot,
   Check,
   Copy,
+  PanelLeft,
   Pencil,
   Plus,
+  RotateCcw,
   Search,
   Send,
+  Square,
   Trash2,
   User,
   Wifi,
@@ -22,7 +25,9 @@ import {
 
 import { useStore } from "@/src/store/useStore"
 import { Button } from "@/src/components/ui/button"
+import { Drawer } from "@/src/components/ui/drawer"
 import { Input } from "@/src/components/ui/input"
+import { Modal } from "@/src/components/ui/modal"
 import { cn } from "@/src/lib/utils"
 import {
   ApiError,
@@ -144,11 +149,14 @@ export function Chat() {
   const [sessionsError, setSessionsError] = useState("")
   const [historyLoading, setHistoryLoading] = useState(false)
   const [creatingSession, setCreatingSession] = useState(false)
+  const [mobileSessionsOpen, setMobileSessionsOpen] = useState(false)
   const [renamingSessionId, setRenamingSessionId] = useState("")
   const [renameValue, setRenameValue] = useState("")
+  const [deleteTarget, setDeleteTarget] = useState<ChatSession | null>(null)
   const [sessionActionLoadingId, setSessionActionLoadingId] = useState("")
   const [wsStatus, setWsStatus] = useState<"connecting" | "open" | "closed">("connecting")
   const [wsError, setWsError] = useState("")
+  const [awaitingResponse, setAwaitingResponse] = useState(false)
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const wsRef = useRef<WebSocket | null>(null)
@@ -157,6 +165,8 @@ export function Chat() {
   const activeSessionIdRef = useRef("")
   const boundSessionIdRef = useRef("")
   const authRetryCountRef = useRef(0)
+  const awaitingResponseRef = useRef(false)
+  const activeRequestIdRef = useRef("")
 
   const { addToast } = useStore()
 
@@ -177,6 +187,23 @@ export function Chat() {
   const displaySessionId = boundSessionId || activeSessionId
   const isSessionSwitching = Boolean(activeSessionId) && activeSessionId !== boundSessionId
   const sessionActionLocked = creatingSession || Boolean(sessionActionLoadingId) || sessionsLoading
+  const lastUserMessage = useMemo(
+    () =>
+      [...messages]
+        .reverse()
+        .find((msg) => msg.role === "user" && String(msg.content || "").trim() && !String(msg.content).trim().startsWith("/")) || null,
+    [messages]
+  )
+
+  const setAwaitingResponseState = (next: boolean) => {
+    awaitingResponseRef.current = next
+    setAwaitingResponse(next)
+  }
+
+  const clearAwaitingResponseState = () => {
+    activeRequestIdRef.current = ""
+    setAwaitingResponseState(false)
+  }
 
   const touchSession = (sessionId: string, patch?: Partial<ChatSession>) => {
     if (!sessionId) return
@@ -219,6 +246,10 @@ export function Chat() {
   useEffect(() => {
     boundSessionIdRef.current = boundSessionId
   }, [boundSessionId])
+
+  useEffect(() => {
+    awaitingResponseRef.current = awaitingResponse
+  }, [awaitingResponse])
 
   async function checkChatStatus() {
     try {
@@ -342,6 +373,7 @@ export function Chat() {
       setRenameValue("")
       setMessages([])
       setWsError("")
+      setMobileSessionsOpen(false)
       addToast({ type: "success", message: "已创建新会话" })
       fetchSessions(parsed.id).catch(() => {})
     } catch (err) {
@@ -361,6 +393,7 @@ export function Chat() {
     setMessages([])
     setHistoryLoading(true)
     setActiveSessionId(sessionId)
+    setMobileSessionsOpen(false)
   }
 
   const beginRenameSession = (session: ChatSession) => {
@@ -401,8 +434,6 @@ export function Chat() {
 
   async function handleDeleteSession(session: ChatSession) {
     if (sessionActionLocked) return
-    const ok = window.confirm(`确定删除会话「${session.title}」吗？该操作不可撤销。`)
-    if (!ok) return
 
     setSessionActionLoadingId(session.id)
     try {
@@ -423,6 +454,7 @@ export function Chat() {
       }
       addToast({ type: "success", message: "会话已删除" })
       fetchSessions(activeSessionId === session.id ? remaining[0]?.id : activeSessionId).catch(() => {})
+      setDeleteTarget(null)
     } catch (err) {
       const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "删除会话失败")
       addToast({ type: "error", message: msg })
@@ -447,8 +479,10 @@ export function Chat() {
       setHistoryLoading(false)
       setMessages([])
       setBoundSessionId("")
+      clearAwaitingResponseState()
       return
     }
+    clearAwaitingResponseState()
     loadHistory(activeSessionId).catch(() => {})
   }, [activeSessionId])
 
@@ -472,6 +506,7 @@ export function Chat() {
       const token = getAccessToken()
       if (!token) {
         setWsStatus("closed")
+        clearAwaitingResponseState()
         return
       }
 
@@ -496,6 +531,7 @@ export function Chat() {
         if (wsRef.current !== ws) return
         wsRef.current = null
         setWsStatus("closed")
+        clearAwaitingResponseState()
         if (ev.reason) {
           setWsError(String(ev.reason))
         }
@@ -530,6 +566,7 @@ export function Chat() {
       ws.onerror = () => {
         if (wsRef.current !== ws) return
         setWsError("WebSocket 错误")
+        clearAwaitingResponseState()
       }
 
       ws.onmessage = (ev) => {
@@ -553,7 +590,16 @@ export function Chat() {
           return
         }
 
+        if (data && data.type === "request") {
+          const acceptedRequestId = String(data.request_id || "")
+          if (acceptedRequestId && activeRequestIdRef.current === acceptedRequestId) {
+            setAwaitingResponseState(true)
+          }
+          return
+        }
+
         if (data && data.type === "error") {
+          clearAwaitingResponseState()
           const msg = String(data.detail || data.error || "对话不可用")
           setWsError(msg)
           setMessages((prev) => [
@@ -564,6 +610,16 @@ export function Chat() {
         }
 
         if (data && typeof data === "object") {
+          const metadata = data.metadata && typeof data.metadata === "object" ? data.metadata : {}
+          const requestId = String(metadata.web_request_id || data.request_id || "")
+          const responseState = String(metadata._response_state || "")
+          const isProgress = Boolean(metadata._progress) || responseState === "delta"
+          const isTerminal =
+            responseState === "completed" ||
+            responseState === "failed" ||
+            responseState === "stopped" ||
+            (!isProgress && responseState !== "delta")
+
           const maybeContent =
             data.content !== undefined && data.content !== null
               ? String(data.content)
@@ -589,6 +645,17 @@ export function Chat() {
                 updatedAt: data.updated_at || data.updatedAt || ts,
               })
             }
+            if (awaitingResponseRef.current) {
+              const activeRequestId = String(activeRequestIdRef.current || "")
+              const stopTargetRequestId = String(metadata.web_stop_target_request_id || "")
+              const requestMatched = Boolean(activeRequestId && requestId && activeRequestId === requestId)
+              const stopMatched =
+                responseState === "stopped" &&
+                (!activeRequestId || !stopTargetRequestId || stopTargetRequestId === activeRequestId)
+              if (stopMatched || (requestMatched && isTerminal) || (!activeRequestId && isTerminal)) {
+                clearAwaitingResponseState()
+              }
+            }
             return
           }
         }
@@ -597,6 +664,9 @@ export function Chat() {
           ...prev,
           { id: `a:${Date.now()}`, role: "assistant", content: text, timestamp: Date.now() },
         ])
+        if (awaitingResponseRef.current) {
+          clearAwaitingResponseState()
+        }
         const sid = String(boundSessionIdRef.current || activeSessionIdRef.current || "")
         if (sid) {
           touchSession(sid, { preview: text, updatedAt: new Date().toISOString() })
@@ -609,6 +679,7 @@ export function Chat() {
     return () => {
       cancelled = true
       if (reconnectTimer) window.clearTimeout(reconnectTimer)
+      clearAwaitingResponseState()
       const ws = wsRef.current
       wsRef.current = null
       try {
@@ -619,38 +690,83 @@ export function Chat() {
     }
   }, [activeSessionId, sessionsReady])
 
-  const handleSend = () => {
-    const text = (input || "").trim()
-    if (!text) return
+  function sendMessage(
+    rawText: string,
+    options?: { appendUserMessage?: boolean; markAwaiting?: boolean; targetRequestId?: string }
+  ): boolean {
+    const text = String(rawText || "").trim()
+    if (!text) return false
 
     const ws = wsRef.current
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       addToast({ type: "error", message: "未连接到服务器" })
-      return
+      return false
     }
-
     if (activeSessionId && activeSessionId !== boundSessionId) {
       addToast({ type: "error", message: "会话切换中，请稍后再试" })
+      return false
+    }
+
+    const requestId = `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+    const payload: Record<string, string> = { type: "chat", content: text, request_id: requestId }
+    const targetRequestId = String(options?.targetRequestId || "").trim()
+    if (targetRequestId) {
+      payload.target_request_id = targetRequestId
+    }
+    ws.send(JSON.stringify(payload))
+
+    const appendUserMessage = options?.appendUserMessage !== false
+    if (appendUserMessage) {
+      const now = Date.now()
+      setMessages((prev) => [
+        ...prev,
+        { id: `u:${now}`, role: "user", content: text, timestamp: now },
+      ])
+      const sid = String(activeSessionId || boundSessionId || "")
+      if (sid) {
+        touchSession(sid, { preview: text, updatedAt: now })
+      }
+    }
+
+    if (options?.markAwaiting !== false) {
+      activeRequestIdRef.current = requestId
+      setAwaitingResponseState(true)
+    }
+    return true
+  }
+
+  const handleSend = () => {
+    const ok = sendMessage(input, { appendUserMessage: true, markAwaiting: true })
+    if (ok) setInput("")
+  }
+
+  const handleStopGeneration = () => {
+    const targetRequestId = String(activeRequestIdRef.current || "")
+    const ok = sendMessage("/stop", {
+      appendUserMessage: false,
+      markAwaiting: false,
+      targetRequestId,
+    })
+    if (!ok) return
+    addToast({ type: "info", message: "已发送停止请求" })
+  }
+
+  const handleRetryLastUser = () => {
+    if (!lastUserMessage?.content) {
+      addToast({ type: "error", message: "没有可重试的上一条用户消息" })
       return
     }
+    sendMessage(lastUserMessage.content, { appendUserMessage: true, markAwaiting: true })
+  }
 
-    ws.send(text)
-
-    const now = Date.now()
-    setMessages((prev) => [
-      ...prev,
-      { id: `u:${now}`, role: "user", content: text, timestamp: now },
-    ])
-    const sid = String(activeSessionId || boundSessionId || "")
-    if (sid) {
-      touchSession(sid, { preview: text, updatedAt: now })
-    }
-    setInput("")
+  const handleResend = (content: string) => {
+    sendMessage(content, { appendUserMessage: true, markAwaiting: true })
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault()
+      if (awaitingResponse) return
       handleSend()
     }
   }
@@ -659,6 +775,159 @@ export function Chat() {
     navigator.clipboard.writeText(text)
     addToast({ type: "success", message: "已复制到剪贴板" })
   }
+
+  const renderSessionPanel = () => (
+    <>
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-sm font-semibold">会话</div>
+        <Button size="sm" onClick={() => handleCreateSession().catch(() => {})} disabled={sessionActionLocked}>
+          <Plus className="mr-1 h-4 w-4" />
+          新建
+        </Button>
+      </div>
+
+      <div className="relative">
+        <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+        <Input
+          value={sessionQuery}
+          onChange={(e) => setSessionQuery(e.target.value)}
+          className="pl-8"
+          placeholder="搜索会话..."
+        />
+      </div>
+
+      {sessionsError && (
+        <div className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
+          {sessionsError}
+        </div>
+      )}
+
+      <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+        {sessionsLoading && sessions.length === 0 ? (
+          <div className="text-sm text-muted-foreground">加载会话中...</div>
+        ) : filteredSessions.length === 0 ? (
+          <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
+            {sessionQuery.trim() ? "未找到匹配会话" : "暂无会话，点击“新建”开始"}
+          </div>
+        ) : (
+          filteredSessions.map((session) => {
+            const isActive = session.id === activeSessionId
+            const isRenaming = session.id === renamingSessionId
+            const isActionLoading = session.id === sessionActionLoadingId
+            const isSessionLocked = sessionActionLocked || historyLoading
+            return (
+              <div
+                key={session.id}
+                className={cn(
+                  "group rounded-md border bg-background p-2 transition-colors",
+                  isActive
+                    ? "border-primary shadow-sm"
+                    : "border-border hover:border-muted-foreground/30"
+                )}
+              >
+                {isRenaming ? (
+                  <div className="space-y-2">
+                    <Input
+                      autoFocus
+                      value={renameValue}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          submitRenameSession(session).catch(() => {})
+                        }
+                        if (e.key === "Escape") {
+                          cancelRenameSession()
+                        }
+                      }}
+                    />
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7"
+                        onClick={cancelRenameSession}
+                        disabled={isActionLoading}
+                      >
+                        <X className="h-4 w-4" />
+                        <span className="sr-only">取消重命名</span>
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7"
+                        onClick={() => submitRenameSession(session).catch(() => {})}
+                        disabled={isActionLoading}
+                      >
+                        <Check className="h-4 w-4" />
+                        <span className="sr-only">确认重命名</span>
+                      </Button>
+                    </div>
+                  </div>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      className="w-full text-left"
+                      onClick={() => handleSelectSession(session.id)}
+                      disabled={isSessionLocked}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="truncate text-sm font-medium">{session.title}</div>
+                        <div className="shrink-0 text-[11px] text-muted-foreground">
+                          {formatSessionTime(session.updatedAt || session.createdAt)}
+                        </div>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                        {session.id}
+                      </div>
+                      {session.preview && (
+                        <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">
+                          {session.preview}
+                        </div>
+                      )}
+                    </button>
+
+                    <div className="mt-2 flex justify-end gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          beginRenameSession(session)
+                        }}
+                        disabled={isSessionLocked}
+                        title="重命名"
+                      >
+                        <Pencil className="h-4 w-4" />
+                        <span className="sr-only">重命名</span>
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-destructive hover:text-destructive"
+                        onClick={(e) => {
+                          e.preventDefault()
+                          e.stopPropagation()
+                          setDeleteTarget(session)
+                        }}
+                        disabled={isSessionLocked}
+                        title="删除会话"
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        <span className="sr-only">删除</span>
+                      </Button>
+                    </div>
+                  </>
+                )}
+              </div>
+            )
+          })
+        )}
+      </div>
+    </>
+  )
 
   return (
     <div className="flex h-[calc(100vh-3.5rem)] flex-col">
@@ -677,158 +946,28 @@ export function Chat() {
       )}
 
       <div className="flex min-h-0 flex-1">
-        <aside className="flex w-72 shrink-0 flex-col gap-3 border-r bg-muted/20 p-4 md:w-80">
-          <div className="flex items-center justify-between gap-2">
-            <div className="text-sm font-semibold">会话</div>
-            <Button size="sm" onClick={() => handleCreateSession().catch(() => {})} disabled={sessionActionLocked}>
-              <Plus className="mr-1 h-4 w-4" />
-              新建
-            </Button>
-          </div>
-
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-            <Input
-              value={sessionQuery}
-              onChange={(e) => setSessionQuery(e.target.value)}
-              className="pl-8"
-              placeholder="搜索会话..."
-            />
-          </div>
-
-          {sessionsError && (
-            <div className="rounded-md border border-destructive/30 bg-destructive/10 p-2 text-xs text-destructive">
-              {sessionsError}
-            </div>
-          )}
-
-          <div className="min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
-            {sessionsLoading && sessions.length === 0 ? (
-              <div className="text-sm text-muted-foreground">加载会话中...</div>
-            ) : filteredSessions.length === 0 ? (
-              <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
-                {sessionQuery.trim() ? "未找到匹配会话" : "暂无会话，点击“新建”开始"}
-              </div>
-            ) : (
-              filteredSessions.map((session) => {
-                const isActive = session.id === activeSessionId
-                const isRenaming = session.id === renamingSessionId
-                const isActionLoading = session.id === sessionActionLoadingId
-                const isSessionLocked = sessionActionLocked || historyLoading
-                return (
-                  <div
-                    key={session.id}
-                    className={cn(
-                      "group rounded-md border bg-background p-2 transition-colors",
-                      isActive
-                        ? "border-primary shadow-sm"
-                        : "border-border hover:border-muted-foreground/30"
-                    )}
-                  >
-                    {isRenaming ? (
-                      <div className="space-y-2">
-                        <Input
-                          autoFocus
-                          value={renameValue}
-                          onChange={(e) => setRenameValue(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === "Enter") {
-                              submitRenameSession(session).catch(() => {})
-                            }
-                            if (e.key === "Escape") {
-                              cancelRenameSession()
-                            }
-                          }}
-                        />
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            onClick={cancelRenameSession}
-                            disabled={isActionLoading}
-                          >
-                            <X className="h-4 w-4" />
-                            <span className="sr-only">取消重命名</span>
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            onClick={() => submitRenameSession(session).catch(() => {})}
-                            disabled={isActionLoading}
-                          >
-                            <Check className="h-4 w-4" />
-                            <span className="sr-only">确认重命名</span>
-                          </Button>
-                        </div>
-                      </div>
-                    ) : (
-                      <>
-                        <button
-                          type="button"
-                          className="w-full text-left"
-                          onClick={() => handleSelectSession(session.id)}
-                          disabled={isSessionLocked}
-                        >
-                          <div className="flex items-center justify-between gap-2">
-                            <div className="truncate text-sm font-medium">{session.title}</div>
-                            <div className="shrink-0 text-[11px] text-muted-foreground">
-                              {formatSessionTime(session.updatedAt || session.createdAt)}
-                            </div>
-                          </div>
-                          <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-                            {session.id}
-                          </div>
-                          {session.preview && (
-                            <div className="mt-1 line-clamp-2 text-xs text-muted-foreground">
-                              {session.preview}
-                            </div>
-                          )}
-                        </button>
-
-                        <div className="mt-2 flex justify-end gap-1 opacity-100 transition-opacity sm:opacity-0 sm:group-hover:opacity-100">
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7"
-                            onClick={(e) => {
-                              e.preventDefault()
-                              e.stopPropagation()
-                              beginRenameSession(session)
-                            }}
-                            disabled={isSessionLocked}
-                            title="重命名"
-                          >
-                            <Pencil className="h-4 w-4" />
-                            <span className="sr-only">重命名</span>
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="icon"
-                            className="h-7 w-7 text-destructive hover:text-destructive"
-                            onClick={(e) => {
-                              e.preventDefault()
-                              e.stopPropagation()
-                              handleDeleteSession(session).catch(() => {})
-                            }}
-                            disabled={isSessionLocked}
-                            title="删除会话"
-                          >
-                            <Trash2 className="h-4 w-4" />
-                            <span className="sr-only">删除</span>
-                          </Button>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                )
-              })
-            )}
-          </div>
+        <aside className="hidden w-72 shrink-0 flex-col gap-3 border-r bg-muted/20 p-4 md:flex md:w-80">
+          {renderSessionPanel()}
         </aside>
 
         <div className="flex min-w-0 flex-1 flex-col">
+          <div className="border-b bg-background p-3 md:hidden">
+            <div className="flex items-center justify-between gap-2">
+              <Button variant="outline" size="sm" onClick={() => setMobileSessionsOpen(true)}>
+                <PanelLeft className="mr-1 h-4 w-4" />
+                会话
+              </Button>
+              <div className="min-w-0 text-right">
+                <div className="truncate text-sm text-muted-foreground">
+                  {activeSession?.title || "会话未选择"}
+                </div>
+                <div className="truncate font-mono text-[11px] text-muted-foreground">
+                  {displaySessionId ? `session: ${displaySessionId}` : ""}
+                </div>
+              </div>
+            </div>
+          </div>
+
           <div className="flex-1 overflow-y-auto p-4 sm:p-6">
             <div className="mx-auto max-w-3xl space-y-6">
               <div className="flex items-center justify-between gap-3 text-xs text-muted-foreground">
@@ -837,11 +976,24 @@ export function Chat() {
                   <span>{wsStatus === "open" ? "已连接" : wsStatus === "connecting" ? "连接中" : "未连接"}</span>
                   {isSessionSwitching && <span>· 会话切换中...</span>}
                   {historyLoading && <span>· 加载历史中...</span>}
+                  {awaitingResponse && <span>· 生成中...</span>}
                 </div>
                 <div className="text-right">
                   <div className="truncate text-muted-foreground">{activeSession?.title || "会话未选择"}</div>
                   <div className="font-mono">{displaySessionId ? `session: ${displaySessionId}` : ""}</div>
                 </div>
+              </div>
+
+              <div className="flex justify-end">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={handleRetryLastUser}
+                  disabled={!lastUserMessage || wsStatus !== "open" || isSessionSwitching || awaitingResponse}
+                >
+                  <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                  重试上条
+                </Button>
               </div>
 
               {wsError && (
@@ -927,6 +1079,20 @@ export function Chat() {
                         </ReactMarkdown>
                       </div>
                     )}
+                    {msg.role === "user" && (
+                      <div className="mt-1 flex justify-end">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => handleResend(msg.content)}
+                          disabled={wsStatus !== "open" || isSessionSwitching || awaitingResponse}
+                        >
+                          <RotateCcw className="mr-1 h-3.5 w-3.5" />
+                          重发
+                        </Button>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}
@@ -943,6 +1109,8 @@ export function Chat() {
                 placeholder={
                   isSessionSwitching
                     ? "会话切换中，暂不可发送..."
+                    : awaitingResponse
+                      ? "生成中，可点击右侧停止..."
                     : wsStatus === "open"
                       ? "输入消息... (Shift + Enter 换行)"
                       : "连接中，暂不可发送..."
@@ -953,17 +1121,66 @@ export function Chat() {
               />
               <Button
                 size="icon"
+                variant={awaitingResponse ? "destructive" : "default"}
                 className="h-[60px] w-[60px] shrink-0"
-                onClick={handleSend}
-                disabled={!input.trim() || wsStatus !== "open" || isSessionSwitching}
+                onClick={awaitingResponse ? handleStopGeneration : handleSend}
+                disabled={
+                  awaitingResponse
+                    ? wsStatus !== "open" || isSessionSwitching
+                    : !input.trim() || wsStatus !== "open" || isSessionSwitching
+                }
               >
-                <Send className="h-5 w-5" />
-                <span className="sr-only">发送</span>
+                {awaitingResponse ? <Square className="h-5 w-5" /> : <Send className="h-5 w-5" />}
+                <span className="sr-only">{awaitingResponse ? "停止生成" : "发送"}</span>
               </Button>
             </div>
           </div>
         </div>
       </div>
+
+      <Drawer
+        isOpen={mobileSessionsOpen}
+        onClose={() => setMobileSessionsOpen(false)}
+        title="会话"
+        description="移动端会话列表"
+      >
+        <div className="flex h-full min-h-0 flex-col gap-3">{renderSessionPanel()}</div>
+      </Drawer>
+
+      <Modal
+        isOpen={Boolean(deleteTarget)}
+        onClose={() => {
+          if (!sessionActionLoadingId) setDeleteTarget(null)
+        }}
+        title="删除会话"
+        description={
+          deleteTarget ? `确定删除会话「${deleteTarget.title}」吗？该操作不可撤销。` : undefined
+        }
+        footer={
+          <>
+            <Button
+              variant="outline"
+              onClick={() => setDeleteTarget(null)}
+              disabled={Boolean(sessionActionLoadingId)}
+            >
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (deleteTarget) handleDeleteSession(deleteTarget).catch(() => {})
+              }}
+              disabled={Boolean(sessionActionLoadingId)}
+            >
+              {sessionActionLoadingId ? "删除中..." : "确认删除"}
+            </Button>
+          </>
+        }
+      >
+        <div className="text-sm text-muted-foreground">
+          删除后会移除该会话的聊天入口，且无法在页面直接恢复。
+        </div>
+      </Modal>
     </div>
   )
 }

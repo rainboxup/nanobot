@@ -10,6 +10,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
 
 
 class ContextBuilder:
@@ -23,7 +24,20 @@ class ContextBuilder:
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
-    def build_system_prompt(self, skill_names: list[str] | None = None) -> str:
+    def _memory_store_for(self, channel: str | None, chat_id: str | None) -> MemoryStore:
+        if str(channel or "").strip() != "web":
+            return self.memory
+        tenant_id = require_web_tenant_id(chat_id, label="chat_id")
+        tenant_workspace = resolve_tenant_memory_workspace(self.workspace, tenant_id)
+        return MemoryStore(tenant_workspace)
+
+    def build_system_prompt(
+        self,
+        skill_names: list[str] | None = None,
+        *,
+        channel: str | None = None,
+        chat_id: str | None = None,
+    ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
@@ -31,7 +45,7 @@ class ContextBuilder:
         if bootstrap:
             parts.append(bootstrap)
 
-        memory = self.memory.get_memory_context()
+        memory = self._memory_store_for(channel, chat_id).get_memory_context()
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
@@ -113,7 +127,10 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         return [
-            {"role": "system", "content": self.build_system_prompt(skill_names)},
+            {
+                "role": "system",
+                "content": self.build_system_prompt(skill_names, channel=channel, chat_id=chat_id),
+            },
             *history,
             {"role": "user", "content": self._build_runtime_context(channel, chat_id)},
             {"role": "user", "content": self._build_user_content(current_message, media)},

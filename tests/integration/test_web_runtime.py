@@ -98,6 +98,25 @@ async def test_web_ops_runtime_endpoint_exposes_runtime_snapshot_for_owner(http_
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_web_ops_runtime_endpoint_normalizes_web_session_cache_metrics(
+    http_client, auth_headers, web_ctx
+) -> None:
+    web_ctx.app.state.tenant_session_manager_max_entries = "bad"
+    web_ctx.app.state.tenant_session_managers = ["not", "a", "dict"]
+    web_ctx.app.state.tenant_session_manager_evictions_total = -9
+
+    response = await http_client.get("/api/ops/runtime", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    web_cache = dict(((body.get("runtime") or {}).get("web_session_cache") or {}))
+    assert int(web_cache.get("max_entries") or 0) == 1
+    assert int(web_cache.get("current_cached_tenant_session_managers") or 0) == 0
+    assert int(web_cache.get("evictions_total") or 0) == 0
+    assert float(web_cache.get("utilization", 1.0)) == 0.0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_web_ops_runtime_endpoint_is_owner_only(http_client, auth_headers_for) -> None:
     alice_headers = await auth_headers_for("alice-runtime", role="admin")
     response = await http_client.get("/api/ops/runtime", headers=alice_headers)

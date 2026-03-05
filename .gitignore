@@ -35,3 +35,8 @@ _bmad-output/
 .coverage
 superpowers-temp/
 tmp-cron-test/
+
+# Ignore most root-level dot-directories (local tooling/cache),
+# but keep repository metadata directories that should be versioned.
+/.*/
+!/.github/

@@ -3,6 +3,7 @@
 import re
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 def ensure_dir(path: Path) -> Path:
@@ -46,7 +47,7 @@ def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]
 
     added: list[str] = []
 
-    def _write(src, dest: Path):
+    def _write(src: Any, dest: Path) -> None:
         if dest.exists():
             return
         dest.parent.mkdir(parents=True, exist_ok=True)

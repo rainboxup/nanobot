@@ -24,6 +24,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.services.soul_paths import resolve_platform_base_soul_path
 from nanobot.session.manager import SessionManager
 from nanobot.tenants.commands import configure_link_throttle, try_handle
 from nanobot.tenants.policy import allowlist_match, resolve_exec_effective, resolve_web_effective
@@ -446,6 +447,7 @@ class MultiTenantAgentLoop:
             bus=self.bus,
             provider=provider,
             workspace=tenant.workspace,
+            platform_base_soul_path=resolve_platform_base_soul_path(config=self.system_config),
             model=tenant_cfg.agents.defaults.model,
             max_iterations=tenant_cfg.agents.defaults.max_tool_iterations,
             brave_api_key=(self.system_config.tools.web.search.api_key or None) if enable_web else None,

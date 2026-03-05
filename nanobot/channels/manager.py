@@ -10,7 +10,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, TenantChannelOverride
 from nanobot.utils.message_splitter import split_markdown
 
 if TYPE_CHECKING:
@@ -279,6 +279,69 @@ class ChannelManager:
         the core channel initialization flow.
         """
         self.channels[name] = channel
+
+    def validate_tenant_channel_override(
+        self,
+        tenant_id: str,
+        channel_name: str,
+        override: TenantChannelOverride,
+    ) -> None:
+        """Validate tenant channel override against security rules.
+
+        Validation Rules:
+        1. No privilege escalation: tenant cannot enable disabled system features
+        2. Tenant allow_from must be subset of system allow_from
+        3. Group chat requires explicit opt-in (enable_group_chat=True)
+        4. Audit logging: log all override usage
+
+        Args:
+            tenant_id: Tenant identifier.
+            channel_name: Channel name (e.g., "feishu", "dingtalk").
+            override: Tenant channel override configuration.
+
+        Raises:
+            ValueError: If validation fails.
+        """
+        # Get system channel config
+        system_channel_config = getattr(self.config.channels, channel_name, None)
+        if not system_channel_config:
+            raise ValueError(f"Unknown channel: {channel_name}")
+
+        # Rule 1: No privilege escalation - tenant cannot enable disabled system channel
+        if not system_channel_config.enabled:
+            raise ValueError(
+                f"Privilege escalation denied: channel '{channel_name}' is disabled at system level"
+            )
+
+        # Rule 2: Tenant allow_from must be subset of system allow_from
+        if override.allow_from is not None:
+            system_allow_from = set(getattr(system_channel_config, "allow_from", []))
+            tenant_allow_from = set(override.allow_from)
+
+            # If system has empty allow_from (allow all), tenant can specify any subset
+            if system_allow_from and not tenant_allow_from.issubset(system_allow_from):
+                raise ValueError(
+                    f"Privilege escalation denied: tenant allow_from must be subset of system allow_from. "
+                    f"Invalid entries: {tenant_allow_from - system_allow_from}"
+                )
+
+        # Rule 3: Group chat opt-in validation (informational - no enforcement here)
+        if override.enable_group_chat:
+            logger.info(
+                "Tenant {} opted in to group chat for channel {}",
+                tenant_id,
+                channel_name,
+            )
+
+        # Rule 4: Audit logging
+        if override.audit_overrides:
+            logger.info(
+                "Tenant channel override: tenant_id={}, channel={}, allow_from={}, enable_group_chat={}",
+                tenant_id,
+                channel_name,
+                override.allow_from,
+                override.enable_group_chat,
+            )
     def get_status(self) -> dict[str, Any]:
         """Get status of all channels."""
         return {

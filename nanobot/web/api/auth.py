@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from nanobot.tenants.store import validate_tenant_id
+from nanobot.tenants.validation import validate_tenant_id
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
 from nanobot.web.auth_cookie import clear_refresh_cookie, get_refresh_cookie, set_refresh_cookie

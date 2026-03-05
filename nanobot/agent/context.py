@@ -11,6 +11,7 @@ from typing import Any
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
+from nanobot.services.soul_layering import SoulLayeringService
 
 
 class ContextBuilder:
@@ -19,8 +20,9 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, *, platform_base_soul_path: Path | None = None):
         self.workspace = workspace
+        self.platform_base_soul_path = platform_base_soul_path
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace)
 
@@ -107,14 +109,38 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
+        try:
+            workspace_root = self.workspace.expanduser().resolve()
+        except Exception:
+            workspace_root = None
 
         for filename in self.BOOTSTRAP_FILES:
+            if filename == "SOUL.md":
+                content = self._load_layered_soul()
+                if content:
+                    parts.append(f"## {filename}\n\n{content}")
+                continue
+
             file_path = self.workspace / filename
-            if file_path.exists():
+            try:
+                if not file_path.exists() or not file_path.is_file():
+                    continue
+                if file_path.is_symlink():
+                    continue
+                if workspace_root is not None:
+                    resolved = file_path.resolve()
+                    resolved.relative_to(workspace_root)
                 content = file_path.read_text(encoding="utf-8")
                 parts.append(f"## {filename}\n\n{content}")
+            except Exception:
+                continue
 
         return "\n\n".join(parts) if parts else ""
+
+    def _load_layered_soul(self) -> str:
+        svc = SoulLayeringService(platform_base_soul_path=self.platform_base_soul_path)
+        effective = svc.generate_effective_preview(workspace=self.workspace, session_overlay=None)
+        return str(effective.merged_content or "").strip()
 
     def build_messages(
         self,

@@ -3,6 +3,14 @@ import pytest
 from nanobot.config.loader import load_config
 
 
+def _system_cfg(web_ctx):
+    return load_config(
+        config_path=web_ctx.config_path,
+        allow_env_override=False,
+        strict=True,
+    )
+
+
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_list_channels_returns_supported_channels(http_client, auth_headers) -> None:
@@ -36,6 +44,8 @@ async def test_list_channels_returns_supported_channels(http_client, auth_header
             "runtime_mode",
             "runtime_scope",
             "runtime_warning",
+            "config_scope",
+            "takes_effect",
             "writable",
             "write_block_reason_code",
             "write_block_reason",
@@ -44,10 +54,18 @@ async def test_list_channels_returns_supported_channels(http_client, auth_header
         for item in data
     )
     assert all(item["runtime_mode"] == "multi" for item in data)
-    assert all(item["runtime_scope"] == "tenant" for item in data)
+    assert all(item["runtime_scope"] == "global" for item in data)
+    assert all(item["config_scope"] == "system" for item in data)
+    assert all(item["takes_effect"] == "restart" for item in data)
+    assert all(str(item.get("runtime_warning") or "").strip() for item in data)
     assert all(item["writable"] is True for item in data)
     assert all(item["write_block_reason_code"] is None for item in data)
     assert all(item["write_block_reason"] is None for item in data)
+    assert any(
+        ("restart" in str(item.get("runtime_warning") or "").lower())
+        or (str(item.get("takes_effect") or "").strip().lower() == "restart")
+        for item in data
+    )
 
 
 @pytest.mark.integration
@@ -62,15 +80,20 @@ async def test_get_channel_status_reports_missing_fields_and_runtime(http_client
     assert "token" in body["missing_required_fields"]
     assert body["runtime_registered"] is False
     assert body["runtime_running"] is False
+    assert body["runtime_scope"] == "global"
+    assert body["config_scope"] == "system"
+    assert body["takes_effect"] == "restart"
+    assert "restart" in str(body.get("runtime_warning") or "").lower()
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_get_channel_status_becomes_ready_after_config_update(http_client, auth_headers) -> None:
+async def test_get_channel_status_becomes_ready_after_config_update(http_client, auth_headers, web_ctx) -> None:
+    token = "token-123"
     set_resp = await http_client.put(
         "/api/channels/telegram",
         headers=auth_headers,
-        json={"token": "token-123"},
+        json={"token": token},
     )
     assert set_resp.status_code == 200
 
@@ -80,6 +103,9 @@ async def test_get_channel_status_becomes_ready_after_config_update(http_client,
     assert body["name"] == "telegram"
     assert body["config_ready"] is True
     assert body["missing_required_fields"] == []
+
+    persisted = _system_cfg(web_ctx)
+    assert persisted.channels.telegram.token == token
 
 
 @pytest.mark.integration
@@ -104,13 +130,10 @@ async def test_update_channel_masks_sensitive_fields(http_client, auth_headers, 
     assert r2.status_code == 200
     cfg = r2.json()["config"]
     assert cfg["token"] != token
+    assert cfg["token"] == "****"
     assert cfg["proxy"] == "http://localhost:8888"
 
-    persisted = load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path("admin"),
-        allow_env_override=False,
-        strict=True,
-    )
+    persisted = _system_cfg(web_ctx)
     assert persisted.channels.telegram.token == token
 
 
@@ -145,20 +168,19 @@ async def test_get_channel_masks_additional_sensitive_tokens(http_client, auth_h
     whatsapp = await http_client.get("/api/channels/whatsapp", headers=auth_headers)
     assert whatsapp.status_code == 200
     assert whatsapp.json()["config"]["bridge_token"] != bridge_token
+    assert whatsapp.json()["config"]["bridge_token"] == "****"
 
     matrix = await http_client.get("/api/channels/matrix", headers=auth_headers)
     assert matrix.status_code == 200
     assert matrix.json()["config"]["access_token"] != access_token
+    assert matrix.json()["config"]["access_token"] == "****"
 
     mochat = await http_client.get("/api/channels/mochat", headers=auth_headers)
     assert mochat.status_code == 200
     assert mochat.json()["config"]["claw_token"] != claw_token
+    assert mochat.json()["config"]["claw_token"] == "****"
 
-    persisted = load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path("admin"),
-        allow_env_override=False,
-        strict=True,
-    )
+    persisted = _system_cfg(web_ctx)
     assert persisted.channels.whatsapp.bridge_token == bridge_token
     assert persisted.channels.matrix.access_token == access_token
     assert persisted.channels.mochat.claw_token == claw_token
@@ -174,6 +196,8 @@ async def test_get_channel_includes_sensitive_keys_metadata(http_client, auth_he
     assert isinstance(keys, list)
     assert "token" in keys
     assert "secret" in keys
+    assert body.get("redacted_value") == "****"
+    assert isinstance(body.get("sensitive_paths"), list)
 
 
 @pytest.mark.integration
@@ -183,12 +207,31 @@ async def test_toggle_channel_persists(http_client, auth_headers, web_ctx) -> No
     assert r.status_code == 200
     enabled = bool(r.json()["enabled"])
 
-    cfg = load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path("admin"),
-        allow_env_override=False,
-        strict=True,
-    )
+    cfg = _system_cfg(web_ctx)
     assert cfg.channels.discord.enabled is enabled
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_update_channel_ignores_redacted_sensitive_values(http_client, auth_headers, web_ctx) -> None:
+    token = "token-keep-1234567890"
+    set_resp = await http_client.put(
+        "/api/channels/telegram",
+        headers=auth_headers,
+        json={"token": token},
+    )
+    assert set_resp.status_code == 200
+
+    update_resp = await http_client.put(
+        "/api/channels/telegram",
+        headers=auth_headers,
+        json={"token": "****", "proxy": "http://localhost:9999"},
+    )
+    assert update_resp.status_code == 200
+
+    persisted = _system_cfg(web_ctx)
+    assert persisted.channels.telegram.token == token
+    assert persisted.channels.telegram.proxy == "http://localhost:9999"
 
 
 @pytest.mark.integration
@@ -234,109 +277,79 @@ async def test_channel_update_rejects_unknown_fields(http_client, auth_headers) 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_channel_updates_are_tenant_isolated(http_client, auth_headers_for, web_ctx) -> None:
-    alice_headers = await auth_headers_for("alice", role="admin")
-    bob_headers = await auth_headers_for("bob", role="admin")
+async def test_channel_updates_are_system_scoped(http_client, auth_headers, auth_headers_for, web_ctx) -> None:
+    alice_headers = await auth_headers_for("alice-channel-scope", role="admin")
+    bob_headers = await auth_headers_for("bob-channel-scope", role="admin")
 
-    r1 = await http_client.put(
-        "/api/channels/telegram",
-        headers=alice_headers,
-        json={"token": "alice-token-123"},
-    )
-    assert r1.status_code == 200
-
-    r2 = await http_client.get("/api/channels/telegram", headers=bob_headers)
-    assert r2.status_code == 200
-    bob_cfg = r2.json()["config"]
-    assert bob_cfg["token"] in ("", "****")
-
-    alice_cfg = load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path("alice"),
-        allow_env_override=False,
-        strict=True,
-    )
-    bob_cfg_file = load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path("bob"),
-        allow_env_override=False,
-        strict=True,
-    )
-    assert alice_cfg.channels.telegram.token == "alice-token-123"
-    assert bob_cfg_file.channels.telegram.token == ""
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_single_tenant_mode_exposes_channel_runtime_metadata(
-    http_client, auth_headers, web_ctx
-) -> None:
-    web_ctx.app.state.runtime_mode = "single"
-
-    resp = await http_client.get("/api/channels/telegram/status", headers=auth_headers)
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["runtime_mode"] == "single"
-    assert body["runtime_scope"] == "global"
-    assert body["writable"] is False
-    assert body["write_block_reason_code"] == "single_tenant_runtime_mode"
-    assert body["write_block_reason"] == body["runtime_warning"]
-    assert "runtime_warning" in body
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_single_tenant_mode_blocks_channel_updates(http_client, auth_headers, web_ctx) -> None:
-    web_ctx.app.state.runtime_mode = "single"
-
+    token = "token-1234567890abcdef"
     update_resp = await http_client.put(
         "/api/channels/telegram",
         headers=auth_headers,
-        json={"token": "token-123"},
+        json={"token": token},
     )
-    assert update_resp.status_code == 409
-    assert "single-tenant runtime mode" in str(update_resp.json().get("detail") or "").lower()
+    assert update_resp.status_code == 200
 
-    toggle_resp = await http_client.post("/api/channels/telegram/toggle", headers=auth_headers, json={})
-    assert toggle_resp.status_code == 409
-    assert "single-tenant runtime mode" in str(toggle_resp.json().get("detail") or "").lower()
+    alice_list = await http_client.get("/api/channels", headers=alice_headers)
+    assert alice_list.status_code == 200
+    alice_rows = {row["name"]: row for row in alice_list.json()}
+    assert alice_rows["telegram"]["config_summary"]["has_token"] is True
+
+    bob_list = await http_client.get("/api/channels", headers=bob_headers)
+    assert bob_list.status_code == 200
+    bob_rows = {row["name"]: row for row in bob_list.json()}
+    assert bob_rows["telegram"]["config_summary"]["has_token"] is True
+
+    alice_status = await http_client.get("/api/channels/telegram/status", headers=alice_headers)
+    assert alice_status.status_code == 200
+    assert alice_status.json()["config_ready"] is True
+
+    bob_status = await http_client.get("/api/channels/telegram/status", headers=bob_headers)
+    assert bob_status.status_code == 200
+    assert bob_status.json()["config_ready"] is True
+
+    persisted = _system_cfg(web_ctx)
+    assert persisted.channels.telegram.token == token
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_single_tenant_mode_channel_list_exposes_write_block_metadata(
-    http_client, auth_headers, web_ctx
-) -> None:
-    web_ctx.app.state.runtime_mode = "single"
+async def test_non_owner_admin_cannot_update_or_toggle_channel(http_client, auth_headers_for) -> None:
+    alice_headers = await auth_headers_for("alice-channel-write", role="admin")
 
-    resp = await http_client.get("/api/channels", headers=auth_headers)
+    update_resp = await http_client.put(
+        "/api/channels/telegram",
+        headers=alice_headers,
+        json={"token": "token-123"},
+    )
+    assert update_resp.status_code == 403
+
+    toggle_resp = await http_client.post(
+        "/api/channels/telegram/toggle",
+        headers=alice_headers,
+        json={},
+    )
+    assert toggle_resp.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_non_owner_admin_cannot_view_channel_config_detail(http_client, auth_headers_for) -> None:
+    alice_headers = await auth_headers_for("alice-channel-detail", role="admin")
+    resp = await http_client.get("/api/channels/telegram", headers=alice_headers)
+    assert resp.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_non_owner_admin_channel_list_is_read_only(http_client, auth_headers_for) -> None:
+    alice_headers = await auth_headers_for("alice-channel-list-ro", role="admin")
+
+    resp = await http_client.get("/api/channels", headers=alice_headers)
     assert resp.status_code == 200
     data = resp.json()
     assert isinstance(data, list)
     assert data
-    row = data[0]
-    assert row["runtime_mode"] == "single"
-    assert row["runtime_scope"] == "global"
-    assert row["writable"] is False
-    assert row["write_block_reason_code"] == "single_tenant_runtime_mode"
-    assert row["write_block_reason"] == row["runtime_warning"]
-
-
-@pytest.mark.integration
-@pytest.mark.asyncio
-async def test_single_tenant_mode_named_channel_prefers_404_before_409(
-    http_client, auth_headers, web_ctx
-) -> None:
-    web_ctx.app.state.runtime_mode = "single"
-
-    update_missing = await http_client.put(
-        "/api/channels/not-a-channel",
-        headers=auth_headers,
-        json={"token": "token-123"},
-    )
-    assert update_missing.status_code == 404
-
-    toggle_missing = await http_client.post(
-        "/api/channels/not-a-channel/toggle",
-        headers=auth_headers,
-        json={},
-    )
-    assert toggle_missing.status_code == 404
+    assert all(bool(row.get("writable")) is False for row in data)
+    assert all(str(row.get("write_block_reason_code") or "") for row in data)
+    assert all(row.get("config_scope") == "system" for row in data)
+    assert all(row.get("takes_effect") == "restart" for row in data)

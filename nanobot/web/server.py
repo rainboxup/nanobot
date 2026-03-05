@@ -753,11 +753,13 @@ def create_app(
     from nanobot.web.api.providers import router as providers_router
     from nanobot.web.api.security import router as security_router
     from nanobot.web.api.skills import router as skills_router
+    from nanobot.web.api.soul import router as soul_router
 
     app.include_router(auth_router)
     app.include_router(audit_router)
     app.include_router(providers_router)
     app.include_router(channels_router)
+    app.include_router(soul_router)
     app.include_router(cron_router)
     app.include_router(beta_router)
     app.include_router(skills_router)

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import secrets
 import shutil
 import threading
@@ -24,6 +23,11 @@ from typing import Any
 from nanobot.config.loader import load_config, save_config
 from nanobot.config.schema import Config
 from nanobot.tenants.types import TenantContext
+from nanobot.tenants.validation import (
+    ConfigOwnershipValidator,
+    ConfigValidationError,
+    validate_tenant_id,
+)
 from nanobot.utils.helpers import ensure_dir, get_data_path, safe_filename
 from nanobot.utils.workspace import create_workspace_templates
 
@@ -57,7 +61,6 @@ class TenantStoreCorruptionError(RuntimeError):
     """Raised when tenants index is corrupted and startup must abort."""
 
 
-_TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _RESERVED_TENANT_IDS = {
     ".",
     "..",
@@ -86,29 +89,21 @@ _RESERVED_TENANT_IDS = {
 }
 
 
-def normalize_tenant_id(value: str) -> str:
-    return str(value or "").strip().lower()
-
-
-def validate_tenant_id(value: str) -> str:
-    tenant_id = normalize_tenant_id(value)
-    if not tenant_id:
-        raise ValueError("tenant_id_required")
-    if tenant_id in _RESERVED_TENANT_IDS:
-        raise ValueError("tenant_id_reserved")
-    if not _TENANT_ID_RE.fullmatch(tenant_id):
-        raise ValueError("tenant_id_invalid")
-    return tenant_id
-
-
 class TenantStore:
     """A tiny JSON store for tenant identities and link codes."""
 
-    def __init__(self, base_dir: Path | None = None):
+    def __init__(self, base_dir: Path | None = None, system_config: Config | None = None):
         data_dir = base_dir or (get_data_path() / "tenants")
         self.base_dir = ensure_dir(data_dir)
         self.index_path = self.base_dir / "index.json"
         self._index_lock = threading.RLock()
+
+        # Initialize config ownership validator
+        self._system_config = system_config
+        self._validator = None
+        if system_config is not None:
+            self._validator = ConfigOwnershipValidator(system_config)
+
         # Best-effort hardening: tenant store contains identifiers + link codes.
         try:
             os.chmod(self.base_dir, 0o700)
@@ -278,7 +273,29 @@ class TenantStore:
     def load_tenant_config(self, tenant_id: str) -> Config:
         tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
-        return load_config(config_path=ctx.config_path, allow_env_override=False, strict=True)
+        tenant_cfg = load_config(config_path=ctx.config_path, allow_env_override=False, strict=True)
+
+        # Validate tenant config respects ownership boundaries
+        if self._validator is not None:
+            try:
+                tenant_cfg_dict = tenant_cfg.model_dump(exclude_unset=True)
+                self._validator.validate_tenant_config(tenant_cfg_dict, tenant_id)
+            except ConfigValidationError as e:
+                # Log validation failure and re-raise
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(
+                    f"Tenant config validation failed for {tenant_id}: {e.reason_code}",
+                    extra={
+                        "tenant_id": tenant_id,
+                        "reason_code": e.reason_code,
+                        "message": e.message,
+                        "details": e.details,
+                    },
+                )
+                raise
+
+        return tenant_cfg
 
     def save_tenant_config(self, tenant_id: str, config: Config) -> None:
         tenant_id = validate_tenant_id(tenant_id)

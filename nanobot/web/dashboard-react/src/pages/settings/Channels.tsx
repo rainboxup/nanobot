@@ -26,6 +26,11 @@ function buildSensitiveKeySet(keys?: string[] | null): Set<string> {
   return new Set(source.map((k) => String(k || "").trim().toLowerCase()).filter(Boolean))
 }
 
+function buildSensitivePathSet(paths?: string[] | null): Set<string> {
+  if (!Array.isArray(paths) || paths.length === 0) return new Set()
+  return new Set(paths.map((p) => String(p || "").trim()).filter(Boolean))
+}
+
 function isPlainObject(value: any): value is Record<string, any> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value)
 }
@@ -52,6 +57,8 @@ interface ChannelItem {
   runtime_mode?: string
   runtime_scope?: string
   runtime_warning?: string
+  config_scope?: string
+  takes_effect?: string
   writable?: boolean
   write_block_reason_code?: string | null
   write_block_reason?: string | null
@@ -61,9 +68,14 @@ interface ChannelDetail {
   name: string
   config: Record<string, any>
   sensitive_keys?: string[]
+  redacted_value?: string
+  sensitive_paths?: string[]
+  sensitive_has_value?: Record<string, boolean>
   runtime_mode?: string
   runtime_scope?: string
   runtime_warning?: string
+  config_scope?: string
+  takes_effect?: string
   writable?: boolean
   write_block_reason_code?: string | null
   write_block_reason?: string | null
@@ -79,6 +91,8 @@ interface ChannelStatus {
   runtime_mode?: string
   runtime_scope?: string
   runtime_warning?: string
+  config_scope?: string
+  takes_effect?: string
   writable?: boolean
   write_block_reason_code?: string | null
   write_block_reason?: string | null
@@ -88,7 +102,8 @@ type FieldKind = "bool" | "number" | "array" | "string" | "sensitive"
 
 export function Channels() {
   const { user, addToast } = useStore()
-  const canEdit = String(user?.role || "").toLowerCase() !== "member"
+  const role = String(user?.role || "member").toLowerCase()
+  const isOwner = role === "owner"
 
   const [channels, setChannels] = useState<ChannelItem[]>([])
   const [loading, setLoading] = useState(false)
@@ -104,21 +119,20 @@ export function Channels() {
 
   const runtimeState = useMemo(() => {
     const probe = channels.find(
-      (item) => typeof item.writable === "boolean" || String(item.runtime_mode || "").trim() !== ""
+      (item) => typeof item.writable === "boolean" || Boolean(item.runtime_warning)
     )
-    if (!probe) return { known: false, writable: true, reason: "" }
-    const writable =
-      typeof probe.writable === "boolean"
-        ? probe.writable
-        : String(probe.runtime_mode || "").trim().toLowerCase() !== "single"
-    const reason = String(probe.write_block_reason || probe.runtime_warning || "").trim()
-    return { known: true, writable, reason }
-  }, [channels])
+    const writable = typeof probe?.writable === "boolean" ? probe.writable : isOwner
+    const systemWarning = String(probe?.runtime_warning || "").trim()
+    const writeBlockedReason = String(probe?.write_block_reason || "").trim()
+    return { known: Boolean(probe), writable, systemWarning, writeBlockedReason }
+  }, [channels, isOwner])
 
-  const writeBlocked = runtimeState.known && !runtimeState.writable
-  const writeBlockedReason = runtimeState.reason || "当前运行模式禁止修改租户级渠道配置。"
-  const canWrite = canEdit && !writeBlocked
-  const writeDeniedTitle = !canEdit ? "仅 Admin/Owner 可操作" : writeBlockedReason
+  const systemWarning =
+    runtimeState.systemWarning || "渠道配置为系统级（所有租户共享），修改后需要重启服务才会生效。"
+  const writeBlocked = runtimeState.known ? !runtimeState.writable : !isOwner
+  const writeBlockedReason = runtimeState.writeBlockedReason || "仅 Owner 可以修改系统渠道配置。"
+  const canWrite = !writeBlocked
+  const writeDeniedTitle = writeBlockedReason
 
   async function loadList() {
     setLoading(true)
@@ -149,7 +163,20 @@ export function Channels() {
     [activeChannel]
   )
 
-  function initValuesFromConfig(config: Record<string, any>, sensitiveKeys: Set<string>) {
+  const activeSensitivePaths = useMemo(
+    () => buildSensitivePathSet(activeChannel?.sensitive_paths || null),
+    [activeChannel]
+  )
+
+  const activeRedactedValue = String(activeChannel?.redacted_value || "****")
+
+  function initValuesFromConfig(
+    config: Record<string, any>,
+    *,
+    sensitiveKeys: Set<string>,
+    sensitivePaths: Set<string>,
+    redactedValue: string
+  ) {
     const next: Record<string, any> = {}
 
     function walk(obj: any, prefix: string) {
@@ -164,7 +191,9 @@ export function Channels() {
         else if (typeof v === "number") next[path] = String(v)
         else if (Array.isArray(v)) next[path] = v.join(", ")
         else {
-          const isSensitive = sensitiveKeys.has(String(k || "").toLowerCase())
+          const keyLower = String(k || "").toLowerCase()
+          const isSensitive =
+            sensitivePaths.has(path) || sensitiveKeys.has(keyLower) || String(v ?? "") === redactedValue
           next[path] = isSensitive ? "" : String(v ?? "")
         }
       }
@@ -175,6 +204,10 @@ export function Channels() {
   }
 
   async function openEditor(name: string) {
+    if (!canWrite) {
+      addToast({ id: `channel:edit:${name}`, type: "error", message: writeDeniedTitle })
+      return
+    }
     setDrawerOpen(true)
     setActiveChannel(null)
     setDetailError("")
@@ -183,8 +216,13 @@ export function Channels() {
     try {
       const detail = await api.get<ChannelDetail>(`/api/channels/${encodeURIComponent(name)}`)
       const sensitiveKeys = buildSensitiveKeySet(detail.sensitive_keys || null)
+      const sensitivePaths = buildSensitivePathSet(detail.sensitive_paths || null)
       setActiveChannel(detail)
-      initValuesFromConfig(detail.config || {}, sensitiveKeys)
+      initValuesFromConfig(detail.config || {}, {
+        sensitiveKeys,
+        sensitivePaths,
+        redactedValue: String(detail.redacted_value || "****"),
+      })
     } catch (err) {
       const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "加载失败")
       setDetailError(msg)
@@ -192,13 +230,13 @@ export function Channels() {
   }
 
   async function toggleChannel(name: string) {
-    if (!canEdit) return
-    if (writeBlocked) {
-      addToast({ id: `channel:toggle:${name}`, type: "error", message: writeBlockedReason })
+    if (!canWrite) {
+      addToast({ id: `channel:toggle:${name}`, type: "error", message: writeDeniedTitle })
       return
     }
     try {
       await api.post(`/api/channels/${encodeURIComponent(name)}/toggle`, {})
+      addToast({ id: `channel:toggle:${name}`, type: "success", message: "已保存（需重启服务生效）" })
       await loadList()
     } catch (err) {
       const msg = err instanceof ApiError ? err.detail : String((err as any)?.message || "操作失败")
@@ -281,11 +319,21 @@ export function Channels() {
     )
   }
 
-  function fieldKindForValue(value: any, key: string, sensitiveKeys: Set<string>): FieldKind {
+  function fieldKindForValue(
+    value: any,
+    path: string,
+    key: string,
+    sensitiveKeys: Set<string>,
+    sensitivePaths: Set<string>,
+    redactedValue: string
+  ): FieldKind {
     if (typeof value === "boolean") return "bool"
     if (typeof value === "number") return "number"
     if (Array.isArray(value)) return "array"
-    if (sensitiveKeys.has(String(key || "").toLowerCase())) return "sensitive"
+    const keyLower = String(key || "").toLowerCase()
+    const isSensitive =
+      sensitivePaths.has(path) || sensitiveKeys.has(keyLower) || String(value ?? "") === redactedValue
+    if (isSensitive) return "sensitive"
     return "string"
   }
 
@@ -301,7 +349,7 @@ export function Channels() {
           continue
         }
 
-        const kind = fieldKindForValue(v, k, activeSensitiveKeys)
+        const kind = fieldKindForValue(v, path, k, activeSensitiveKeys, activeSensitivePaths, activeRedactedValue)
         const nextVal = values[path]
 
         if (kind === "sensitive") {
@@ -350,10 +398,9 @@ export function Channels() {
 
   async function saveConfig() {
     if (!activeChannel) return
-    if (!canEdit) return
-    if (writeBlocked) {
-      setDetailError(writeBlockedReason)
-      addToast({ id: `channel:${activeChannel.name}`, type: "error", message: writeBlockedReason })
+    if (!canWrite) {
+      setDetailError(writeDeniedTitle)
+      addToast({ id: `channel:${activeChannel.name}`, type: "error", message: writeDeniedTitle })
       return
     }
     if (saving) return
@@ -368,7 +415,11 @@ export function Channels() {
         return
       }
       await api.put(`/api/channels/${encodeURIComponent(activeChannel.name)}`, payload)
-      addToast({ id: `channel:${activeChannel.name}`, type: "success", message: "已保存" })
+      addToast({
+        id: `channel:${activeChannel.name}`,
+        type: "success",
+        message: "已保存（需重启服务生效）",
+      })
       setDrawerOpen(false)
       setActiveChannel(null)
       await loadList()
@@ -407,7 +458,7 @@ export function Channels() {
 
       if (!matchesField(path)) continue
 
-      const kind = fieldKindForValue(v, k, activeSensitiveKeys)
+      const kind = fieldKindForValue(v, path, k, activeSensitiveKeys, activeSensitivePaths, activeRedactedValue)
       const value = values[path]
       const isSensitive = kind === "sensitive"
 
@@ -448,7 +499,7 @@ export function Channels() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">渠道</h2>
-          <p className="text-muted-foreground">启用/禁用渠道并编辑配置，可直接检查接入就绪与运行状态。</p>
+          <p className="text-muted-foreground">{systemWarning} 可直接检查接入就绪与运行状态。</p>
         </div>
       </div>
 
@@ -472,14 +523,13 @@ export function Channels() {
           {error}
         </div>
       )}
-      {writeBlocked && (
-        <div className="rounded-md border border-warning/30 bg-yellow-500/10 p-3 text-sm text-yellow-800 dark:text-yellow-300">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4" />
-            {writeBlockedReason}
-          </div>
+      <div className="rounded-md border border-warning/30 bg-yellow-500/10 p-3 text-sm text-yellow-800 dark:text-yellow-300">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="h-4 w-4" />
+          {systemWarning}
         </div>
-      )}
+        {writeBlocked && <div className="mt-2 text-xs text-muted-foreground">{writeBlockedReason}</div>}
+      </div>
 
       <div className="rounded-md border bg-card">
         <Table>
@@ -560,8 +610,16 @@ export function Channels() {
           setActiveChannel(null)
           setDetailError("")
         }}
-        title={activeChannel ? `编辑：${activeChannel.name}` : "编辑渠道"}
-        description="敏感字段不会自动填充；留空将保持不变。"
+        title={
+          activeChannel
+            ? canWrite
+              ? `编辑：${activeChannel.name}`
+              : `查看：${activeChannel.name}`
+            : canWrite
+              ? "编辑渠道"
+              : "查看渠道"
+        }
+        description={`${systemWarning} 敏感字段不会自动填充；留空将保持不变。`}
         footer={
           <>
             <Button
@@ -571,11 +629,13 @@ export function Channels() {
                 setActiveChannel(null)
               }}
             >
-              取消
+              {canWrite ? "取消" : "关闭"}
             </Button>
-            <Button onClick={() => saveConfig().catch(() => {})} disabled={!activeChannel || !canWrite || saving}>
-              {saving ? "保存中..." : "保存"}
-            </Button>
+            {canWrite && (
+              <Button onClick={() => saveConfig().catch(() => {})} disabled={!activeChannel || saving}>
+                {saving ? "保存中..." : "保存"}
+              </Button>
+            )}
           </>
         }
       >
@@ -599,8 +659,12 @@ export function Channels() {
               />
             </div>
             <div className="space-y-4">{renderFields(activeChannel.config || {}, "")}</div>
-            {!canEdit && <div className="text-sm text-muted-foreground">仅 Admin/Owner 可以修改渠道配置。</div>}
-            {canEdit && writeBlocked && (
+            {!isOwner && (
+              <div className="text-sm text-muted-foreground">
+                仅 Owner 可以修改系统渠道配置；当前为只读模式。
+              </div>
+            )}
+            {isOwner && writeBlocked && (
               <div className="text-sm text-muted-foreground">{writeBlockedReason}</div>
             )}
           </div>

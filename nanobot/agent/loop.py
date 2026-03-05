@@ -57,6 +57,7 @@ class AgentLoop:
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
+        platform_base_soul_path: Path | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -98,7 +99,7 @@ class AgentLoop:
         self._filesystem_tools: list[ReadFileTool | WriteFileTool | EditFileTool | ListDirTool] = []
         self._exec_tool: ExecTool | None = None
 
-        self.context = ContextBuilder(workspace)
+        self.context = ContextBuilder(workspace, platform_base_soul_path=platform_base_soul_path)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = (

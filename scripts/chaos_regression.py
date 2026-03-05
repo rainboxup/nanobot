@@ -89,8 +89,8 @@ def _build_fake_docker(fake_bin: Path) -> None:
     docker = fake_bin / "docker"
     docker.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = \"info\" ] && [ \"$2\" = \"--format\" ]; then\n"
-        "  echo '{\"runc\":{\"path\":\"runc\"}}'\n"
+        'if [ "$1" = "info" ] && [ "$2" = "--format" ]; then\n'
+        '  echo \'{"runc":{"path":"runc"}}\'\n'
         "  exit 0\n"
         "fi\n"
         "echo 'fake docker: unsupported command' >&2\n"
@@ -137,7 +137,9 @@ async def scenario_corrupt_index() -> ScenarioResult:
                 "startup log should include TenantStoreCorruptionError",
             )
             _require(backups, "corrupted backup file was not created")
-            _require(backups[-1].read_text(encoding="utf-8") == bad_payload, "backup content mismatch")
+            _require(
+                backups[-1].read_text(encoding="utf-8") == bad_payload, "backup content mismatch"
+            )
 
             return ScenarioResult(
                 name=name,
@@ -166,7 +168,9 @@ async def scenario_ingress_panic() -> ScenarioResult:
                 max_pending_per_tenant=1,
             )
 
-            first = InboundMessage(channel="telegram", sender_id="u-1", chat_id="c-1", content="first")
+            first = InboundMessage(
+                channel="telegram", sender_id="u-1", chat_id="c-1", content="first"
+            )
             admit1 = await ingress._admit(first)
             _require(admit1.accepted, "first message should be admitted")
             tenant_id = str((first.metadata or {}).get("tenant_id") or "")

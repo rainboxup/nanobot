@@ -14,7 +14,7 @@ from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
+from nanobot.channels.base import BaseChannel, MessageType
 from nanobot.config.schema import DingTalkConfig
 
 try:
@@ -70,12 +70,22 @@ class NanobotDingTalkHandler(CallbackHandler):
             sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
             sender_name = chatbot_msg.sender_nick or "Unknown"
 
-            logger.info("Received DingTalk message from {} ({}): {}", sender_name, sender_id, content)
+            # Extract conversation type and ID for group chat support
+            # conversationType: "1" = private, "2" = group
+            conversation_type = message.data.get("conversationType", "1")
+            conversation_id = message.data.get("conversationId")
+
+            logger.info(
+                "Received DingTalk message from {} ({}) [type={}]: {}",
+                sender_name, sender_id, conversation_type, content
+            )
 
             # Forward to Nanobot via _on_message (non-blocking).
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
-                self.channel._on_message(content, sender_id, sender_name)
+                self.channel._on_message(
+                    content, sender_id, sender_name, conversation_type, conversation_id
+                )
             )
             self.channel._background_tasks.add(task)
             task.add_done_callback(self.channel._background_tasks.discard)
@@ -204,9 +214,12 @@ class DingTalkChannel(BaseChannel):
 
     def _guess_upload_type(self, media_ref: str) -> str:
         ext = Path(urlparse(media_ref).path).suffix.lower()
-        if ext in self._IMAGE_EXTS: return "image"
-        if ext in self._AUDIO_EXTS: return "voice"
-        if ext in self._VIDEO_EXTS: return "video"
+        if ext in self._IMAGE_EXTS:
+            return "image"
+        if ext in self._AUDIO_EXTS:
+            return "voice"
+        if ext in self._VIDEO_EXTS:
+            return "video"
         return "file"
 
     def _guess_filename(self, media_ref: str, upload_type: str) -> str:
@@ -316,8 +329,10 @@ class DingTalkChannel(BaseChannel):
             if resp.status_code != 200:
                 logger.error("DingTalk send failed msgKey={} status={} body={}", msg_key, resp.status_code, body[:500])
                 return False
-            try: result = resp.json()
-            except Exception: result = {}
+            try:
+                result = resp.json()
+            except Exception:
+                result = {}
             errcode = result.get("errcode")
             if errcode not in (None, 0):
                 logger.error("DingTalk send api error msgKey={} errcode={} body={}", msg_key, errcode, body[:500])
@@ -417,22 +432,54 @@ class DingTalkChannel(BaseChannel):
                 f"[Attachment send failed: {filename}]",
             )
 
-    async def _on_message(self, content: str, sender_id: str, sender_name: str) -> None:
+    async def _on_message(
+        self,
+        content: str,
+        sender_id: str,
+        sender_name: str,
+        conversation_type: str = "1",
+        conversation_id: str | None = None,
+    ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
         Delegates to BaseChannel._handle_message() which enforces allow_from
         permission checks before publishing to the bus.
+
+        Args:
+            content: Message text content.
+            sender_id: Sender's staff_id or user_id.
+            sender_name: Sender's display name.
+            conversation_type: "1" for private, "2" for group.
+            conversation_id: Conversation identifier (group ID for group chats).
         """
         try:
             logger.info("DingTalk inbound: {} from {}", content, sender_name)
+
+            # Determine message type and group_id based on conversation_type
+            message_type = MessageType.PRIVATE
+            group_id = None
+            chat_id = sender_id  # Default to sender_id for private chat
+
+            if conversation_type == "2":
+                # Group conversation
+                message_type = MessageType.GROUP
+                group_id = conversation_id
+                # Reply privately by default (safer in multi-tenant mode and compatible with batchSend API).
+                chat_id = sender_id
+                logger.debug("Received group message from conversation_id={}", conversation_id)
+
             await self._handle_message(
                 sender_id=sender_id,
-                chat_id=sender_id,  # For private chat, chat_id == sender_id
+                chat_id=chat_id,
                 content=str(content),
                 metadata={
                     "sender_name": sender_name,
                     "platform": "dingtalk",
+                    "conversation_type": conversation_type,
+                    "conversation_id": conversation_id,
                 },
+                message_type=message_type,
+                group_id=group_id,
             )
         except Exception as e:
             logger.error("Error publishing DingTalk message: {}", e)

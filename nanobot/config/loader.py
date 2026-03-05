@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 from types import UnionType
@@ -340,8 +341,24 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
     data = config.model_dump()
     data = convert_to_camel(data)
 
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     # Best-effort hardening: config contains API keys; keep it user-readable only.
     try:

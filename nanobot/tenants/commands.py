@@ -74,7 +74,10 @@ def _prune_link_guard_locked(now: float) -> None:
 def _link_guard_maybe_gc_locked(now: float) -> None:
     global _LINK_GC_COUNTER
     _LINK_GC_COUNTER += 1
-    if _LINK_GC_COUNTER % _LINK_GC_EVERY_CALLS == 0 or len(_LINK_THROTTLE) > _LINK_STATE_MAX_ENTRIES:
+    if (
+        _LINK_GC_COUNTER % _LINK_GC_EVERY_CALLS == 0
+        or len(_LINK_THROTTLE) > _LINK_STATE_MAX_ENTRIES
+    ):
         _prune_link_guard_locked(now)
 
 
@@ -119,6 +122,8 @@ def _is_group(metadata: dict) -> bool:
     if metadata.get("is_group") is True:
         return True
     if metadata.get("chat_type") == "group":
+        return True
+    if str(metadata.get("conversation_type") or "").strip() == "2":
         return True
     if metadata.get("guild_id"):
         return True
@@ -261,6 +266,11 @@ def try_handle(
         )
 
     if cmd == "link":
+        if _is_group(metadata):
+            return CommandResult(
+                handled=True,
+                reply="⚠️ 为了安全，请在私聊/DM 中使用 !link（避免在群里泄露绑定码）。",
+            )
         if not args:
             code = store.create_link_code(tenant.tenant_id)
             return CommandResult(

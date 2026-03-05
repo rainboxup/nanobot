@@ -11,6 +11,7 @@ import { Chat } from "./pages/Chat"
 import { Settings, SettingsIndex, getAllowedSettingsTabs, getDefaultSettingsTab, type SettingsTab } from "./pages/Settings"
 import { Providers } from "./pages/settings/Providers"
 import { Channels } from "./pages/settings/Channels"
+import { Soul } from "./pages/settings/Soul"
 import { ToolsPolicy } from "./pages/settings/ToolsPolicy"
 import { Cron } from "./pages/settings/Cron"
 import { Beta } from "./pages/settings/Beta"
@@ -106,6 +107,7 @@ export default function App() {
             <Route index element={<SettingsIndex />} />
             <Route path="providers" element={<SettingsRouteGuard tab="providers"><Providers /></SettingsRouteGuard>} />
             <Route path="channels" element={<SettingsRouteGuard tab="channels"><Channels /></SettingsRouteGuard>} />
+            <Route path="soul" element={<SettingsRouteGuard tab="soul"><Soul /></SettingsRouteGuard>} />
             <Route path="tools" element={<SettingsRouteGuard tab="tools"><ToolsPolicy /></SettingsRouteGuard>} />
             <Route path="cron" element={<SettingsRouteGuard tab="cron"><Cron /></SettingsRouteGuard>} />
             <Route path="beta" element={<SettingsRouteGuard tab="beta"><Beta /></SettingsRouteGuard>} />

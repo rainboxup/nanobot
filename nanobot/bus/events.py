@@ -8,7 +8,11 @@ from typing import Any
 
 @dataclass
 class InboundMessage:
-    """Message received from a chat channel."""
+    """Message received from a chat channel.
+
+    Supports multiple message types (private, group, broadcast) for multi-channel integration.
+    Group messages require explicit handling (e.g., @mention detection) by channel implementations.
+    """
 
     channel: str  # telegram, discord, slack, whatsapp
     sender_id: str  # User identifier
@@ -19,6 +23,8 @@ class InboundMessage:
     metadata: dict[str, Any] = field(default_factory=dict)  # Channel-specific data
     session_id: str | None = None  # Optional override for session routing (legacy)
     session_key_override: str | None = None  # Optional override for thread-scoped sessions
+    message_type: str = "private"  # Message type: "private", "group", or "broadcast"
+    group_id: str | None = None  # Group identifier for group messages
 
     @property
     def session_key(self) -> str:

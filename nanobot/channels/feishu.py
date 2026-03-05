@@ -5,7 +5,6 @@ import json
 import os
 import re
 import threading
-import time
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any
@@ -14,7 +13,7 @@ from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.channels.base import BaseChannel
+from nanobot.channels.base import BaseChannel, MessageType
 from nanobot.config.schema import FeishuConfig
 
 try:
@@ -371,6 +370,53 @@ class FeishuChannel(BaseChannel):
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(None, self._add_reaction_sync, message_id, emoji_type)
 
+    def _is_bot_mentioned(self, message: Any) -> bool:
+        """
+        Check if bot is mentioned in a group message.
+
+        Args:
+            message: Feishu message object from event.
+
+        Returns:
+            True if bot is mentioned, False otherwise.
+        """
+        try:
+            # Check mentions field for bot mention
+            mentions = getattr(message, "mentions", None)
+            if mentions:
+                for mention in mentions:
+                    # Bot mention has id.user_id or id.open_id
+                    mention_id = getattr(mention, "id", None)
+                    if mention_id:
+                        # Check if it's a bot mention (tenant_key indicates bot)
+                        if hasattr(mention_id, "tenant_key") and mention_id.tenant_key:
+                            return True
+            return False
+        except Exception as e:
+            logger.debug("Error checking bot mention: {}", e)
+            return False
+
+    def _extract_group_id(self, message: Any) -> str | None:
+        """
+        Extract group_id from Feishu message.
+
+        Args:
+            message: Feishu message object from event.
+
+        Returns:
+            Group chat_id if available, None otherwise.
+        """
+        try:
+            # For group messages, chat_id is the group identifier
+            chat_id = getattr(message, "chat_id", None)
+            chat_type = getattr(message, "chat_type", None)
+            if chat_type == "group" and chat_id:
+                return chat_id
+            return None
+        except Exception as e:
+            logger.debug("Error extracting group_id: {}", e)
+            return None
+
     # Regex to match markdown tables (header + separator + data rows)
     _TABLE_RE = re.compile(
         r"((?:^[ \t]*\|.+\|[ \t]*\n)(?:^[ \t]*\|[-:\s|]+\|[ \t]*\n)(?:^[ \t]*\|.+\|[ \t]*\n?)+)",
@@ -697,6 +743,17 @@ class FeishuChannel(BaseChannel):
             chat_type = message.chat_type
             msg_type = message.message_type
 
+            # Determine message type and group_id
+            message_type = MessageType.PRIVATE
+            group_id = None
+
+            if chat_type == "group":
+                message_type = MessageType.GROUP
+                group_id = chat_id
+                # For group messages, check if bot is mentioned (optional: can be enforced by config)
+                # Currently allowing all group messages where bot is added
+                logger.debug("Received group message from chat_id={}", chat_id)
+
             # Add reaction
             await self._add_reaction(message_id, self.config.react_emoji)
 
@@ -748,7 +805,9 @@ class FeishuChannel(BaseChannel):
                 return
 
             # Forward to message bus
-            reply_to = chat_id if chat_type == "group" else sender_id
+            # Reply privately by default to avoid leaking tenant context into group chats.
+            # Group replies should be an explicit opt-in with mention gating.
+            reply_to = sender_id
             await self._handle_message(
                 sender_id=sender_id,
                 chat_id=reply_to,
@@ -758,7 +817,9 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
-                }
+                },
+                message_type=message_type,
+                group_id=group_id,
             )
 
         except Exception as e:

@@ -8,11 +8,7 @@ from pathlib import Path
 
 
 def iter_shell_scripts(repo_root: Path) -> list[Path]:
-    return sorted(
-        path
-        for path in repo_root.rglob("*.sh")
-        if ".git" not in path.parts
-    )
+    return sorted(path for path in repo_root.rglob("*.sh") if ".git" not in path.parts)
 
 
 def main() -> int:

@@ -1,12 +1,20 @@
 """Base channel interface for chat platforms."""
 
 from abc import ABC, abstractmethod
+from enum import Enum
 from typing import Any
 
 from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+
+
+class MessageType(str, Enum):
+    """Message type classification for multi-channel support."""
+    PRIVATE = "private"  # 1:1 private chat
+    GROUP = "group"      # Group chat (requires @mention or explicit opt-in)
+    BROADCAST = "broadcast"  # Broadcast/announcement messages
 
 
 class BaseChannel(ABC):
@@ -91,6 +99,8 @@ class BaseChannel(ABC):
         media: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         session_key: str | None = None,
+        message_type: "MessageType | None" = None,
+        group_id: str | None = None,
     ) -> None:
         """
         Handle an incoming message from the chat platform.
@@ -104,6 +114,8 @@ class BaseChannel(ABC):
             media: Optional list of media URLs.
             metadata: Optional channel-specific metadata.
             session_key: Optional session key override (e.g. thread-scoped sessions).
+            message_type: Message type (PRIVATE, GROUP, BROADCAST). Defaults to PRIVATE.
+            group_id: Group identifier for group messages.
         """
         if not self.is_allowed(sender_id):
             logger.warning(
@@ -121,6 +133,8 @@ class BaseChannel(ABC):
             media=media or [],
             metadata=metadata or {},
             session_key_override=session_key,
+            message_type=message_type.value if message_type else MessageType.PRIVATE.value,
+            group_id=group_id,
         )
 
         await self.bus.publish_inbound(msg)

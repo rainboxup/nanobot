@@ -2,22 +2,26 @@
 
 from __future__ import annotations
 
+import asyncio
+from pathlib import Path
 from typing import Any, get_args, get_origin
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ValidationError
 
-from nanobot.config.schema import ChannelsConfig
+from nanobot.config.loader import save_config
+from nanobot.config.schema import ChannelsConfig, Config
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
-from nanobot.web.tenant import load_tenant_config
 
 router = APIRouter()
 
-_SINGLE_TENANT_WRITE_BLOCK_DETAIL = (
-    "Tenant-scoped updates are disabled in single-tenant runtime mode; "
-    "update global runtime configuration instead."
+_CHANNEL_CONFIG_SYSTEM_SCOPE_WARNING = (
+    "Channel configuration is system-scoped and shared across tenants. "
+    "Changes require a service restart to take effect."
 )
+
+_CHANNEL_CONFIG_WRITE_BLOCK_DETAIL = "Only owner can modify system channel configuration."
 
 
 SENSITIVE_KEYS = {
@@ -37,6 +41,7 @@ SENSITIVE_KEYS = {
 }
 
 SENSITIVE_KEY_SUFFIXES = ("token", "secret", "password", "key")
+_REDACTED_VALUE = "****"
 
 REQUIRED_FIELDS: dict[str, list[str]] = {
     "telegram": ["token"],
@@ -64,9 +69,7 @@ REQUIRED_TRUE_FIELDS: dict[str, list[str]] = {
 
 
 def _mask_value(value: str) -> str:
-    if len(value) <= 8:
-        return "****"
-    return f"{value[:4]}****{value[-4:]}"
+    return _REDACTED_VALUE
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -92,6 +95,87 @@ def _mask_sensitive(obj: Any) -> Any:
     if isinstance(obj, list):
         return [_mask_sensitive(x) for x in obj]
     return obj
+
+
+def _redact_sensitive(obj: Any, *, prefix: str = "") -> tuple[Any, set[str], dict[str, bool]]:
+    sensitive_paths: set[str] = set()
+    has_value: dict[str, bool] = {}
+
+    if isinstance(obj, dict):
+        out: dict[str, Any] = {}
+        for k, v in obj.items():
+            path = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                redacted, paths, present = _redact_sensitive(v, prefix=path)
+                out[k] = redacted
+                sensitive_paths.update(paths)
+                has_value.update(present)
+                continue
+            if isinstance(v, list):
+                redacted_items: list[Any] = []
+                for item in v:
+                    if isinstance(item, dict):
+                        red_item, paths, present = _redact_sensitive(item, prefix=path)
+                        redacted_items.append(red_item)
+                        sensitive_paths.update(paths)
+                        has_value.update(present)
+                    else:
+                        redacted_items.append(item)
+                out[k] = redacted_items
+                continue
+
+            if _is_sensitive_key(str(k)) and isinstance(v, str):
+                present = bool(v.strip())
+                sensitive_paths.add(path)
+                has_value[path] = present
+                out[k] = _REDACTED_VALUE if present else ""
+                continue
+
+            out[k] = v
+        return out, sensitive_paths, has_value
+
+    if isinstance(obj, list):
+        out_list: list[Any] = []
+        for item in obj:
+            if isinstance(item, dict):
+                red_item, paths, present = _redact_sensitive(item, prefix=prefix)
+                out_list.append(red_item)
+                sensitive_paths.update(paths)
+                has_value.update(present)
+            else:
+                out_list.append(item)
+        return out_list, sensitive_paths, has_value
+
+    return obj, sensitive_paths, has_value
+
+
+def _prune_sensitive_updates(update: dict[str, Any]) -> dict[str, Any]:
+    def _walk(obj: Any) -> Any:
+        if not isinstance(obj, dict):
+            return obj
+        cleaned: dict[str, Any] = {}
+        for k, v in obj.items():
+            if isinstance(v, dict):
+                nested = _walk(v)
+                if isinstance(nested, dict) and not nested:
+                    continue
+                cleaned[k] = nested
+                continue
+
+            if _is_sensitive_key(str(k)):
+                if v is None:
+                    continue
+                if isinstance(v, str):
+                    text = v.strip()
+                    if not text:
+                        continue
+                    if text == _REDACTED_VALUE:
+                        continue
+            cleaned[k] = v
+        return cleaned
+
+    cleaned = _walk(update)
+    return cleaned if isinstance(cleaned, dict) else {}
 
 
 def _strip_optional(annotation: Any) -> Any:
@@ -272,50 +356,78 @@ def _runtime_mode(request: Request) -> str:
     return "single" if mode == "single" else "multi"
 
 
-def _runtime_scope(runtime_mode: str) -> str:
-    return "global" if runtime_mode == "single" else "tenant"
+def _system_config(request: Request) -> Config:
+    cfg = getattr(request.app.state, "config", None)
+    if isinstance(cfg, Config):
+        return cfg
+    raise HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail="System config unavailable",
+    )
 
 
-def _runtime_warning(runtime_mode: str) -> str | None:
-    if runtime_mode == "single":
-        return _SINGLE_TENANT_WRITE_BLOCK_DETAIL
-    return None
+def _system_config_path(request: Request) -> Path | None:
+    raw = getattr(request.app.state, "config_path", None)
+    if raw is None:
+        return None
+    if isinstance(raw, Path):
+        return raw
+    try:
+        return Path(str(raw))
+    except Exception:
+        return None
 
 
-def _write_status(runtime_mode: str) -> dict[str, Any]:
-    if runtime_mode == "single":
+def _system_config_lock(request: Request) -> asyncio.Lock:
+    lock = getattr(request.app.state, "system_config_lock", None)
+    if isinstance(lock, asyncio.Lock):
+        return lock
+    lock = asyncio.Lock()
+    request.app.state.system_config_lock = lock
+    return lock
+
+
+def _takes_effect() -> str:
+    return "restart"
+
+
+def _config_scope() -> str:
+    return "system"
+
+
+def _write_status(user: dict[str, Any]) -> dict[str, Any]:
+    role = str(user.get("role") or "").strip().lower()
+    if role == "owner":
         return {
-            "writable": False,
-            "write_block_reason_code": "single_tenant_runtime_mode",
-            "write_block_reason": _SINGLE_TENANT_WRITE_BLOCK_DETAIL,
+            "writable": True,
+            "write_block_reason_code": None,
+            "write_block_reason": None,
         }
     return {
-        "writable": True,
-        "write_block_reason_code": None,
-        "write_block_reason": None,
+        "writable": False,
+        "write_block_reason_code": "owner_required",
+        "write_block_reason": _CHANNEL_CONFIG_WRITE_BLOCK_DETAIL,
     }
 
 
-def _attach_runtime_meta(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
-    mode = _runtime_mode(request)
-    payload["runtime_mode"] = mode
-    payload["runtime_scope"] = _runtime_scope(mode)
-    write_status = _write_status(mode)
+def _attach_runtime_meta(
+    request: Request, *, user: dict[str, Any], payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload["runtime_mode"] = _runtime_mode(request)
+    payload["runtime_scope"] = "global"
+    payload["config_scope"] = _config_scope()
+    payload["takes_effect"] = _takes_effect()
+    payload["runtime_warning"] = _CHANNEL_CONFIG_SYSTEM_SCOPE_WARNING
+    write_status = _write_status(user)
     payload["writable"] = bool(write_status["writable"])
     payload["write_block_reason_code"] = write_status["write_block_reason_code"]
     payload["write_block_reason"] = write_status["write_block_reason"]
-    warning = _runtime_warning(mode)
-    if warning:
-        payload["runtime_warning"] = warning
     return payload
 
 
-def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
-    if _runtime_mode(request) == "single":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL)
-
-
-def _channel_status_payload(name: str, cfg: BaseModel, request: Request) -> dict[str, Any]:
+def _channel_status_payload(
+    name: str, cfg: BaseModel, request: Request, *, user: dict[str, Any]
+) -> dict[str, Any]:
     missing_required_fields = _channel_missing_required_fields(name, cfg)
     runtime_registered, runtime_running = _channel_runtime_state(request, name)
     enabled = bool(getattr(cfg, "enabled", False))
@@ -327,7 +439,7 @@ def _channel_status_payload(name: str, cfg: BaseModel, request: Request) -> dict
         "runtime_registered": runtime_registered,
         "runtime_running": runtime_running,
     }
-    return _attach_runtime_meta(request, payload)
+    return _attach_runtime_meta(request, user=user, payload=payload)
 
 
 def _audit(
@@ -344,9 +456,13 @@ def _audit(
         event=event,
         status="succeeded",
         actor=str(user.get("sub") or "").strip() or None,
-        tenant_id=str(user.get("tenant_id") or "").strip() or None,
+        tenant_id=None,
         ip=request_ip(request),
-        metadata=metadata or {},
+        metadata={
+            "config_scope": "system",
+            **({"actor_tenant_id": str(user.get("tenant_id") or "").strip()} if user.get("tenant_id") else {}),
+            **(metadata or {}),
+        },
     )
 
 
@@ -354,12 +470,13 @@ def _audit(
 async def list_channels(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
-    _tenant_id, _store, cfg = load_tenant_config(request, user)
+    require_min_role(user, "admin")
+    cfg = _system_config(request)
 
     result: list[dict[str, Any]] = []
     for name in _channel_names():
         ch_cfg = getattr(cfg.channels, name)
-        status_payload = _channel_status_payload(name, ch_cfg, request)
+        status_payload = _channel_status_payload(name, ch_cfg, request, user=user)
         result.append(
             {
                 "name": name,
@@ -372,6 +489,8 @@ async def list_channels(
                 "runtime_mode": status_payload.get("runtime_mode"),
                 "runtime_scope": status_payload.get("runtime_scope"),
                 "runtime_warning": status_payload.get("runtime_warning"),
+                "config_scope": status_payload.get("config_scope"),
+                "takes_effect": status_payload.get("takes_effect"),
                 "writable": bool(status_payload.get("writable", True)),
                 "write_block_reason_code": status_payload.get("write_block_reason_code"),
                 "write_block_reason": status_payload.get("write_block_reason"),
@@ -384,25 +503,32 @@ async def list_channels(
 async def get_channel(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
+    require_min_role(user, "owner")
     _ensure_channel(name)
-    _tenant_id, _store, cfg = load_tenant_config(request, user)
+    cfg = _system_config(request)
     ch_cfg: BaseModel = getattr(cfg.channels, name)
+    raw = ch_cfg.model_dump()
+    redacted, sensitive_paths, sensitive_has_value = _redact_sensitive(raw)
     payload = {
         "name": name,
-        "config": _mask_sensitive(ch_cfg.model_dump()),
+        "config": redacted,
         "sensitive_keys": sorted(list(SENSITIVE_KEYS)),
+        "redacted_value": _REDACTED_VALUE,
+        "sensitive_paths": sorted(list(sensitive_paths)),
+        "sensitive_has_value": sensitive_has_value,
     }
-    return _attach_runtime_meta(request, payload)
+    return _attach_runtime_meta(request, user=user, payload=payload)
 
 
 @router.get("/api/channels/{name}/status")
 async def get_channel_status(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
+    require_min_role(user, "admin")
     _ensure_channel(name)
-    _tenant_id, _store, cfg = load_tenant_config(request, user)
+    cfg = _system_config(request)
     ch_cfg: BaseModel = getattr(cfg.channels, name)
-    return _channel_status_payload(name, ch_cfg, request)
+    return _channel_status_payload(name, ch_cfg, request, user=user)
 
 
 @router.put("/api/channels/{name}")
@@ -412,52 +538,55 @@ async def update_channel(
     request: Request,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "owner")
     _ensure_channel(name)
-    _ensure_tenant_scoped_writes_allowed(request)
-    tenant_id, store, cfg = load_tenant_config(request, user)
+    cfg = _system_config(request)
     current: BaseModel = getattr(cfg.channels, name)
+    update = _prune_sensitive_updates(update)
     _ensure_no_unknown_fields(current.__class__, update)
 
-    merged = _deep_merge(current.model_dump(), update)
-    try:
-        updated = current.__class__.model_validate(merged)
-    except ValidationError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
-    setattr(cfg.channels, name, updated)
-    store.save_tenant_config(tenant_id, cfg)
-    _audit(
-        request,
-        event="config.channel.update",
-        user=user,
-        metadata={"channel": name},
-    )
+    async with _system_config_lock(request):
+        merged = _deep_merge(current.model_dump(), update)
+        try:
+            updated = current.__class__.model_validate(merged)
+        except ValidationError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+        setattr(cfg.channels, name, updated)
+        save_config(cfg, config_path=_system_config_path(request))
+        _audit(
+            request,
+            event="config.channel.update",
+            user=user,
+            metadata={"channel": name},
+        )
 
-    return {"name": name, "config": _mask_sensitive(updated.model_dump())}
+        payload = {"name": name, "config": _mask_sensitive(updated.model_dump())}
+        return _attach_runtime_meta(request, user=user, payload=payload)
 
 
 @router.post("/api/channels/{name}/toggle")
 async def toggle_channel(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "owner")
     _ensure_channel(name)
-    _ensure_tenant_scoped_writes_allowed(request)
-    tenant_id, store, cfg = load_tenant_config(request, user)
-    current: BaseModel = getattr(cfg.channels, name)
+    cfg = _system_config(request)
+    async with _system_config_lock(request):
+        current: BaseModel = getattr(cfg.channels, name)
 
-    new_enabled = not bool(getattr(current, "enabled", False))
-    try:
-        updated = current.__class__.model_validate({**current.model_dump(), "enabled": new_enabled})
-    except ValidationError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
-    setattr(cfg.channels, name, updated)
-    store.save_tenant_config(tenant_id, cfg)
-    _audit(
-        request,
-        event="config.channel.toggle",
-        user=user,
-        metadata={"channel": name, "enabled": bool(new_enabled)},
-    )
+        new_enabled = not bool(getattr(current, "enabled", False))
+        try:
+            updated = current.__class__.model_validate({**current.model_dump(), "enabled": new_enabled})
+        except ValidationError as e:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+        setattr(cfg.channels, name, updated)
+        save_config(cfg, config_path=_system_config_path(request))
+        _audit(
+            request,
+            event="config.channel.toggle",
+            user=user,
+            metadata={"channel": name, "enabled": bool(new_enabled)},
+        )
 
-    return {"name": name, "enabled": new_enabled}
+        payload = {"name": name, "enabled": new_enabled}
+        return _attach_runtime_meta(request, user=user, payload=payload)

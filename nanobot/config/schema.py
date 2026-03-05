@@ -184,6 +184,23 @@ class QQConfig(Base):
     secret: str = ""  # 机器人密钥 (AppSecret) from q.qq.com
     allow_from: list[str] = Field(default_factory=list)  # Allowed user openids (empty = public access)
 
+
+class TenantChannelOverride(Base):
+    """Tenant-level channel configuration overrides with security boundaries.
+
+    Allows tenants to customize channel behavior within system-defined constraints.
+    All overrides are subject to validation rules:
+    - No privilege escalation (cannot enable disabled system features)
+    - Tenant allow_from must be subset of system allow_from
+    - Group chat requires explicit opt-in
+    - All overrides are audited
+    """
+
+    allow_from: list[str] | None = None  # Tenant-specific allow list (must be subset of system allow_from)
+    enable_group_chat: bool = False  # Explicit opt-in for group chat support (default: private-only)
+    audit_overrides: bool = True  # Log all override usage for security auditing
+
+
 class ChannelsConfig(Base):
     """Configuration for chat channels."""
 

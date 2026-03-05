@@ -1,6 +1,7 @@
 import pytest
 
 from nanobot.config.loader import load_config
+from nanobot.config.schema import ProvidersConfig
 
 
 def _tenant_cfg(web_ctx, tenant_id: str):
@@ -18,22 +19,17 @@ async def test_list_providers_returns_core_fields(http_client, auth_headers) -> 
     assert r.status_code == 200
     data = r.json()
     assert isinstance(data, list)
-    names = {item["name"] for item in data}
-    core = {
-        "anthropic",
-        "openai",
-        "openrouter",
-        "deepseek",
-        "groq",
-        "zhipu",
-        "dashscope",
-        "vllm",
-        "gemini",
-        "moonshot",
-        "aihubmix",
-    }
-    assert core.issubset(names)
-    assert all({"name", "has_key", "api_base", "masked_key"} <= item.keys() for item in data)
+    by_name = {item["name"]: item for item in data}
+    assert set(by_name.keys()) == set(ProvidersConfig.model_fields.keys())
+    assert all(
+        {"name", "provider_kind", "supports_api_key", "has_key", "api_base", "masked_key"}
+        <= item.keys()
+        for item in data
+    )
+    assert by_name["openai_codex"]["provider_kind"] == "oauth"
+    assert by_name["openai_codex"]["supports_api_key"] is False
+    assert by_name["openai_codex"]["has_key"] is False
+    assert by_name["openai_codex"]["masked_key"] is None
 
 
 @pytest.mark.integration
@@ -92,6 +88,11 @@ async def test_update_provider_defaults_persists(http_client, auth_headers, web_
     body = r.json()
     assert body["model"] == "openai/gpt-4o-mini"
     assert body["provider"] == "openai"
+    assert body["runtime_mode"] == "multi"
+    assert body["runtime_scope"] == "tenant"
+    assert body["writable"] is True
+    assert body["write_block_reason_code"] is None
+    assert body["write_block_reason"] is None
 
     r2 = await http_client.get("/api/providers/defaults", headers=auth_headers)
     assert r2.status_code == 200
@@ -274,7 +275,7 @@ async def test_update_provider_defaults_accepts_hyphen_provider_alias(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_update_provider_defaults_model_only_preserves_invalid_stored_provider(
+async def test_update_provider_defaults_model_only_normalizes_invalid_stored_provider(
     http_client, auth_headers, web_ctx
 ) -> None:
     cfg = _tenant_cfg(web_ctx, "admin")
@@ -293,7 +294,7 @@ async def test_update_provider_defaults_model_only_preserves_invalid_stored_prov
 
     persisted = _tenant_cfg(web_ctx, "admin")
     assert persisted.agents.defaults.model == "openai/gpt-4o-mini"
-    assert persisted.agents.defaults.provider == "legacy-provider"
+    assert persisted.agents.defaults.provider == "auto"
 
 
 @pytest.mark.integration
@@ -399,6 +400,45 @@ async def test_put_provider_extra_headers_roundtrip(http_client, auth_headers) -
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_put_provider_masks_sensitive_extra_headers(http_client, auth_headers, web_ctx) -> None:
+    payload = {
+        "extra_headers": {
+            "Authorization": "Bearer super-secret-token",
+            "X-API-Key": "sensitive-header-value",
+            "X-AuthToken": "x-auth-token-secret",
+            "X-AccessToken": "x-access-token-secret",
+            "X-App-Code": "public-code",
+        }
+    }
+    r = await http_client.put("/api/providers/openai", headers=auth_headers, json=payload)
+    assert r.status_code == 200
+    body_headers = r.json()["extra_headers"]
+    assert body_headers["Authorization"] != payload["extra_headers"]["Authorization"]
+    assert body_headers["X-API-Key"] != payload["extra_headers"]["X-API-Key"]
+    assert body_headers["X-AuthToken"] != payload["extra_headers"]["X-AuthToken"]
+    assert body_headers["X-AccessToken"] != payload["extra_headers"]["X-AccessToken"]
+    assert body_headers["X-App-Code"] == "public-code"
+
+    r2 = await http_client.get("/api/providers/openai", headers=auth_headers)
+    assert r2.status_code == 200
+    get_headers = r2.json()["extra_headers"]
+    assert get_headers["Authorization"] == body_headers["Authorization"]
+    assert get_headers["X-API-Key"] == body_headers["X-API-Key"]
+    assert get_headers["X-AuthToken"] == body_headers["X-AuthToken"]
+    assert get_headers["X-AccessToken"] == body_headers["X-AccessToken"]
+    assert get_headers["X-App-Code"] == "public-code"
+
+    cfg = _tenant_cfg(web_ctx, "admin")
+    assert cfg.providers.openai.extra_headers is not None
+    assert cfg.providers.openai.extra_headers["Authorization"] == "Bearer super-secret-token"
+    assert cfg.providers.openai.extra_headers["X-API-Key"] == "sensitive-header-value"
+    assert cfg.providers.openai.extra_headers["X-AuthToken"] == "x-auth-token-secret"
+    assert cfg.providers.openai.extra_headers["X-AccessToken"] == "x-access-token-secret"
+    assert cfg.providers.openai.extra_headers["X-App-Code"] == "public-code"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_invalid_provider_returns_404(http_client, auth_headers) -> None:
     r = await http_client.get("/api/providers/not-a-provider", headers=auth_headers)
     assert r.status_code == 404
@@ -409,7 +449,44 @@ async def test_invalid_provider_returns_404(http_client, auth_headers) -> None:
 async def test_provider_path_accepts_hyphen_alias(http_client, auth_headers) -> None:
     r = await http_client.get("/api/providers/openai-codex", headers=auth_headers)
     assert r.status_code == 200
-    assert r.json()["name"] == "openai_codex"
+    body = r.json()
+    assert body["name"] == "openai_codex"
+    assert body["provider_kind"] == "oauth"
+    assert body["supports_api_key"] is False
+    assert body["has_key"] is False
+    assert body["masked_key"] is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_put_oauth_provider_rejects_api_key_update(http_client, auth_headers) -> None:
+    r = await http_client.put(
+        "/api/providers/openai-codex",
+        headers=auth_headers,
+        json={"api_key": "sk-oauth-should-not-be-accepted"},
+    )
+    assert r.status_code == 422
+    detail = str(r.json().get("detail") or "").lower()
+    assert "oauth" in detail
+    assert "api_key" in detail
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_put_oauth_provider_rejects_direct_config_fields(http_client, auth_headers) -> None:
+    for payload, field in (
+        ({"api_base": "https://oauth.example.com"}, "api_base"),
+        ({"extra_headers": {"X-App-Code": "abc"}}, "extra_headers"),
+    ):
+        r = await http_client.put(
+            "/api/providers/openai-codex",
+            headers=auth_headers,
+            json=payload,
+        )
+        assert r.status_code == 422
+        detail = str(r.json().get("detail") or "").lower()
+        assert "oauth" in detail
+        assert field in detail
 
 
 @pytest.mark.integration
@@ -503,3 +580,58 @@ async def test_provider_changes_are_audited(http_client, auth_headers) -> None:
     assert provider_events.status_code == 200
     provider_rows = provider_events.json()
     assert any(str(item.get("metadata", {}).get("provider") or "") == "openai" for item in provider_rows)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_single_tenant_mode_exposes_provider_runtime_metadata(
+    http_client, auth_headers, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+
+    resp = await http_client.get("/api/providers/defaults", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["runtime_mode"] == "single"
+    assert body["runtime_scope"] == "global"
+    assert body["writable"] is False
+    assert body["write_block_reason_code"] == "single_tenant_runtime_mode"
+    assert body["write_block_reason"] == body["runtime_warning"]
+    assert "runtime_warning" in body
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_single_tenant_mode_blocks_provider_updates(http_client, auth_headers, web_ctx) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+
+    resp = await http_client.put(
+        "/api/providers/defaults",
+        headers=auth_headers,
+        json={"model": "openai/gpt-4o-mini", "provider": "openai"},
+    )
+    assert resp.status_code == 409
+    assert "single-tenant runtime mode" in str(resp.json().get("detail") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_single_tenant_mode_named_provider_prefers_404_before_409(
+    http_client, auth_headers, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+
+    missing_resp = await http_client.put(
+        "/api/providers/not-a-provider",
+        headers=auth_headers,
+        json={"api_key": "anything"},
+    )
+    assert missing_resp.status_code == 404
+
+    blocked_resp = await http_client.put(
+        "/api/providers/openai",
+        headers=auth_headers,
+        json={"api_key": "anything"},
+    )
+    assert blocked_resp.status_code == 409
+    assert "single-tenant runtime mode" in str(blocked_resp.json().get("detail") or "").lower()

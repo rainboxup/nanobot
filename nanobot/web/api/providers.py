@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -15,11 +16,79 @@ from nanobot.web.tenant import load_tenant_config
 
 router = APIRouter()
 
+_SINGLE_TENANT_WRITE_BLOCK_DETAIL = (
+    "Tenant-scoped updates are disabled in single-tenant runtime mode; "
+    "update global runtime configuration instead."
+)
+
+SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "proxy-authorization",
+    "x-api-key",
+    "api-key",
+    "cookie",
+    "set-cookie",
+}
+
+SENSITIVE_HEADER_COMPACT_NAMES = {
+    "authorization",
+    "proxyauthorization",
+    "apikey",
+    "authtoken",
+    "accesstoken",
+    "clientsecret",
+}
+
 
 def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "****"
     return f"{key[:4]}****{key[-4:]}"
+
+
+def _header_key_parts(value: str) -> set[str]:
+    return {part for part in re.split(r"[^a-z0-9]+", value.lower()) if part}
+
+
+def _is_sensitive_header_key(key: str) -> bool:
+    normalized = str(key or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in SENSITIVE_HEADER_NAMES:
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    if compact in SENSITIVE_HEADER_COMPACT_NAMES:
+        return True
+    if "token" in compact and any(marker in compact for marker in ("auth", "access", "api", "client")):
+        return True
+    if "secret" in compact and any(marker in compact for marker in ("client", "api", "auth")):
+        return True
+
+    parts = _header_key_parts(normalized)
+    if {"authorization", "token", "secret", "password"} & parts:
+        return True
+    if "apikey" in parts:
+        return True
+    if "api" in parts and "key" in parts:
+        return True
+    if "auth" in parts and "key" in parts:
+        return True
+    if "access" in parts and "key" in parts:
+        return True
+    if "token" in parts and {"auth", "access", "api", "client"} & parts:
+        return True
+    if "secret" in parts and {"auth", "api", "client"} & parts:
+        return True
+    return False
+
+
+def _mask_extra_headers(extra_headers: dict[str, str] | None) -> dict[str, str] | None:
+    if extra_headers is None:
+        return None
+    return {
+        k: _mask_key(v) if _is_sensitive_header_key(k) and isinstance(v, str) and v else v
+        for k, v in extra_headers.items()
+    }
 
 
 def _provider_name_set() -> set[str]:
@@ -39,6 +108,19 @@ def _provider_names() -> list[str]:
         if name not in used:
             names.append(name)
     return names
+
+
+def _provider_kind(name: str) -> str:
+    spec = find_by_name(name)
+    if spec and bool(getattr(spec, "is_oauth", False)):
+        return "oauth"
+    if spec and bool(getattr(spec, "is_direct", False)):
+        return "direct"
+    return "api_key"
+
+
+def _provider_supports_api_key(name: str) -> bool:
+    return _provider_kind(name) != "oauth"
 
 
 def _ensure_provider(name: str) -> str:
@@ -153,6 +235,74 @@ def _agent_defaults_payload(cfg: Any) -> dict[str, Any]:
     }
 
 
+def _runtime_mode(request: Request) -> str:
+    mode = str(getattr(request.app.state, "runtime_mode", "multi") or "multi").strip().lower()
+    return "single" if mode == "single" else "multi"
+
+
+def _runtime_scope(runtime_mode: str) -> str:
+    return "global" if runtime_mode == "single" else "tenant"
+
+
+def _runtime_warning(runtime_mode: str) -> str | None:
+    if runtime_mode == "single":
+        return _SINGLE_TENANT_WRITE_BLOCK_DETAIL
+    return None
+
+
+def _write_status(runtime_mode: str) -> dict[str, Any]:
+    if runtime_mode == "single":
+        return {
+            "writable": False,
+            "write_block_reason_code": "single_tenant_runtime_mode",
+            "write_block_reason": _SINGLE_TENANT_WRITE_BLOCK_DETAIL,
+        }
+    return {
+        "writable": True,
+        "write_block_reason_code": None,
+        "write_block_reason": None,
+    }
+
+
+def _attach_runtime_meta(request: Request, payload: dict[str, Any]) -> dict[str, Any]:
+    mode = _runtime_mode(request)
+    payload["runtime_mode"] = mode
+    payload["runtime_scope"] = _runtime_scope(mode)
+    write_status = _write_status(mode)
+    payload["writable"] = bool(write_status["writable"])
+    payload["write_block_reason_code"] = write_status["write_block_reason_code"]
+    payload["write_block_reason"] = write_status["write_block_reason"]
+    warning = _runtime_warning(mode)
+    if warning:
+        payload["runtime_warning"] = warning
+    return payload
+
+
+def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
+    if _runtime_mode(request) == "single":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL)
+
+
+def _provider_response_payload(
+    *, name: str, provider: ProviderConfig, include_extra_headers: bool
+) -> dict[str, Any]:
+    supports_api_key = _provider_supports_api_key(name)
+    api_key = str(provider.api_key or "")
+    payload: dict[str, Any] = {
+        "name": name,
+        "provider_kind": _provider_kind(name),
+        "supports_api_key": supports_api_key,
+        "api_base": provider.api_base,
+        "has_key": bool(api_key) if supports_api_key else False,
+        "masked_key": _mask_key(api_key) if supports_api_key and api_key else None,
+    }
+    if include_extra_headers:
+        payload["extra_headers"] = _mask_extra_headers(provider.extra_headers)
+    if not supports_api_key:
+        payload["auth_hint"] = "OAuth provider; manage credentials via account linking, not api_key."
+    return payload
+
+
 @router.get("/api/providers")
 async def list_providers(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -161,16 +311,8 @@ async def list_providers(
 
     result: list[dict[str, Any]] = []
     for name in _provider_names():
-        p: ProviderConfig = getattr(cfg.providers, name)
-        api_key = str(p.api_key or "")
-        result.append(
-            {
-                "name": name,
-                "has_key": bool(api_key),
-                "api_base": p.api_base,
-                "masked_key": _mask_key(api_key) if api_key else None,
-            }
-        )
+        provider: ProviderConfig = getattr(cfg.providers, name)
+        result.append(_provider_response_payload(name=name, provider=provider, include_extra_headers=False))
     return result
 
 
@@ -179,7 +321,7 @@ async def get_provider_defaults(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
     _tenant_id, _store, cfg = load_tenant_config(request, user)
-    return _agent_defaults_payload(cfg)
+    return _attach_runtime_meta(request, _agent_defaults_payload(cfg))
 
 
 @router.put("/api/providers/defaults")
@@ -189,16 +331,17 @@ async def update_provider_defaults(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
     tenant_id, store, cfg = load_tenant_config(request, user)
 
     data = update.model_dump(exclude_unset=True)
     if not data:
-        return _agent_defaults_payload(cfg)
+        return _attach_runtime_meta(request, _agent_defaults_payload(cfg))
 
     defaults = cfg.agents.defaults
     next_model = str(getattr(defaults, "model", "") or "").strip()
-    current_provider_raw = _normalize_forced_provider(getattr(defaults, "provider", "auto"))
-    next_provider_raw = current_provider_raw
+    current_provider = _sanitize_forced_provider(getattr(defaults, "provider", "auto"))
+    next_provider = current_provider
 
     if "model" in data:
         next_model = str(data["model"] or "").strip()
@@ -209,25 +352,21 @@ async def update_provider_defaults(
             )
 
     if "provider" in data:
-        next_provider_raw = _normalize_forced_provider(data["provider"])
-        _ensure_forced_provider(next_provider_raw)
+        next_provider = _normalize_forced_provider(data["provider"])
+        _ensure_forced_provider(next_provider)
 
-    validation_provider = next_provider_raw if _is_valid_forced_provider(next_provider_raw) else "auto"
-    _validate_model_provider_pair(next_model, validation_provider)
+    _validate_model_provider_pair(next_model, next_provider)
 
     defaults.model = next_model
-    if "provider" in data:
-        defaults.provider = next_provider_raw
-    elif _is_valid_forced_provider(current_provider_raw):
-        defaults.provider = current_provider_raw
+    defaults.provider = next_provider
     store.save_tenant_config(tenant_id, cfg)
     _audit(
         request,
         event="config.agent_defaults.update",
         user=user,
-        metadata={"model": next_model, "provider": validation_provider},
+        metadata={"model": next_model, "provider": next_provider},
     )
-    return _agent_defaults_payload(cfg)
+    return _attach_runtime_meta(request, _agent_defaults_payload(cfg))
 
 
 @router.get("/api/providers/{name}")
@@ -236,15 +375,8 @@ async def get_provider(
 ) -> dict[str, Any]:
     name = _ensure_provider(name)
     _tenant_id, _store, cfg = load_tenant_config(request, user)
-    p: ProviderConfig = getattr(cfg.providers, name)
-    api_key = str(p.api_key or "")
-    return {
-        "name": name,
-        "api_base": p.api_base,
-        "extra_headers": p.extra_headers,
-        "has_key": bool(api_key),
-        "masked_key": _mask_key(api_key) if api_key else None,
-    }
+    provider: ProviderConfig = getattr(cfg.providers, name)
+    return _provider_response_payload(name=name, provider=provider, include_extra_headers=True)
 
 
 @router.put("/api/providers/{name}")
@@ -256,6 +388,21 @@ async def update_provider(
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     name = _ensure_provider(name)
+    _ensure_tenant_scoped_writes_allowed(request)
+    if not _provider_supports_api_key(name):
+        disallowed = sorted(
+            set(update.model_fields_set) & {"api_key", "api_base", "extra_headers"}
+        )
+        if disallowed:
+            fields = ", ".join(disallowed)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=(
+                    f"provider '{name}' uses OAuth and does not accept direct config fields "
+                    f"({fields}); use OAuth account linking instead."
+                ),
+            )
+
     tenant_id, store, cfg = load_tenant_config(request, user)
     current: ProviderConfig = getattr(cfg.providers, name)
 
@@ -272,12 +419,4 @@ async def update_provider(
         user=user,
         metadata={"provider": name},
     )
-
-    api_key = str(updated.api_key or "")
-    return {
-        "name": name,
-        "api_base": updated.api_base,
-        "extra_headers": updated.extra_headers,
-        "has_key": bool(api_key),
-        "masked_key": _mask_key(api_key) if api_key else None,
-    }
+    return _provider_response_payload(name=name, provider=updated, include_extra_headers=True)

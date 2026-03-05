@@ -15,6 +15,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.message import MessageTool
@@ -93,6 +94,9 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.enable_spawn = enable_spawn
         self.enable_exec = enable_exec
+        self._default_fs_allowed_dir = self.workspace if self.restrict_to_workspace else None
+        self._filesystem_tools: list[ReadFileTool | WriteFileTool | EditFileTool | ListDirTool] = []
+        self._exec_tool: ExecTool | None = None
 
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
@@ -109,6 +113,7 @@ class AgentLoop:
                 brave_api_key=brave_api_key,
                 exec_config=self.exec_config,
                 restrict_to_workspace=restrict_to_workspace,
+                enable_exec=enable_exec,
             )
             if enable_spawn
             else None
@@ -128,7 +133,7 @@ class AgentLoop:
 
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
-        allowed_dir = self.workspace if self.restrict_to_workspace else None
+        allowed_dir = self._default_fs_allowed_dir
         fs = self.filesystem_config
         max_read = fs.max_read_bytes
         max_write = fs.max_write_bytes
@@ -136,25 +141,37 @@ class AgentLoop:
         quota_mib = fs.workspace_quota_mib
         max_entries = fs.max_list_entries
 
-        self.tools.register(ReadFileTool(allowed_dir=allowed_dir, max_read_bytes=max_read))
-        self.tools.register(
-            WriteFileTool(
-                allowed_dir=allowed_dir,
-                max_write_bytes=max_write,
-                workspace_quota_mib=quota_mib,
-            )
+        read_tool = ReadFileTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+            max_read_bytes=max_read,
         )
-        self.tools.register(
-            EditFileTool(
-                allowed_dir=allowed_dir,
-                max_edit_bytes=max_edit,
-                max_write_bytes=max_write,
-                workspace_quota_mib=quota_mib,
-            )
+        write_tool = WriteFileTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+            max_write_bytes=max_write,
+            workspace_quota_mib=quota_mib,
         )
-        self.tools.register(ListDirTool(allowed_dir=allowed_dir, max_entries=max_entries))
+        edit_tool = EditFileTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+            max_edit_bytes=max_edit,
+            max_write_bytes=max_write,
+            workspace_quota_mib=quota_mib,
+        )
+        list_tool = ListDirTool(
+            workspace=self.workspace,
+            allowed_dir=allowed_dir,
+            max_entries=max_entries,
+        )
+        self._filesystem_tools = [read_tool, write_tool, edit_tool, list_tool]
+
+        self.tools.register(read_tool)
+        self.tools.register(write_tool)
+        self.tools.register(edit_tool)
+        self.tools.register(list_tool)
         if self.enable_exec:
-            self.tools.register(ExecTool(
+            exec_tool = ExecTool(
                 working_dir=str(self.workspace),
                 timeout=self.exec_config.timeout,
                 restrict_to_workspace=self.restrict_to_workspace,
@@ -167,22 +184,25 @@ class AgentLoop:
                 memory_mib=self.exec_config.memory_mib,
                 pids_limit=self.exec_config.pids_limit,
                 output_limit=self.exec_config.output_limit,
-            ))
-        self.tools.register(
-            WebSearchTool(
-                api_key=self.brave_api_key or self.web_config.search.api_key,
-                max_results=self.web_config.search.max_results,
             )
-        )
-        self.tools.register(
-            WebFetchTool(
-                max_chars=self.web_config.fetch.max_chars,
-                max_download_bytes=self.web_config.fetch.max_download_bytes,
-                timeout_s=self.web_config.fetch.timeout_s,
-                max_redirects=self.web_config.fetch.max_redirects,
-                allow_private_network=self.web_config.fetch.allow_private_network,
+            self._exec_tool = exec_tool
+            self.tools.register(exec_tool)
+        if bool(getattr(self.web_config, "enabled", True)):
+            self.tools.register(
+                WebSearchTool(
+                    api_key=self.brave_api_key or self.web_config.search.api_key,
+                    max_results=self.web_config.search.max_results,
+                )
             )
-        )
+            self.tools.register(
+                WebFetchTool(
+                    max_chars=self.web_config.fetch.max_chars,
+                    max_download_bytes=self.web_config.fetch.max_download_bytes,
+                    timeout_s=self.web_config.fetch.timeout_s,
+                    max_redirects=self.web_config.fetch.max_redirects,
+                    allow_private_network=self.web_config.fetch.allow_private_network,
+                )
+            )
         self.tools.register(
             MessageTool(send_callback=self.bus.publish_outbound, allow_target_override=True)
         )
@@ -213,7 +233,19 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
-    def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
+    def _filesystem_allowed_dir_for_context(self, channel: str, chat_id: str) -> Path | None:
+        if channel != "web":
+            return self._default_fs_allowed_dir
+        tenant_id = require_web_tenant_id(chat_id, label="chat_id")
+        return resolve_tenant_memory_workspace(self.workspace, tenant_id)
+
+    def _set_tool_context(
+        self,
+        channel: str,
+        chat_id: str,
+        message_id: str | None = None,
+        session_key: str | None = None,
+    ) -> None:
         """Update context for all tools that need routing info."""
         for name in ("message", "spawn", "cron"):
             tool = self.tools.get(name)
@@ -222,10 +254,21 @@ class AgentLoop:
             try:
                 if name == "message":
                     tool.set_context(channel, chat_id, message_id)
+                elif name == "spawn":
+                    tool.set_context(channel, chat_id, session_key)
                 else:
                     tool.set_context(channel, chat_id)
             except TypeError:
                 tool.set_context(channel, chat_id)
+
+        fs_allowed_dir = self._filesystem_allowed_dir_for_context(channel, chat_id)
+        fs_workspace = fs_allowed_dir or self.workspace
+        for tool in self._filesystem_tools:
+            tool.set_allowed_dir(fs_allowed_dir, workspace=fs_workspace)
+
+        if self._exec_tool is not None:
+            exec_workspace = fs_allowed_dir or self.workspace
+            self._exec_tool.working_dir = str(exec_workspace)
 
     @staticmethod
     def _strip_think(text: str | None) -> str | None:
@@ -352,11 +395,17 @@ class AgentLoop:
                 await t
             except (asyncio.CancelledError, Exception):
                 pass
-        sub_cancelled = await self.subagents.cancel_by_session(msg.session_key)
+        sub_cancelled = (
+            await self.subagents.cancel_by_session(msg.session_key)
+            if self.subagents is not None
+            else 0
+        )
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
+        stop_meta = dict(msg.metadata or {})
+        stop_meta["_response_state"] = "stopped"
         await self.bus.publish_outbound(OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=content,
+            channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=stop_meta,
         ))
 
     async def _dispatch(self, msg: InboundMessage) -> None:
@@ -376,9 +425,12 @@ class AgentLoop:
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
+                error_meta = dict(msg.metadata or {})
+                error_meta["_response_state"] = "failed"
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Sorry, I encountered an error.",
+                    metadata=error_meta,
                 ))
 
     async def close_mcp(self) -> None:
@@ -402,6 +454,14 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
+        base_metadata = dict(msg.metadata or {})
+
+        def _response_metadata(state: str = "completed", **extra: str | bool | int) -> dict:
+            metadata = dict(base_metadata)
+            metadata["_response_state"] = state
+            metadata.update(extra)
+            return metadata
+
         # System messages: parse origin from chat_id ("channel:chat_id")
         if msg.channel == "system":
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
@@ -409,7 +469,12 @@ class AgentLoop:
             logger.info("Processing system message from {}", msg.sender_id)
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
-            self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
+            self._set_tool_context(
+                channel,
+                chat_id,
+                msg.metadata.get("message_id"),
+                session_key=key,
+            )
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
@@ -419,12 +484,13 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
-                                  content=final_content or "Background task completed.")
+                                  content=final_content or "Background task completed.",
+                                  metadata=_response_metadata())
 
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info("Processing message from {}:{}: {}", msg.channel, msg.sender_id, preview)
 
-        key = session_key or msg.session_key
+        key = self._resolve_message_session_key(msg, session_key)
         session = self.sessions.get_or_create(key)
 
         # Slash commands
@@ -442,12 +508,14 @@ class AgentLoop:
                             return OutboundMessage(
                                 channel=msg.channel, chat_id=msg.chat_id,
                                 content="Memory archival failed, session not cleared. Please try again.",
+                                metadata=_response_metadata("failed"),
                             )
             except Exception:
                 logger.exception("/new archival failed for {}", session.key)
                 return OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
                     content="Memory archival failed, session not cleared. Please try again.",
+                    metadata=_response_metadata("failed"),
                 )
             finally:
                 self._consolidating.discard(session.key)
@@ -457,10 +525,12 @@ class AgentLoop:
             if hasattr(self.sessions, "invalidate"):
                 self.sessions.invalidate(session.key)
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="New session started.")
+                                  content="New session started.",
+                                  metadata=_response_metadata())
         if cmd == "/help":
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
-                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands")
+                                  content="🐈 nanobot commands:\n/new — Start a new conversation\n/stop — Stop the current task\n/help — Show available commands",
+                                  metadata=_response_metadata())
 
         unconsolidated = len(session.messages) - session.last_consolidated
         if (unconsolidated >= self.memory_window and session.key not in self._consolidating):
@@ -480,7 +550,12 @@ class AgentLoop:
             _task = asyncio.create_task(_consolidate_and_unlock())
             self._consolidation_tasks.add(_task)
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+        self._set_tool_context(
+            msg.channel,
+            msg.chat_id,
+            msg.metadata.get("message_id"),
+            session_key=key,
+        )
         if message_tool := self.tools.get("message"):
             if isinstance(message_tool, MessageTool):
                 if hasattr(message_tool, "start_turn"):
@@ -498,6 +573,7 @@ class AgentLoop:
             meta = dict(msg.metadata or {})
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
+            meta["_response_state"] = "delta"
             await self.bus.publish_outbound(OutboundMessage(
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
@@ -519,7 +595,7 @@ class AgentLoop:
         logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
         return OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=msg.metadata or {},
+            metadata=_response_metadata(),
         )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
@@ -546,9 +622,33 @@ class AgentLoop:
             session.messages.append(entry)
         session.updated_at = datetime.now()
 
+    @staticmethod
+    def _validate_web_session_boundary(*, chat_id: str, session_key: str) -> None:
+        if session_key != chat_id:
+            raise ValueError("web session boundary mismatch: session_key must equal chat_id")
+        chat_tenant = require_web_tenant_id(chat_id, label="chat_id")
+        session_tenant = require_web_tenant_id(session_key, label="session_key")
+        if session_tenant != chat_tenant:
+            raise ValueError("web session boundary mismatch: tenant mismatch")
+
+    def _resolve_message_session_key(self, msg: InboundMessage, session_key: str | None) -> str:
+        resolved = str(session_key or msg.session_key or "").strip()
+        if not resolved:
+            raise ValueError("missing session key")
+        if msg.channel == "web":
+            chat_id = str(msg.chat_id or "").strip()
+            self._validate_web_session_boundary(chat_id=chat_id, session_key=resolved)
+        return resolved
+
+    def _memory_workspace_for_session(self, session_key: str | None) -> Path:
+        text = str(session_key or "").strip()
+        tenant_id = require_web_tenant_id(text, label="session_key") if text.startswith("web:") else None
+        return resolve_tenant_memory_workspace(self.workspace, tenant_id)
+
     async def _consolidate_memory(self, session, archive_all: bool = False) -> bool:
         """Delegate to MemoryStore.consolidate(). Returns True on success."""
-        return await MemoryStore(self.workspace).consolidate(
+        memory_workspace = self._memory_workspace_for_session(getattr(session, "key", ""))
+        return await MemoryStore(memory_workspace).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
         )

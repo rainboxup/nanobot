@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from types import UnionType
+from typing import Any, Union, get_args, get_origin
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
+from pydantic_settings.sources.providers.env import parse_env_vars
 
 from nanobot.config.profiles import apply_profile_defaults
 from nanobot.config.schema import (
@@ -54,6 +57,96 @@ def get_data_dir() -> Path:
     return get_data_path()
 
 
+def _strip_optional_annotation(annotation: Any) -> Any:
+    """Return T for Optional[T], otherwise return annotation unchanged."""
+    origin = get_origin(annotation)
+    if origin not in (Union, UnionType):
+        return annotation
+
+    args = tuple(arg for arg in get_args(annotation) if arg is not type(None))
+    if len(args) == 1:
+        return args[0]
+    return annotation
+
+
+def _as_model_type(annotation: Any) -> type[BaseModel] | None:
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
+
+
+def _collect_unknown_config_keys_for_annotation(
+    value: Any, annotation: Any, *, path: tuple[str, ...]
+) -> list[str]:
+    annotation = _strip_optional_annotation(annotation)
+
+    model_type = _as_model_type(annotation)
+    if model_type is not None:
+        if isinstance(value, dict):
+            return _collect_unknown_config_keys(value, model_type, path=path)
+        return []
+
+    origin = get_origin(annotation)
+    if origin in (dict, Mapping) and isinstance(value, dict):
+        args = get_args(annotation)
+        value_annotation = args[1] if len(args) == 2 else Any
+        value_model = _as_model_type(_strip_optional_annotation(value_annotation))
+        if value_model is None:
+            return []
+
+        unknown: list[str] = []
+        for mapping_key, mapping_value in value.items():
+            unknown.extend(
+                _collect_unknown_config_keys(
+                    mapping_value,
+                    value_model,
+                    path=path + (str(mapping_key),),
+                )
+            )
+        return unknown
+
+    return []
+
+
+def _collect_unknown_config_keys(
+    data: Any,
+    model_type: type[BaseModel],
+    *,
+    path: tuple[str, ...] = (),
+) -> list[str]:
+    if not isinstance(data, dict):
+        return []
+
+    unknown: list[str] = []
+    for raw_key, value in data.items():
+        key = str(raw_key)
+        field = model_type.model_fields.get(key)
+        if field is None:
+            unknown.append(".".join(path + (key,)))
+            continue
+        unknown.extend(
+            _collect_unknown_config_keys_for_annotation(
+                value,
+                field.annotation,
+                path=path + (key,),
+            )
+        )
+    return unknown
+
+
+def _ensure_no_unknown_config_keys(data: dict[str, Any]) -> None:
+    unknown = sorted(set(_collect_unknown_config_keys(data, Config)))
+    if not unknown:
+        return
+
+    max_keys = 8
+    shown = unknown[:max_keys]
+    message = ", ".join(shown)
+    if len(unknown) > max_keys:
+        message += f", ... (+{len(unknown) - max_keys} more)"
+    raise ValueError(f"Unknown config keys in strict mode: {message}")
+
+
 def load_config(
     config_path: Path | None = None,
     *,
@@ -62,7 +155,8 @@ def load_config(
 ) -> Config:
     """Load configuration from file + profile defaults + optional env overrides."""
     path = config_path or get_config_path()
-    profile_name = os.getenv("NANOBOT_PROFILE") if allow_env_override else None
+    env_snapshot: dict[str, str] | None = dict(os.environ) if allow_env_override else None
+    profile_name = env_snapshot.get("NANOBOT_PROFILE") if env_snapshot is not None else None
 
     data: dict[str, Any] = {}
     if path.exists():
@@ -86,16 +180,40 @@ def load_config(
 
     merged = apply_profile_defaults(convert_keys(data), profile_name)
     try:
+        if strict:
+            _ensure_no_unknown_config_keys(merged)
+
         if allow_env_override:
+            if strict:
+                # Strict mode surfaces validation errors directly, including bad env overrides.
+                return Config(**merged)
             # Use BaseSettings init so NANOBOT_* env vars can override file/profile values.
-            return Config(**merged)
+            # In non-strict mode, prune only invalid env keys and keep valid overrides.
+            config, ignored_env_keys, env_error = _build_config_with_pruned_env_overrides(
+                merged, env_snapshot=env_snapshot or {}
+            )
+            if config is not None:
+                if ignored_env_keys:
+                    print(
+                        "Warning: Ignoring invalid NANOBOT_* env overrides: "
+                        + ", ".join(sorted(ignored_env_keys))
+                    )
+                return config
+            if env_error is not None:
+                raise env_error
 
         # Strict isolation mode: use only file + code defaults, never process env.
-        return _build_config_without_env(merged, strict_section_types=strict)
-    except ValidationError as e:
+        # Non-strict mode still rejects root/section shape errors and degrades with warnings.
+        return _build_config_without_env(merged, strict_section_types=True)
+    except (ValidationError, ValueError) as e:
         if strict:
-            raise ValueError(f"Failed to validate config from {path}: {e}") from e
-        print(f"Warning: Failed to validate config from {path}: {e}")
+            if isinstance(e, ValidationError):
+                raise ValueError(f"Failed to validate config from {path}: {e}") from e
+            raise
+        if isinstance(e, ValidationError):
+            print(f"Warning: Failed to validate config from {path}: {e}")
+        else:
+            print(f"Warning: Failed to validate config structure from {path}: {e}")
         print(
             "Using profile/default configuration."
             if not allow_env_override
@@ -103,8 +221,108 @@ def load_config(
         )
         fallback = apply_profile_defaults({}, profile_name)
         if allow_env_override:
-            return Config(**fallback)
+            config, ignored_env_keys, fallback_error = _build_config_with_pruned_env_overrides(
+                fallback, env_snapshot=env_snapshot or {}
+            )
+            if config is not None:
+                if ignored_env_keys:
+                    print(
+                        "Warning: Ignoring invalid NANOBOT_* env overrides: "
+                        + ", ".join(sorted(ignored_env_keys))
+                    )
+                return config
+            if fallback_error is not None:
+                print(f"Warning: Failed to apply fallback env overrides: {fallback_error}")
+            return _build_config_without_env(fallback, strict_section_types=False)
         return _build_config_without_env(fallback)
+
+
+def _build_config_with_pruned_env_overrides(
+    data: dict[str, Any],
+    *,
+    env_snapshot: Mapping[str, str],
+) -> tuple[Config | None, set[str], ValidationError | None]:
+    """Build config while pruning only invalid NANOBOT_* env keys."""
+    ignored_env_keys: set[str] = set()
+    last_error: ValidationError | None = None
+
+    while True:
+        try:
+            config = _build_config_from_env_snapshot(
+                data, env_snapshot=env_snapshot, ignored_env_keys=ignored_env_keys
+            )
+            return config, ignored_env_keys, None
+        except ValidationError as error:
+            last_error = error
+
+        newly_invalid = _collect_invalid_env_keys(last_error, env_snapshot=env_snapshot)
+        newly_invalid -= ignored_env_keys
+        if not newly_invalid:
+            return None, ignored_env_keys, last_error
+        ignored_env_keys.update(newly_invalid)
+
+
+def _build_config_from_env_snapshot(
+    data: dict[str, Any],
+    *,
+    env_snapshot: Mapping[str, str],
+    ignored_env_keys: set[str],
+) -> Config:
+    """Build config from explicit env snapshot without mutating process os.environ."""
+    filtered_env: dict[str, str] = {
+        key: value for key, value in env_snapshot.items() if key not in ignored_env_keys
+    }
+
+    class _ConfigWithSnapshot(Config):
+        @classmethod
+        def settings_customise_sources(
+            cls,
+            settings_cls,
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            file_secret_settings,
+        ):
+            env_settings.env_vars = parse_env_vars(
+                filtered_env,
+                env_settings.case_sensitive,
+                env_settings.env_ignore_empty,
+                env_settings.env_parse_none_str,
+            )
+            return env_settings, init_settings, dotenv_settings, file_secret_settings
+
+    return _ConfigWithSnapshot(**data)
+
+
+def _collect_invalid_env_keys(
+    error: ValidationError, *, env_snapshot: Mapping[str, str]
+) -> set[str]:
+    """Collect NANOBOT_* env keys that map to validation error locations."""
+    invalid_env_keys: set[str] = set()
+    for item in error.errors():
+        loc = item.get("loc")
+        if not isinstance(loc, tuple):
+            continue
+        env_key = _validation_loc_to_env_key(loc)
+        if env_key and env_key in env_snapshot:
+            invalid_env_keys.add(env_key)
+    return invalid_env_keys
+
+
+def _validation_loc_to_env_key(loc: tuple[Any, ...]) -> str | None:
+    """Map pydantic validation location to NANOBOT_* env var key."""
+    if not loc:
+        return None
+
+    parts: list[str] = []
+    for part in loc:
+        if not isinstance(part, str):
+            return None
+        token = part.strip()
+        if not token:
+            return None
+        parts.append(token.upper())
+    return "NANOBOT_" + "__".join(parts)
 
 
 def save_config(config: Config, config_path: Path | None = None) -> None:
@@ -190,6 +408,8 @@ def convert_to_camel(data: Any, _path: tuple[str, ...] = ()) -> Any:
 
 def camel_to_snake(name: str) -> str:
     """Convert camelCase to snake_case."""
+    # Accept hyphen aliases in config keys (e.g. provider names like github-copilot).
+    name = str(name).replace("-", "_")
     result = []
     for i, char in enumerate(name):
         if char.isupper() and i > 0:

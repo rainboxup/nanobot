@@ -8,6 +8,7 @@ from typing import Any
 
 from loguru import logger
 
+from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -33,6 +34,7 @@ class SubagentManager:
         brave_api_key: str | None = None,
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
+        enable_exec: bool = True,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -45,6 +47,7 @@ class SubagentManager:
         self.brave_api_key = brave_api_key
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
+        self.enable_exec = bool(enable_exec)
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -60,9 +63,10 @@ class SubagentManager:
         task_id = str(uuid.uuid4())[:8]
         display_label = label or task[:30] + ("..." if len(task) > 30 else "")
         origin = {"channel": origin_channel, "chat_id": origin_chat_id}
+        scoped_workspace = self._workspace_for_origin(origin_channel, origin_chat_id)
 
         bg_task = asyncio.create_task(
-            self._run_subagent(task_id, task, display_label, origin)
+            self._run_subagent(task_id, task, display_label, origin, scoped_workspace)
         )
         self._running_tasks[task_id] = bg_task
         if session_key:
@@ -80,12 +84,20 @@ class SubagentManager:
         logger.info("Spawned subagent [{}]: {}", task_id, display_label)
         return f"Subagent [{display_label}] started (id: {task_id}). I'll notify you when it completes."
 
+    def _workspace_for_origin(self, origin_channel: str, origin_chat_id: str) -> Path:
+        """Resolve the subagent workspace for the request origin."""
+        if origin_channel != "web":
+            return self.workspace
+        tenant_id = require_web_tenant_id(origin_chat_id, label="chat_id")
+        return resolve_tenant_memory_workspace(self.workspace, tenant_id)
+
     async def _run_subagent(
         self,
         task_id: str,
         task: str,
         label: str,
         origin: dict[str, str],
+        workspace: Path,
     ) -> None:
         """Execute the subagent task and announce the result."""
         logger.info("Subagent [{}] starting task: {}", task_id, label)
@@ -93,21 +105,32 @@ class SubagentManager:
         try:
             # Build subagent tools (no message tool, no spawn tool)
             tools = ToolRegistry()
-            allowed_dir = self.workspace if self.restrict_to_workspace else None
-            tools.register(ReadFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(WriteFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(EditFileTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ListDirTool(workspace=self.workspace, allowed_dir=allowed_dir))
-            tools.register(ExecTool(
-                working_dir=str(self.workspace),
-                timeout=self.exec_config.timeout,
-                restrict_to_workspace=self.restrict_to_workspace,
-                path_append=self.exec_config.path_append,
-            ))
+            allowed_dir = workspace if self.restrict_to_workspace else None
+            tools.register(ReadFileTool(workspace=workspace, allowed_dir=allowed_dir))
+            tools.register(WriteFileTool(workspace=workspace, allowed_dir=allowed_dir))
+            tools.register(EditFileTool(workspace=workspace, allowed_dir=allowed_dir))
+            tools.register(ListDirTool(workspace=workspace, allowed_dir=allowed_dir))
+            if self.enable_exec:
+                tools.register(
+                    ExecTool(
+                        working_dir=str(workspace),
+                        timeout=self.exec_config.timeout,
+                        restrict_to_workspace=self.restrict_to_workspace,
+                        path_append=self.exec_config.path_append,
+                        mode=self.exec_config.mode,
+                        docker_image=self.exec_config.docker_image,
+                        docker_runtime=self.exec_config.docker_runtime,
+                        require_runtime=self.exec_config.require_runtime,
+                        cpu=self.exec_config.cpu,
+                        memory_mib=self.exec_config.memory_mib,
+                        pids_limit=self.exec_config.pids_limit,
+                        output_limit=self.exec_config.output_limit,
+                    )
+                )
             tools.register(WebSearchTool(api_key=self.brave_api_key))
             tools.register(WebFetchTool())
-            
-            system_prompt = self._build_subagent_prompt()
+
+            system_prompt = self._build_subagent_prompt(workspace)
             messages: list[dict[str, Any]] = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": task},
@@ -206,8 +229,8 @@ Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not men
 
         await self.bus.publish_inbound(msg)
         logger.debug("Subagent [{}] announced result to {}:{}", task_id, origin['channel'], origin['chat_id'])
-    
-    def _build_subagent_prompt(self) -> str:
+
+    def _build_subagent_prompt(self, workspace: Path) -> str:
         """Build a focused system prompt for the subagent."""
         from nanobot.agent.context import ContextBuilder
         from nanobot.agent.skills import SkillsLoader
@@ -221,14 +244,14 @@ You are a subagent spawned by the main agent to complete a specific task.
 Stay focused on the assigned task. Your final response will be reported back to the main agent.
 
 ## Workspace
-{self.workspace}"""]
+{workspace}"""]
 
-        skills_summary = SkillsLoader(self.workspace).build_skills_summary()
+        skills_summary = SkillsLoader(workspace).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 
         return "\n\n".join(parts)
-    
+
     async def cancel_by_session(self, session_key: str) -> int:
         """Cancel all subagents for the given session. Returns count cancelled."""
         tasks = [self._running_tasks[tid] for tid in self._session_tasks.get(session_key, [])

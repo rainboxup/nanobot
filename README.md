@@ -678,6 +678,10 @@ Config file: `~/.nanobot/config.json`
 | `openai_codex` | LLM (Codex, OAuth) | `nanobot provider login openai-codex` |
 | `github_copilot` | LLM (GitHub Copilot, OAuth) | `nanobot provider login github-copilot` |
 
+OAuth providers (`openai_codex`, `github_copilot`) are account-linking only:
+- Web API marks them as `provider_kind="oauth"` and `supports_api_key=false`.
+- `PUT /api/providers/{name}` rejects direct config fields (`api_key`, `api_base`, `extra_headers`) with `422`.
+
 <details>
 <summary><b>OpenAI Codex (OAuth)</b></summary>
 
@@ -970,6 +974,31 @@ cp .env.example .env
 docker compose -f compose.yml up -d --build
 python scripts/smoke_web.py --base-url http://127.0.0.1:8318
 ```
+
+Recommended production cookie policy (already defaulted in `.env.example`):
+
+- `NANOBOT_WEB_REFRESH_COOKIE_SECURE=1` (require HTTPS)
+- `NANOBOT_WEB_REFRESH_COOKIE_SAMESITE=lax`
+- `NANOBOT_WEB_REFRESH_COOKIE_PATH=/api/auth`
+- `NANOBOT_WEB_REFRESH_COOKIE_NAME=nanobot_refresh_token`
+- `NANOBOT_WEB_REFRESH_TOKEN_SOURCE_POLICY=hybrid_prefer_cookie`
+  - options: `cookie_only`, `body_only`, `hybrid_prefer_cookie`, `hybrid_prefer_body`
+  - `hybrid_prefer_cookie` keeps cookie-first behavior and allows fallback to body when cookie token is invalid
+- `NANOBOT_WEB_REFRESH_BODY_REQUIRE_SAME_ORIGIN=1` (recommended; keep body-based refresh same-origin checks enabled)
+- `NANOBOT_WEB_TRUSTED_PROXY_CIDRS=` (optional CIDR/IP allowlist of trusted reverse proxies for `Forwarded` / `X-Forwarded-*`; IPv4 must be `/16+`, IPv6 must be `/48+`)
+- `NANOBOT_WEB_REFRESH_ALLOWED_ORIGINS=` (optional comma-separated explicit origins for refresh same-origin checks)
+- `NANOBOT_WEB_CORS_ORIGINS=` (required for cross-origin frontend/API deployments, e.g. `https://app.example.com`)
+- `NANOBOT_JWT_SECRET=<long-random-secret>` (must be at least 32 characters)
+- `NANOBOT_WEB_WS_ALLOW_QUERY_TOKEN=0` (keep query-token WebSocket auth disabled)
+- `NANOBOT_WEB_UVICORN_WS_BACKEND=wsproto` (recommended websocket backend for uvicorn)
+- `NANOBOT_TRAFFIC__WEB_TENANT_SESSION_MANAGER_MAX_ENTRIES=64` (web session cache LRU limit)
+- `NANOBOT_TOOLS__EXEC__ENABLED=0` (safer SaaS default; disable exec unless required)
+- `NANOBOT_TOOLS__EXEC__MODE=docker` (if enabling exec, keep sandboxed mode instead of host mode)
+
+If your frontend and API are deployed cross-site, `NANOBOT_WEB_REFRESH_COOKIE_SAMESITE=none` plus `NANOBOT_WEB_REFRESH_COOKIE_SECURE=1` is required, but not sufficient by itself.
+Refresh requests must still pass origin validation: add browser origins to `NANOBOT_WEB_REFRESH_ALLOWED_ORIGINS`, or expose API and frontend behind a same-origin reverse proxy.
+When relying on `Forwarded` / `X-Forwarded-*` to recover the external origin, set `NANOBOT_WEB_TRUSTED_PROXY_CIDRS` so only trusted last-hop proxy headers are accepted.
+Browser requests must also pass CORS: set `NANOBOT_WEB_CORS_ORIGINS` to your frontend origins for cross-site deployments.
 
 ### Docker
 

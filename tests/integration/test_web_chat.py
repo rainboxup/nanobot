@@ -1,5 +1,6 @@
 import asyncio
 import json
+from contextlib import suppress
 
 import pytest
 import websockets
@@ -52,6 +53,10 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
         session_id = meta["session_id"]
 
         await ws.send("hello")
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert ack.get("type") == "request"
+        request_id = str(ack.get("request_id") or "")
+        assert request_id
 
         inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
         assert inbound.channel == "web"
@@ -60,14 +65,22 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
         assert inbound.content == "hello"
         assert inbound.metadata.get("tenant_id") == "admin"
         assert inbound.metadata.get("canonical_sender_id") == "admin"
+        assert str(inbound.metadata.get("web_request_id") or "") == request_id
 
         ok = await web_ctx.bus.publish_outbound(
-            OutboundMessage(channel="web", chat_id=session_id, content="hi from agent")
+            OutboundMessage(
+                channel="web",
+                chat_id=session_id,
+                content="hi from agent",
+                metadata={"web_request_id": request_id},
+            )
         )
         assert ok is True
 
-        msg = await asyncio.wait_for(ws.recv(), timeout=5.0)
-        assert msg == "hi from agent"
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert msg.get("type") == "message"
+        assert str(msg.get("content") or "") == "hi from agent"
+        assert str((msg.get("metadata") or {}).get("web_request_id") or "") == request_id
 
         # Seed history (agent loop normally saves it).
         session_manager = _tenant_session_manager(web_ctx, "admin")
@@ -111,6 +124,326 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
     await asyncio.sleep(0.1)
     web_channel = getattr(web_ctx.channel_manager, "channels").get("web")
     assert session_id not in getattr(web_channel, "connections", {})
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_connection_replacement_enforces_single_active_connection(
+    web_ctx, auth_token
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws1:
+        first = json.loads(await asyncio.wait_for(ws1.recv(), timeout=5.0))
+        session_id = str(first.get("session_id") or "")
+        assert session_id
+
+        async with websockets.connect(
+            _ws_uri(web_ctx.ws_url, session_id=session_id),
+            subprotocols=_ws_subprotocols(auth_token),
+        ) as ws2:
+            second = json.loads(await asyncio.wait_for(ws2.recv(), timeout=5.0))
+            assert str(second.get("session_id") or "") == session_id
+
+            stale_send_failed = False
+            try:
+                await ws1.send("stale should be rejected")
+            except Exception:
+                stale_send_failed = True
+
+            if not stale_send_failed:
+                stale = json.loads(await asyncio.wait_for(ws1.recv(), timeout=5.0))
+                assert stale.get("type") == "error"
+                assert str(stale.get("error_code") or "") == "session_replaced"
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=0.2)
+
+            await ws2.send("fresh connection still active")
+            inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+            assert inbound.content == "fresh connection still active"
+            assert inbound.session_id == session_id
+
+            ok = await web_ctx.bus.publish_outbound(
+                OutboundMessage(
+                    channel="web",
+                    chat_id=session_id,
+                    content="still routed to latest connection",
+                )
+            )
+            assert ok is True
+
+            msg = None
+            for _ in range(2):
+                frame = json.loads(await asyncio.wait_for(ws2.recv(), timeout=5.0))
+                if frame.get("type") == "message":
+                    msg = frame
+                    break
+            assert isinstance(msg, dict)
+            assert str(msg.get("content") or "") == "still routed to latest connection"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_slow_session_send_does_not_block_other_sessions(
+    web_ctx, auth_token
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws_slow:
+        slow_meta = json.loads(await asyncio.wait_for(ws_slow.recv(), timeout=5.0))
+        slow_session_id = str(slow_meta.get("session_id") or "")
+        assert slow_session_id
+
+        async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws_fast:
+            fast_meta = json.loads(await asyncio.wait_for(ws_fast.recv(), timeout=5.0))
+            fast_session_id = str(fast_meta.get("session_id") or "")
+            assert fast_session_id
+            assert fast_session_id != slow_session_id
+
+            web_channel = getattr(web_ctx.app.state, "web_channel", None)
+            assert web_channel is not None
+            slow_server_ws = web_channel.connections.get(slow_session_id)
+            assert slow_server_ws is not None
+
+            block_entered = asyncio.Event()
+            block_release = asyncio.Event()
+            original_send_json = slow_server_ws.send_json
+
+            async def _blocked_send_json(payload: dict[str, object]) -> None:
+                if str(payload.get("type") or "") == "message":
+                    block_entered.set()
+                    await block_release.wait()
+                await original_send_json(payload)
+
+            setattr(slow_server_ws, "send_json", _blocked_send_json)
+
+            slow_send_task = asyncio.create_task(
+                web_channel.send(
+                    OutboundMessage(
+                        channel="web",
+                        chat_id=slow_session_id,
+                        content="slow-path-message",
+                    )
+                )
+            )
+            try:
+                await asyncio.wait_for(block_entered.wait(), timeout=5.0)
+
+                await asyncio.wait_for(
+                    web_channel.send(
+                        OutboundMessage(
+                            channel="web",
+                            chat_id=fast_session_id,
+                            content="fast-path-message",
+                        )
+                    ),
+                    timeout=1.0,
+                )
+                fast_msg = json.loads(await asyncio.wait_for(ws_fast.recv(), timeout=1.0))
+                assert fast_msg.get("type") == "message"
+                assert str(fast_msg.get("content") or "") == "fast-path-message"
+
+                block_release.set()
+                if not slow_send_task.done():
+                    await asyncio.wait_for(slow_send_task, timeout=5.0)
+                else:
+                    assert slow_send_task.result() is None
+                slow_msg = json.loads(await asyncio.wait_for(ws_slow.recv(), timeout=5.0))
+                assert slow_msg.get("type") == "message"
+                assert str(slow_msg.get("content") or "") == "slow-path-message"
+            finally:
+                block_release.set()
+                if not slow_send_task.done():
+                    slow_send_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await slow_send_task
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_replacement_race_rejects_stale_publish(
+    web_ctx, auth_token, monkeypatch
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    web_channel = getattr(web_ctx.app.state, "web_channel", None)
+    assert web_channel is not None
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws1:
+        first = json.loads(await asyncio.wait_for(ws1.recv(), timeout=5.0))
+        session_id = str(first.get("session_id") or "")
+        assert session_id
+
+        gate_entered = asyncio.Event()
+        gate_release = asyncio.Event()
+        original_publish = web_channel.publish_inbound_if_current
+
+        async def _gated_publish(session_key: str, ws_obj, publish):
+            if session_key == session_id:
+                gate_entered.set()
+                await gate_release.wait()
+            return await original_publish(session_key, ws_obj, publish)
+
+        monkeypatch.setattr(web_channel, "publish_inbound_if_current", _gated_publish)
+
+        await ws1.send("stale message in race window")
+        await asyncio.wait_for(gate_entered.wait(), timeout=5.0)
+
+        async with websockets.connect(
+            _ws_uri(web_ctx.ws_url, session_id=session_id),
+            subprotocols=_ws_subprotocols(auth_token),
+        ) as ws2:
+            second = json.loads(await asyncio.wait_for(ws2.recv(), timeout=5.0))
+            assert str(second.get("session_id") or "") == session_id
+
+            gate_release.set()
+
+            try:
+                stale_frame = json.loads(await asyncio.wait_for(ws1.recv(), timeout=5.0))
+                assert stale_frame.get("type") == "error"
+                assert str(stale_frame.get("error_code") or "") == "session_replaced"
+            except websockets.exceptions.ConnectionClosed as exc:
+                close_code = (
+                    getattr(getattr(exc, "rcvd", None), "code", None)
+                    or getattr(getattr(exc, "sent", None), "code", None)
+                    or 0
+                )
+                assert int(close_code) == 4009
+
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=0.2)
+
+            await ws2.send("fresh after race")
+            inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+            assert inbound.content == "fresh after race"
+            assert inbound.session_id == session_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_session_frame_precedes_racing_outbound_message(
+    web_ctx, auth_token
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws1:
+        first = json.loads(await asyncio.wait_for(ws1.recv(), timeout=5.0))
+        session_id = str(first.get("session_id") or "")
+        assert session_id
+
+        publish_done = asyncio.Event()
+
+        async def _publish_burst() -> None:
+            for idx in range(12):
+                await web_ctx.bus.publish_outbound(
+                    OutboundMessage(
+                        channel="web",
+                        chat_id=session_id,
+                        content=f"race-{idx}",
+                    )
+                )
+                await asyncio.sleep(0.005)
+            publish_done.set()
+
+        publish_task = asyncio.create_task(_publish_burst())
+        async with websockets.connect(
+            _ws_uri(web_ctx.ws_url, session_id=session_id),
+            subprotocols=_ws_subprotocols(auth_token),
+        ) as ws2:
+            first_new = json.loads(await asyncio.wait_for(ws2.recv(), timeout=5.0))
+            assert first_new.get("type") == "session"
+            assert str(first_new.get("session_id") or "") == session_id
+
+            await asyncio.wait_for(publish_done.wait(), timeout=5.0)
+            await asyncio.wait_for(publish_task, timeout=5.0)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_rejects_unknown_type_without_publishing_inbound(
+    web_ctx, auth_token
+) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "typing",
+                    "content": "should not reach agent",
+                    "request_id": "req-unknown-type",
+                }
+            )
+        )
+        err = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert err.get("type") == "error"
+        assert str(err.get("detail") or "") == "unsupported message type"
+        assert str(err.get("request_id") or "") == "req-unknown-type"
+        assert str(err.get("error_code") or "") == "unsupported_message_type"
+
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=0.2)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_busy_branch_uses_json_error_contract(web_ctx, auth_token) -> None:
+    class _BusyInbound:
+        async def publish_inbound(self, msg) -> bool:
+            return False
+
+    web_ctx.channel_manager.inbound_bus = _BusyInbound()
+    ws_uri = _ws_uri(web_ctx.ws_url)
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        session_id = str(first.get("session_id") or "")
+        assert session_id
+
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "chat",
+                    "content": "hello busy",
+                    "request_id": "req-busy-json",
+                }
+            )
+        )
+        err = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert err.get("type") == "error"
+        assert str(err.get("detail") or "") == "System busy, please try again later"
+        assert str(err.get("request_id") or "") == "req-busy-json"
+        assert str(err.get("session_id") or "") == session_id
+        assert str(err.get("error_code") or "") == "system_busy"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_unavailable_channel_uses_json_error_contract(web_ctx, auth_token) -> None:
+    web_ctx.app.state.web_channel = None
+    ws_uri = _ws_uri(web_ctx.ws_url)
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        err = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert err.get("type") == "error"
+        assert str(err.get("detail") or "") == "web channel unavailable"
+        assert str(err.get("session_id") or "").startswith("web:admin:")
+        assert str(err.get("error_code") or "") == "web_channel_unavailable"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_inbound_bus_unavailable_uses_json_error_contract(
+    web_ctx, auth_token
+) -> None:
+    web_ctx.channel_manager.inbound_bus = None
+    web_ctx.app.state.bus = None
+    ws_uri = _ws_uri(web_ctx.ws_url)
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        err = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert err.get("type") == "error"
+        assert str(err.get("detail") or "") == "inbound publisher unavailable"
+        assert str(err.get("error_code") or "") == "inbound_publisher_unavailable"
+        assert str(err.get("session_id") or "").startswith("web:admin:")
 
 
 @pytest.mark.integration
@@ -385,6 +718,51 @@ async def test_tenant_session_manager_cache_respects_max_entries(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_tenant_session_manager_cache_refreshes_lru_on_hit(
+    web_ctx, http_client, auth_headers_for
+) -> None:
+    web_ctx.app.state.tenant_session_manager_max_entries = 2
+    web_ctx.app.state.tenant_session_manager_evictions_total = 0
+    web_ctx.app.state.tenant_session_managers = {}
+
+    headers_team1 = await auth_headers_for(
+        "cache-lru-team1-user",
+        role="member",
+        tenant_id="cache-lru-team1",
+        password="cache-lru-team1-pass",
+    )
+    headers_team2 = await auth_headers_for(
+        "cache-lru-team2-user",
+        role="member",
+        tenant_id="cache-lru-team2",
+        password="cache-lru-team2-pass",
+    )
+    headers_team3 = await auth_headers_for(
+        "cache-lru-team3-user",
+        role="member",
+        tenant_id="cache-lru-team3",
+        password="cache-lru-team3-pass",
+    )
+
+    for headers in (headers_team1, headers_team2, headers_team1, headers_team3):
+        created = await http_client.post(
+            "/api/chat/sessions",
+            headers=headers,
+            json={"title": "cache lru test"},
+        )
+        assert created.status_code == 201
+
+    cache = getattr(web_ctx.app.state, "tenant_session_managers", {})
+    assert isinstance(cache, dict)
+    assert len(cache) == 2
+    assert "cache-lru-team1" in cache
+    assert "cache-lru-team2" not in cache
+    assert "cache-lru-team3" in cache
+    assert int(getattr(web_ctx.app.state, "tenant_session_manager_evictions_total", 0)) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_tenant_session_manager_cache_limit_initializes_from_config(web_ctx) -> None:
     configured = int(getattr(web_ctx.app.state.config.traffic, "web_tenant_session_manager_max_entries", 0))
     effective = int(getattr(web_ctx.app.state, "tenant_session_manager_max_entries", 0))
@@ -410,6 +788,24 @@ async def test_chat_sessions_use_global_manager_in_single_runtime_mode(
 
     assert web_ctx.session_manager.get(session_id) is not None
 
+    tenant = web_ctx.tenant_store.ensure_tenant_files("admin")
+    tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
+    assert tenant_sessions.get(session_id) is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_uses_global_manager_in_single_runtime_mode(web_ctx, auth_token) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+    session_id = ""
+
+    async with websockets.connect(_ws_uri(web_ctx.ws_url), subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        session_id = str(meta.get("session_id") or "")
+        assert session_id.startswith("web:admin:")
+
+    assert web_ctx.session_manager.get(session_id) is not None
     tenant = web_ctx.tenant_store.ensure_tenant_files("admin")
     tenant_sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
     assert tenant_sessions.get(session_id) is None

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from nanobot.services.config_ownership import ConfigOwnershipService, ConfigScope
+from nanobot.tenants.validation import classify_config_scope
 
 
 def test_get_config_scope_system_keys() -> None:
     assert ConfigOwnershipService.get_config_scope("channels.feishu.app_id") == ConfigScope.SYSTEM
     assert ConfigOwnershipService.get_config_scope("channels.dingtalk.client_id") == ConfigScope.SYSTEM
     assert ConfigOwnershipService.get_config_scope("gateway.mode") == ConfigScope.SYSTEM
+    assert ConfigOwnershipService.get_config_scope("traffic.tenant_burst_limit") == ConfigScope.SYSTEM
 
 
 def test_get_config_scope_workspace_keys() -> None:
@@ -24,6 +26,22 @@ def test_get_config_scope_session_keys() -> None:
 
 def test_unknown_keys_default_to_workspace_scope() -> None:
     assert ConfigOwnershipService.get_config_scope("unknown.key") == ConfigScope.WORKSPACE
+
+
+def test_get_config_scope_matches_validation_classifier() -> None:
+    keys = (
+        "channels.feishu.app_id",
+        "gateway.mode",
+        "traffic.tenant_burst_limit",
+        "providers.openai.api_key",
+        "workspace.channels.feishu.enabled",
+        "session.overlay",
+        "unknown.key",
+    )
+
+    assert all(
+        ConfigOwnershipService.get_config_scope(key).value == classify_config_scope(key) for key in keys
+    )
 
 
 def test_channel_credentials_ownership_single_allows_non_admin() -> None:
@@ -116,4 +134,11 @@ def test_validate_config_change_session_always_allowed() -> None:
     )
     assert decision.allowed is True
     assert decision.scope == ConfigScope.SESSION
-
+def test_workspace_channel_routing_ownership_rejects_unsupported_channel() -> None:
+    decision = ConfigOwnershipService.check_workspace_channel_routing_ownership(
+        runtime_mode="multi",
+        channel_name="slack",
+    )
+    assert decision.allowed is False
+    assert decision.scope == ConfigScope.WORKSPACE
+    assert decision.reason_code == "unsupported_workspace_channel"

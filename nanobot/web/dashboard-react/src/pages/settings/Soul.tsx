@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react"
-import { AlertTriangle } from "lucide-react"
+import { AlertTriangle, ExternalLink } from "lucide-react"
 
 import { api, ApiError } from "@/src/lib/api"
 import { cn } from "@/src/lib/utils"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 import { useStore } from "@/src/store/useStore"
 import { Badge } from "@/src/components/ui/badge"
 import { Button } from "@/src/components/ui/button"
@@ -191,6 +192,14 @@ export function Soul() {
           <p className="text-muted-foreground">
             编辑 workspace Soul，并查看 Platform Base + Workspace + Overlay 的合并结果（Effective Preview）。
           </p>
+          <a
+            href={helpDocHref("effective-policy-and-soul")}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-1 inline-flex items-center gap-1 text-xs text-muted-foreground underline underline-offset-4 hover:text-foreground"
+          >
+            了解 Effective Policy/Soul（解释性预览，不等于能力授权） <ExternalLink className="h-3 w-3" />
+          </a>
         </div>
         <Button variant="outline" onClick={() => loadSoul().catch(() => {})} disabled={loading || saving || previewing}>
           刷新
@@ -265,7 +274,9 @@ export function Soul() {
                 <CardTitle className="text-base flex items-center gap-2">
                   Effective Preview {overlayActive && <Badge variant="secondary">overlay</Badge>}
                 </CardTitle>
-                <CardDescription>合并结果用于解释“实际生效”的 Soul。Overlay 仅用于预览。</CardDescription>
+                <CardDescription>
+                  合并结果用于解释“实际生效”的 Soul。Overlay 仅用于预览，不会修改权限或授权能力。
+                </CardDescription>
               </CardHeader>
               <CardContent className="flex-1 space-y-4">
                 <div className="space-y-2">

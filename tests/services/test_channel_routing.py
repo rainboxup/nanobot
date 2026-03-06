@@ -1,3 +1,5 @@
+import pytest
+
 from nanobot.config.schema import Config
 from nanobot.services.channel_routing import (
     evaluate_workspace_channel_routing,
@@ -5,6 +7,7 @@ from nanobot.services.channel_routing import (
     normalize_sender_id,
     routing_mentioned,
 )
+from nanobot.tenants.validation import workspace_routing_channel_names
 
 
 def test_normalize_sender_id_filters_empty_markers() -> None:
@@ -44,10 +47,11 @@ def test_evaluate_workspace_channel_routing_allows_non_workspace_channels() -> N
     assert decision.reason_code is None
 
 
-def test_evaluate_workspace_channel_routing_rejects_missing_sender() -> None:
+@pytest.mark.parametrize("channel_name", workspace_routing_channel_names())
+def test_evaluate_workspace_channel_routing_rejects_missing_sender(channel_name: str) -> None:
     decision = evaluate_workspace_channel_routing(
         config=Config(),
-        channel_name="feishu",
+        channel_name=channel_name,
         sender_id="unknown",
         message_type="private",
         group_id=None,
@@ -55,6 +59,11 @@ def test_evaluate_workspace_channel_routing_rejects_missing_sender() -> None:
     )
     assert decision.allowed is False
     assert decision.reason_code == "missing_sender_id"
+
+
+def test_workspace_routing_channel_names_match_workspace_schema() -> None:
+    cfg = Config()
+    assert set(workspace_routing_channel_names()) == set(type(cfg.workspace.channels).model_fields)
 
 
 def test_evaluate_workspace_channel_routing_rejects_disabled_workspace_channel() -> None:

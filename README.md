@@ -975,6 +975,12 @@ docker compose -f compose.yml up -d --build
 python scripts/smoke_web.py --base-url http://127.0.0.1:8318
 ```
 
+Docs (multi-tenant / SaaS):
+
+- Workspace routing + binding (`!link`): `docs/howto/workspace-routing-and-binding.md`
+- Explainability: effective Policy + Soul: `docs/howto/effective-policy-and-soul.md`
+- Config scopes/ownership (operator/admin): `docs/architecture/config-ownership.md`
+
 Recommended production cookie policy (already defaulted in `.env.example`):
 
 - `NANOBOT_WEB_REFRESH_COOKIE_SECURE=1` (require HTTPS)

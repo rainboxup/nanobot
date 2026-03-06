@@ -4,6 +4,9 @@ import pytest
 
 from nanobot.config.loader import load_config, save_config
 from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError
+from nanobot.tenants.validation import (
+    workspace_routing_channel_names,
+)
 
 
 def _system_cfg(web_ctx):
@@ -433,9 +436,9 @@ async def test_workspace_routing_binding_instructions_are_readable(
     workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
     assert workspace_list.status_code == 200
     rows = {row["name"]: row for row in workspace_list.json()}
-    assert {"feishu", "dingtalk"}.issubset(rows)
-    assert rows["feishu"]["config_scope"] == "workspace"
-    assert rows["dingtalk"]["config_scope"] == "workspace"
+    assert set(rows) == set(workspace_routing_channel_names())
+    assert all(row["config_scope"] == "workspace" for row in rows.values())
+    assert all(row.get("help_slug") == "workspace-routing-and-binding" for row in rows.values())
 
     binding_resp = await http_client.get(
         "/api/channels/dingtalk/binding-instructions",
@@ -445,7 +448,12 @@ async def test_workspace_routing_binding_instructions_are_readable(
     body = binding_resp.json()
     assert body["name"] == "dingtalk"
     assert body["channel"] == "dingtalk"
-    assert "!link" in body["instructions"]
+    assert body.get("help_slug") == "workspace-routing-and-binding"
+
+    instructions = str(body["instructions"] or "")
+    assert "!link" in instructions
+    assert "!whoami" in instructions
+    assert "dm" in instructions.lower() or "private" in instructions.lower()
     assert body["config_scope"] == "workspace"
 
 

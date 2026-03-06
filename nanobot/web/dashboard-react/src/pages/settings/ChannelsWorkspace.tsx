@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react"
-import { AlertTriangle, Copy, Edit2, RefreshCw } from "lucide-react"
+import { AlertTriangle, Copy, Edit2, ExternalLink, RefreshCw } from "lucide-react"
 
 import { api, ApiError } from "@/src/lib/api"
 import { useStore } from "@/src/store/useStore"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 import { Badge } from "@/src/components/ui/badge"
 import { Button } from "@/src/components/ui/button"
 import { Drawer } from "@/src/components/ui/drawer"
@@ -20,6 +21,8 @@ interface WorkspaceChannelItem {
   require_mention: boolean
   takes_effect?: string
   runtime_warning?: string
+  help_slug?: string
+  help_url?: string
   writable?: boolean
   write_block_reason?: string | null
 }
@@ -29,6 +32,8 @@ interface BindingInstructionsResponse {
   channel: string
   instructions: string
   runtime_warning?: string
+  help_slug?: string
+  help_url?: string
 }
 
 function toTextareaValue(items?: string[] | null) {
@@ -81,6 +86,14 @@ export function ChannelsWorkspace() {
 
   const runtimeWarning = useMemo(() => {
     return String(channels.find((item) => item.runtime_warning)?.runtime_warning || "").trim()
+  }, [channels])
+
+  const helpHref = useMemo(() => {
+    const helpSlug = String(channels.find((item) => item.help_slug)?.help_slug || "").trim()
+    if (helpSlug) return helpDocHref(helpSlug)
+    const externalUrl = String(channels.find((item) => item.help_url)?.help_url || "").trim()
+    if (/^https?:\/\//i.test(externalUrl)) return externalUrl
+    return helpDocHref("workspace-routing-and-binding")
   }, [channels])
 
   async function openEditor(name: string) {
@@ -163,10 +176,18 @@ export function ChannelsWorkspace() {
             Workspace routing only narrows inbound access for this workspace. System channel allowlists still apply before messages reach the workspace, so workspace sender IDs must stay within the system policy.
           </div>
         </div>
-        <Button variant="outline" onClick={() => loadChannels().catch(() => {})} disabled={loading}>
-          <RefreshCw className="mr-2 h-4 w-4" />
-          Refresh
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button asChild variant="outline">
+            <a href={helpHref} target="_blank" rel="noreferrer">
+              <ExternalLink className="mr-2 h-4 w-4" />
+              Learn more
+            </a>
+          </Button>
+          <Button variant="outline" onClick={() => loadChannels().catch(() => {})} disabled={loading}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {error && <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">{error}</div>}

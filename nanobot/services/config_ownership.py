@@ -9,6 +9,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 
+from nanobot.tenants.validation import (
+    classify_config_scope,
+    is_workspace_routing_channel,
+    normalize_workspace_routing_channel_name,
+)
+
 
 class ConfigScope(StrEnum):
     SYSTEM = "system"
@@ -30,20 +36,7 @@ class ConfigOwnershipService:
 
     @staticmethod
     def get_config_scope(config_key: str) -> ConfigScope:
-        key = str(config_key or "").strip()
-        if not key:
-            return ConfigScope.WORKSPACE
-
-        if key.startswith("session."):
-            return ConfigScope.SESSION
-
-        if key.startswith(("channels.", "gateway.")):
-            return ConfigScope.SYSTEM
-
-        if key.startswith(("providers.", "agents.", "tools.", "workspace.")):
-            return ConfigScope.WORKSPACE
-
-        return ConfigScope.WORKSPACE
+        return ConfigScope(classify_config_scope(config_key))
 
     @staticmethod
     def check_channel_credentials_ownership(
@@ -92,9 +85,17 @@ class ConfigOwnershipService:
     def check_workspace_channel_routing_ownership(
         cls, *, runtime_mode: str, channel_name: str
     ) -> OwnershipDecision:
+        normalized = normalize_workspace_routing_channel_name(channel_name)
+        if not is_workspace_routing_channel(normalized):
+            return OwnershipDecision(
+                allowed=False,
+                scope=ConfigScope.WORKSPACE,
+                reason_code="unsupported_workspace_channel",
+            )
+
         return cls.check_workspace_config_ownership(
             runtime_mode=runtime_mode,
-            config_key=f"workspace.channels.{str(channel_name or '').strip().lower()}",
+            config_key=f"workspace.channels.{normalized}",
         )
 
     @classmethod

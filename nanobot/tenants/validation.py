@@ -6,7 +6,7 @@ This module enforces the 3-layer configuration ownership model:
 - Session Scope: Runtime-only (exec_enabled, session metadata)
 
 Validation Rules:
-1. No privilege escalation: Tenants cannot enable system-disabled features
+1. No privilege escalation: Tenants cannot write system-scoped keys
 2. Subset constraint: Tenants can only restrict, not expand permissions
 3. Opt-in only: Dangerous features require explicit tenant opt-in
 4. Audit logging: All validation decisions are logged for security auditing
@@ -19,7 +19,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, WorkspaceChannelsConfig
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +66,59 @@ WORKSPACE_ALLOWED_KEYS = {
     "providers",
     "workspace",
 }
+
+CONFIG_SCOPE_SYSTEM = "system"
+CONFIG_SCOPE_WORKSPACE = "workspace"
+CONFIG_SCOPE_SESSION = "session"
+
+WORKSPACE_ROUTING_CHANNELS = tuple(str(name) for name in WorkspaceChannelsConfig.model_fields)
+WORKSPACE_ROUTING_CHANNEL_DISPLAY_NAMES = {
+    "feishu": "Feishu",
+    "dingtalk": "DingTalk",
+}
+
+
+def classify_config_scope(config_key: str) -> str:
+    """Classify a dotted config key into system/workspace/session scope."""
+    key = str(config_key or "").strip().lower()
+    if not key:
+        return CONFIG_SCOPE_WORKSPACE
+
+    if key.startswith("session."):
+        return CONFIG_SCOPE_SESSION
+
+    root = key.split(".", 1)[0]
+    if root in SYSTEM_ONLY_KEYS:
+        return CONFIG_SCOPE_SYSTEM
+    if root in WORKSPACE_ALLOWED_KEYS:
+        return CONFIG_SCOPE_WORKSPACE
+    return CONFIG_SCOPE_WORKSPACE
+
+
+def normalize_workspace_routing_channel_name(channel_name: str) -> str:
+    """Normalize a workspace-routing channel identifier."""
+    return str(channel_name or "").strip().lower()
+
+
+def workspace_routing_channel_names() -> tuple[str, ...]:
+    """Single authoritative list of channels supporting workspace routing."""
+    return WORKSPACE_ROUTING_CHANNELS
+
+
+def workspace_routing_channel_display_name(channel_name: str) -> str:
+    """Return a human-readable display name for a workspace-routing channel."""
+    normalized = normalize_workspace_routing_channel_name(channel_name)
+    display_name = WORKSPACE_ROUTING_CHANNEL_DISPLAY_NAMES.get(normalized)
+    if display_name:
+        return display_name
+    if not normalized:
+        return ""
+    return normalized.replace("-", " ").replace("_", " ").title()
+
+
+def is_workspace_routing_channel(channel_name: str) -> bool:
+    """Return whether a channel supports workspace-scoped routing."""
+    return normalize_workspace_routing_channel_name(channel_name) in WORKSPACE_ROUTING_CHANNELS
 
 
 def normalize_tenant_id(value: str) -> str:
@@ -168,54 +221,13 @@ class ConfigOwnershipValidator:
         """
         # Check for system-only key override attempts
         for key in tenant_config_dict.keys():
-            if key in SYSTEM_ONLY_KEYS:
+            if classify_config_scope(str(key)) == CONFIG_SCOPE_SYSTEM:
                 return ValidationResult(
                     valid=False,
                     reason_code="privilege_escalation",
                     message=f"Tenant config cannot override system-only key: {key}",
                     details={"tenant_id": tenant_id, "forbidden_key": key},
                 )
-
-        # Check if tenant tries to enable system-disabled tools
-        if "tools" in tenant_config_dict:
-            tenant_tools = tenant_config_dict["tools"]
-            system_tools = self.system_config.tools
-
-            # Check exec tool
-            if isinstance(tenant_tools, dict) and "exec" in tenant_tools:
-                tenant_exec = tenant_tools["exec"]
-                if isinstance(tenant_exec, dict):
-                    tenant_exec_enabled = tenant_exec.get("enabled", False)
-                    if tenant_exec_enabled and not system_tools.exec.enabled:
-                        return ValidationResult(
-                            valid=False,
-                            reason_code="privilege_escalation",
-                            message="Tenant cannot enable tools.exec when system has it disabled",
-                            details={
-                                "tenant_id": tenant_id,
-                                "tool": "exec",
-                                "system_enabled": False,
-                                "tenant_enabled": True,
-                            },
-                        )
-
-            # Check web tool
-            if isinstance(tenant_tools, dict) and "web" in tenant_tools:
-                tenant_web = tenant_tools["web"]
-                if isinstance(tenant_web, dict):
-                    tenant_web_enabled = tenant_web.get("enabled", True)
-                    if tenant_web_enabled and not system_tools.web.enabled:
-                        return ValidationResult(
-                            valid=False,
-                            reason_code="privilege_escalation",
-                            message="Tenant cannot enable tools.web when system has it disabled",
-                            details={
-                                "tenant_id": tenant_id,
-                                "tool": "web",
-                                "system_enabled": False,
-                                "tenant_enabled": True,
-                            },
-                        )
 
         return ValidationResult(valid=True)
 
@@ -229,7 +241,7 @@ class ConfigOwnershipValidator:
         if not isinstance(channels_cfg, dict):
             return {}
         return {
-            str(channel_name): channel_cfg
+            normalize_workspace_routing_channel_name(str(channel_name)): channel_cfg
             for channel_name, channel_cfg in channels_cfg.items()
             if isinstance(channel_cfg, dict)
         }
@@ -271,14 +283,15 @@ class ConfigOwnershipValidator:
                         )
 
         for channel_name, channel_override in self._workspace_channel_overrides(tenant_config_dict).items():
-            system_channel = getattr(self.system_config.channels, channel_name, None)
-            if system_channel is None:
+            if not is_workspace_routing_channel(channel_name):
                 return ValidationResult(
                     valid=False,
                     reason_code="subset_constraint",
                     message=f"Unknown workspace channel override: {channel_name}",
                     details={"tenant_id": tenant_id, "channel": channel_name},
                 )
+
+            system_channel = getattr(self.system_config.channels, channel_name, None)
 
             tenant_allow_from = set(channel_override.get("allow_from") or [])
             system_allow_from = set(getattr(system_channel, "allow_from", []) or [])

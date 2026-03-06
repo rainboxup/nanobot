@@ -19,6 +19,7 @@ import { Cron } from "./pages/settings/Cron"
 import { Beta } from "./pages/settings/Beta"
 import { Users } from "./pages/settings/Users"
 import { Security } from "./pages/settings/Security"
+import { HelpDoc } from "./pages/HelpDoc"
 import { Skills } from "./pages/Skills"
 import { Ops } from "./pages/Ops"
 import { useStore } from "./store/useStore"
@@ -151,6 +152,8 @@ export default function App() {
           </Route>
           
           <Route path="skills" element={<Skills />} />
+          <Route path="help" element={<HelpDoc />} />
+          <Route path="help/:slug" element={<HelpDoc />} />
           <Route path="ops" element={<Ops />} />
         </Route>
       </Routes>

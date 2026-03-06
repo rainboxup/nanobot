@@ -2,6 +2,7 @@ import { useMemo } from "react"
 import { NavLink, Outlet, useLocation } from "react-router-dom"
 
 import { cn } from "@/src/lib/utils"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 import { useStore } from "@/src/store/useStore"
 
 export function Channels() {
@@ -38,6 +39,24 @@ export function Channels() {
         <p className="text-sm text-muted-foreground">
           Separate system channel connections from workspace routing so saved settings match runtime behavior.
         </p>
+        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+          <a
+            href={helpDocHref("workspace-routing-and-binding")}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-4 hover:text-foreground"
+          >
+            Learn more / Troubleshooting: routing & binding
+          </a>
+          <a
+            href={helpDocHref("effective-policy-and-soul")}
+            target="_blank"
+            rel="noreferrer"
+            className="underline underline-offset-4 hover:text-foreground"
+          >
+            Learn more: effective policy & soul
+          </a>
+        </div>
       </div>
 
       <div className="space-y-3">

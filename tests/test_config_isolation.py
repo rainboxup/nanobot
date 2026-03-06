@@ -3,7 +3,13 @@ import json
 
 import pytest
 
-from nanobot.config.loader import load_config
+from nanobot.config import loader as loader_module
+from nanobot.config.loader import (
+    build_config_without_env,
+    ensure_no_unknown_config_keys,
+    load_config,
+    migrate_config_data,
+)
 from nanobot.config.schema import Config
 from nanobot.tenants import store as tenant_store_module
 from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError, TenantStore
@@ -21,6 +27,49 @@ def test_load_config_can_disable_env_override(monkeypatch, tmp_path) -> None:
 
     assert with_env.providers.openrouter.api_key.startswith("sk-env-")
     assert without_env.providers.openrouter.api_key == ""
+
+
+def test_loader_public_build_config_without_env_never_reads_host_env(monkeypatch) -> None:
+    monkeypatch.setenv("NANOBOT_PROVIDERS__OPENROUTER__API_KEY", "sk-env-public-helper")
+
+    cfg = build_config_without_env({})
+
+    assert cfg.providers.openrouter.api_key == ""
+
+
+def test_loader_public_helpers_preserve_strict_tenant_contract() -> None:
+    legacy = {"tools": {"exec": {"restrictToWorkspace": True}}}
+
+    migrated = migrate_config_data(legacy)
+    assert migrated["tools"]["restrictToWorkspace"] is True
+    assert "restrictToWorkspace" not in migrated["tools"]["exec"]
+
+    with pytest.raises(ValueError, match="Unknown config keys in strict mode"):
+        ensure_no_unknown_config_keys(
+            {"workspace": {"channels": {"feishu": {"unknown_flag": True}}}}
+        )
+
+    with pytest.raises(ValueError, match="config section 'tools' must be an object"):
+        build_config_without_env({"tools": "invalid-shape"}, strict_section_types=True)
+
+
+def test_load_config_uses_public_loader_helpers(monkeypatch, tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        json.dumps({"tools": {"exec": {"restrictToWorkspace": True}}}),
+        encoding="utf-8",
+    )
+
+    def unexpected_private_helper(*_args, **_kwargs):
+        raise AssertionError("private loader helper should not be used")
+
+    monkeypatch.setattr(loader_module, "_build_config_without_env", unexpected_private_helper)
+    monkeypatch.setattr(loader_module, "_ensure_no_unknown_config_keys", unexpected_private_helper)
+    monkeypatch.setattr(loader_module, "_migrate_config", unexpected_private_helper)
+
+    cfg = load_config(config_path=path, allow_env_override=False, strict=True)
+
+    assert cfg.tools.restrict_to_workspace is True
 
 
 def test_tenant_store_never_seeds_config_from_host_env(monkeypatch, tmp_path) -> None:
@@ -65,10 +114,10 @@ def test_tenant_store_migrates_legacy_channel_overrides_to_workspace(tmp_path) -
                         "allowFrom": ["legacy-user"],
                         "groupPolicy": "allowlist",
                         "groupAllowFrom": ["legacy-group"],
-                        "appId": "legacy-app-id"
+                        "appId": "legacy-app-id",
                     }
                 },
-                "gateway": {"host": "legacy-host"}
+                "gateway": {"host": "legacy-host"},
             },
             indent=2,
         ),
@@ -100,6 +149,24 @@ def test_tenant_store_save_rejects_workspace_channel_allowlist_expansion(tmp_pat
 
     with pytest.raises(ConfigValidationError, match="subset_constraint"):
         store.save_tenant_config(tenant_id, cfg)
+
+
+def test_tenant_store_save_allows_tool_opt_in_above_system_cap_for_effective_capping(tmp_path) -> None:
+    system_cfg = Config()
+    system_cfg.tools.exec.enabled = False
+    system_cfg.tools.web.enabled = False
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=system_cfg)
+    tenant_id = store.ensure_tenant("telegram", "u-4b")
+
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.tools.exec.enabled = True
+    cfg.tools.web.enabled = True
+
+    store.save_tenant_config(tenant_id, cfg)
+
+    raw = json.loads(store.tenant_config_path(tenant_id).read_text(encoding="utf-8"))
+    assert raw["tools"]["exec"]["enabled"] is True
+    assert raw["tools"]["web"]["enabled"] is True
 
 
 def test_tenant_store_save_uses_load_time_baseline_snapshot(tmp_path) -> None:
@@ -134,7 +201,6 @@ def test_tenant_store_rejects_stale_snapshot_on_save(tmp_path) -> None:
         store.save_tenant_config(tenant_id, stale)
 
 
-
 def test_tenant_store_load_without_snapshot_skips_write_tracking(tmp_path) -> None:
     store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
     tenant_id = store.ensure_tenant("telegram", "u-6b")
@@ -165,7 +231,6 @@ def test_tenant_store_save_preserves_unknown_tenant_root_keys(tmp_path) -> None:
     raw = json.loads(config_path.read_text(encoding="utf-8"))
     assert raw["futureFeature"] == {"mode": "keep-me"}
     assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
-
 
 
 def test_tenant_store_save_preserves_explicit_override_matching_baseline(tmp_path) -> None:
@@ -215,8 +280,9 @@ def test_tenant_store_save_preserves_migrated_legacy_enabled_override(tmp_path) 
     assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
 
 
-
-def test_tenant_store_save_raises_busy_when_config_lock_cannot_be_acquired(monkeypatch, tmp_path) -> None:
+def test_tenant_store_save_raises_busy_when_config_lock_cannot_be_acquired(
+    monkeypatch, tmp_path
+) -> None:
     store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
     tenant_id = store.ensure_tenant("telegram", "u-9")
     cfg = store.load_tenant_config(tenant_id)
@@ -239,7 +305,6 @@ def test_load_config_strict_raises_on_invalid_json(tmp_path) -> None:
     bad = tmp_path / "broken.json"
     bad.write_text("{invalid json", encoding="utf-8")
 
-
     with pytest.raises(ValueError, match="Failed to load config"):
         load_config(config_path=bad, allow_env_override=False, strict=True)
 
@@ -257,7 +322,6 @@ def test_load_config_strict_raises_on_invalid_tools_shape(tmp_path) -> None:
     bad = tmp_path / "broken-shape-strict.json"
     bad.write_text(json.dumps({"tools": "invalid-shape"}), encoding="utf-8")
 
-
     with pytest.raises(ValueError, match="Failed to validate config"):
         load_config(config_path=bad, allow_env_override=True, strict=True)
 
@@ -265,7 +329,6 @@ def test_load_config_strict_raises_on_invalid_tools_shape(tmp_path) -> None:
 def test_load_config_strict_without_env_override_rejects_invalid_section_shape(tmp_path) -> None:
     bad = tmp_path / "broken-shape-strict-no-env.json"
     bad.write_text(json.dumps({"tools": "invalid-shape"}), encoding="utf-8")
-
 
     with pytest.raises(ValueError, match="config section 'tools' must be an object"):
         load_config(config_path=bad, allow_env_override=False, strict=True)

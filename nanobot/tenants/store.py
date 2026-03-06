@@ -33,12 +33,12 @@ else:
     import fcntl
 
 from nanobot.config.loader import (
-    _build_config_without_env,
-    _ensure_no_unknown_config_keys,
-    _migrate_config,
+    build_config_without_env,
     convert_keys,
     convert_to_camel,
+    ensure_no_unknown_config_keys,
     load_config,
+    migrate_config_data,
 )
 from nanobot.config.schema import Config, TenantChannelOverride
 from nanobot.tenants.types import TenantContext
@@ -46,6 +46,7 @@ from nanobot.tenants.validation import (
     ConfigOwnershipValidator,
     ConfigValidationError,
     validate_tenant_id,
+    workspace_routing_channel_names,
 )
 from nanobot.utils.helpers import ensure_dir, get_data_path, safe_filename
 from nanobot.utils.workspace import create_workspace_templates
@@ -171,7 +172,6 @@ _RESERVED_TENANT_IDS = {
 }
 
 _TENANT_CONFIG_ALLOWED_ROOT_KEYS = ("agents", "tools", "providers", "workspace")
-_WORKSPACE_ROUTING_CHANNELS = ("feishu", "dingtalk")
 _LEGACY_WORKSPACE_ROUTING_FIELDS = (
     "allow_from",
     "group_policy",
@@ -226,17 +226,16 @@ def _parse_legacy_bool(value: Any) -> bool | None:
 
 
 def _tenant_allowed_root_data(data: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: deepcopy(data[key])
-        for key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS
-        if key in data
-    }
+    return {key: deepcopy(data[key]) for key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS if key in data}
 
 
 def _tenant_source_passthrough(data: dict[str, Any]) -> dict[str, Any]:
     passthrough: dict[str, Any] = {}
     for key, value in data.items():
-        if key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS or key in _TENANT_CONFIG_SOURCE_EXCLUDED_ROOT_KEYS:
+        if (
+            key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS
+            or key in _TENANT_CONFIG_SOURCE_EXCLUDED_ROOT_KEYS
+        ):
             continue
         passthrough[key] = deepcopy(value)
     return passthrough
@@ -555,8 +554,8 @@ class TenantStore:
         baseline = self._baseline_config_data()
         effective_cfg_dict = _deep_merge_dicts(baseline, tenant_cfg_dict)
         try:
-            _ensure_no_unknown_config_keys(effective_cfg_dict)
-            config = _build_config_without_env(effective_cfg_dict, strict_section_types=True)
+            ensure_no_unknown_config_keys(effective_cfg_dict)
+            config = build_config_without_env(effective_cfg_dict, strict_section_types=True)
         except ValueError as exc:
             raise _tenant_config_schema_error(tenant_id, exc) from exc
 
@@ -574,7 +573,9 @@ class TenantStore:
         tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
         snapshot = self._loaded_config_snapshot(config)
-        baseline = deepcopy(snapshot.baseline) if snapshot is not None else self._baseline_config_data()
+        baseline = (
+            deepcopy(snapshot.baseline) if snapshot is not None else self._baseline_config_data()
+        )
         current_effective = _tenant_allowed_root_data(config.model_dump())
         baseline_allowed = _tenant_allowed_root_data(baseline)
 
@@ -793,7 +794,7 @@ class TenantStore:
                 "Tenant configuration root must be an object.",
             )
 
-        return convert_keys(_migrate_config(raw))
+        return convert_keys(migrate_config_data(raw))
 
     def _read_tenant_config_data(self, tenant_id: str, config_path: Path) -> dict[str, Any]:
         return self._normalize_tenant_config_data(
@@ -836,7 +837,7 @@ class TenantStore:
 
         default_routing = TenantChannelOverride().model_dump(exclude_none=True)
 
-        for channel_name in _WORKSPACE_ROUTING_CHANNELS:
+        for channel_name in workspace_routing_channel_names():
             legacy_channel = legacy_channels.get(channel_name)
             if not isinstance(legacy_channel, dict):
                 continue

@@ -26,8 +26,12 @@ from nanobot.config.schema import (
 )
 
 
-def _build_config_without_env(data: dict[str, Any], *, strict_section_types: bool = False) -> Config:
-    """Build Config from dict/defaults without reading process env vars."""
+def build_config_without_env(data: dict[str, Any], *, strict_section_types: bool = False) -> Config:
+    """Build ``Config`` from explicit data without reading process env vars.
+
+    This is a stable helper for isolated config loaders such as tenant/workspace
+    stores that must never inherit host ``NANOBOT_*`` overrides.
+    """
 
     def _section(name: str, model_cls):
         raw = data.get(name, {})
@@ -137,7 +141,7 @@ def _collect_unknown_config_keys(
     return unknown
 
 
-def _ensure_no_unknown_config_keys(data: dict[str, Any]) -> None:
+def ensure_no_unknown_config_keys(data: dict[str, Any]) -> None:
     unknown = sorted(set(_collect_unknown_config_keys(data, Config)))
     if not unknown:
         return
@@ -170,7 +174,7 @@ def load_config(
                 data = loaded
             else:
                 raise ValueError("config root must be an object")
-            data = _migrate_config(data)
+            data = migrate_config_data(data)
         except (json.JSONDecodeError, ValueError) as e:
             if strict:
                 raise ValueError(f"Failed to load config from {path}: {e}") from e
@@ -184,7 +188,7 @@ def load_config(
     merged = apply_profile_defaults(convert_keys(data), profile_name)
     try:
         if strict:
-            _ensure_no_unknown_config_keys(merged)
+            ensure_no_unknown_config_keys(merged)
 
         if allow_env_override:
             if strict:
@@ -207,7 +211,7 @@ def load_config(
 
         # Strict isolation mode: use only file + code defaults, never process env.
         # Non-strict mode still rejects root/section shape errors and degrades with warnings.
-        return _build_config_without_env(merged, strict_section_types=True)
+        return build_config_without_env(merged, strict_section_types=True)
     except (ValidationError, ValueError) as e:
         if strict:
             if isinstance(e, ValidationError):
@@ -236,8 +240,8 @@ def load_config(
                 return config
             if fallback_error is not None:
                 print(f"Warning: Failed to apply fallback env overrides: {fallback_error}")
-            return _build_config_without_env(fallback, strict_section_types=False)
-        return _build_config_without_env(fallback)
+            return build_config_without_env(fallback, strict_section_types=False)
+        return build_config_without_env(fallback)
 
 
 def _build_config_with_pruned_env_overrides(
@@ -370,8 +374,8 @@ def save_config(config: Config, config_path: Path | None = None) -> None:
         pass
 
 
-def _migrate_config(data: dict) -> dict:
-    """Migrate old config formats to current."""
+def migrate_config_data(data: dict[str, Any]) -> dict[str, Any]:
+    """Migrate legacy config payloads to the current schema."""
     # Move tools.exec.restrictToWorkspace -> tools.restrictToWorkspace
     tools = data.get("tools")
     if not isinstance(tools, dict):
@@ -382,6 +386,12 @@ def _migrate_config(data: dict) -> dict:
     if "restrictToWorkspace" in exec_cfg and "restrictToWorkspace" not in tools:
         tools["restrictToWorkspace"] = exec_cfg.pop("restrictToWorkspace")
     return data
+
+
+# Backward-compatible aliases for legacy imports.
+_build_config_without_env = build_config_without_env
+_ensure_no_unknown_config_keys = ensure_no_unknown_config_keys
+_migrate_config = migrate_config_data
 
 
 _PRESERVE_MAPPING_KEY_FIELDS = {"extra_headers", "headers", "env", "mcp_servers"}

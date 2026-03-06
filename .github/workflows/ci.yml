@@ -7,21 +7,21 @@ on:
     branches: [main, saas-main]
 
 jobs:
-  lint-and-test:
+  python-checks:
+    name: Python lint / architecture / tests
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        python-version: ["3.11"]
+    timeout-minutes: 20
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
+          python-version: "3.11"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
@@ -34,6 +34,65 @@ jobs:
         run: |
           python scripts/check_architecture.py
 
-      - name: Run tests
+      - name: Run pytest
         run: |
           pytest -q
+
+  dashboard-react:
+    name: Dashboard React typecheck / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: nanobot/web/dashboard-react
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: nanobot/web/dashboard-react/package-lock.json
+
+      - name: Install dashboard dependencies
+        run: npm ci
+
+      - name: Run dashboard typecheck
+        run: npm run lint
+
+      - name: Build dashboard
+        run: npm run build
+
+      - name: Verify committed static assets are up to date
+        run: |
+          if [ -n "$(git status --short --untracked-files=all -- ../static)" ]; then
+            git status --short --untracked-files=all -- ../static
+            echo "Dashboard static assets are out of date. Run npm run build in nanobot/web/dashboard-react and commit nanobot/web/static."
+            exit 1
+          fi
+
+  bridge-build:
+    name: Bridge install / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: bridge
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Install bridge dependencies
+        run: npm ci
+
+      - name: Build bridge
+        run: npm run build

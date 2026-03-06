@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 
 from nanobot.config.schema import Config, TenantChannelOverride
+from nanobot.tenants.validation import (
+    is_workspace_routing_channel,
+    normalize_workspace_routing_channel_name,
+)
 
 _EMPTY_SENDER_MARKERS = {"", "unknown", "none", "null"}
 
@@ -30,9 +34,13 @@ def normalize_dingtalk_conversation_type(value: Any) -> str:
 
 
 def routing_policy_for_channel(config: Config, channel_name: str) -> TenantChannelOverride | None:
+    normalized = normalize_workspace_routing_channel_name(channel_name)
+    if not is_workspace_routing_channel(normalized):
+        return None
+
     workspace = getattr(config, "workspace", None)
     channels = getattr(workspace, "channels", None)
-    policy = getattr(channels, str(channel_name or "").strip().lower(), None)
+    policy = getattr(channels, normalized, None)
     return policy if isinstance(policy, TenantChannelOverride) else None
 
 
@@ -55,8 +63,8 @@ def evaluate_workspace_channel_routing(
     group_id: str | None,
     metadata: dict[str, Any] | None,
 ) -> ChannelRoutingDecision:
-    channel = str(channel_name or "").strip().lower()
-    if channel not in {"feishu", "dingtalk"}:
+    channel = normalize_workspace_routing_channel_name(channel_name)
+    if not is_workspace_routing_channel(channel):
         return ChannelRoutingDecision(allowed=True)
 
     normalized_sender = normalize_sender_id(sender_id)

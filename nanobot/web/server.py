@@ -418,6 +418,11 @@ def create_app(
         normalized_runtime_mode = "multi"
     app.state.runtime_mode = normalized_runtime_mode
     app.state.runtime_scope = "global" if normalized_runtime_mode == "single" else "tenant"
+
+    # Help docs registry (curated, slug-based; avoids arbitrary file reads).
+    from nanobot.services.help_docs import HelpDocsRegistry
+
+    app.state.help_docs_registry = HelpDocsRegistry.default()
     initialize_tenant_session_manager_cache(
         app,
         getattr(config.traffic, "web_tenant_session_manager_max_entries", 256),
@@ -752,6 +757,7 @@ def create_app(
     from nanobot.web.api.channels import router as channels_router
     from nanobot.web.api.chat import router as chat_router
     from nanobot.web.api.cron import router as cron_router
+    from nanobot.web.api.help import router as help_router
     from nanobot.web.api.providers import router as providers_router
     from nanobot.web.api.security import router as security_router
     from nanobot.web.api.skills import router as skills_router
@@ -766,6 +772,7 @@ def create_app(
     app.include_router(beta_router)
     app.include_router(skills_router)
     app.include_router(security_router)
+    app.include_router(help_router)
     app.include_router(chat_router)
 
     # Ensure web channel is registered so ChannelManager can route OutboundMessage(channel="web").

@@ -1,0 +1,80 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import nanobot.help_docs as bundled_help_docs
+from nanobot.services.help_docs import HelpDocError, HelpDocSource, HelpDocSpec, HelpDocsRegistry
+
+
+def test_help_docs_registry_get_doc_reads_markdown(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    (docs_dir / "ok.md").write_text("# ok\n", encoding="utf-8")
+
+    registry = HelpDocsRegistry(
+        docs_dir=docs_dir,
+        specs=(
+            HelpDocSpec(
+                slug="ok",
+                title="OK",
+                relative_path=Path("ok.md"),
+                source=HelpDocSource(kind="test", path="docs/ok.md"),
+            ),
+        ),
+    )
+
+    doc = registry.get_doc("ok")
+    assert doc is not None
+    assert doc.slug == "ok"
+    assert doc.title == "OK"
+    assert doc.source.kind == "test"
+    assert doc.source.path == "docs/ok.md"
+    assert "# ok" in doc.markdown
+
+
+def test_help_docs_registry_returns_none_for_unknown_slug(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    registry = HelpDocsRegistry(docs_dir=docs_dir, specs=())
+    assert registry.get_doc("missing") is None
+
+
+def test_help_docs_registry_rejects_path_escape(tmp_path: Path) -> None:
+    docs_dir = tmp_path / "docs"
+    docs_dir.mkdir(parents=True, exist_ok=True)
+
+    registry = HelpDocsRegistry(
+        docs_dir=docs_dir,
+        specs=(
+            HelpDocSpec(
+                slug="escape",
+                title="Escape",
+                relative_path=Path("../escape.md"),
+                source=HelpDocSource(kind="test", path="docs/escape.md"),
+            ),
+        ),
+    )
+
+    with pytest.raises(HelpDocError) as exc_info:
+        registry.get_doc("escape")
+
+    assert exc_info.value.reason_code == "help_doc_path_escape"
+
+
+def test_default_registry_uses_bundled_help_docs_that_match_repo_docs() -> None:
+    registry = HelpDocsRegistry.default()
+    bundled_dir = Path(bundled_help_docs.__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[2]
+
+    assert registry.docs_dir == bundled_dir
+
+    bundled_workspace = (bundled_dir / "workspace-routing-and-binding.md").read_text(encoding="utf-8")
+    repo_workspace = (repo_root / "docs/howto/workspace-routing-and-binding.md").read_text(encoding="utf-8")
+    assert bundled_workspace == repo_workspace
+
+    doc = registry.get_doc("workspace-routing-and-binding")
+    assert doc is not None
+    assert doc.source.path == "docs/howto/workspace-routing-and-binding.md"
+    assert doc.markdown == repo_workspace

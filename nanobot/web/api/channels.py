@@ -12,6 +12,12 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from nanobot.config.loader import save_config
 from nanobot.config.schema import ChannelsConfig, Config, TenantChannelOverride
 from nanobot.services.config_ownership import ConfigOwnershipService, ConfigScope
+from nanobot.tenants.validation import (
+    is_workspace_routing_channel,
+    normalize_workspace_routing_channel_name,
+    workspace_routing_channel_display_name,
+    workspace_routing_channel_names,
+)
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.tenant import load_tenant_config, save_tenant_config
@@ -30,9 +36,7 @@ _WORKSPACE_ROUTING_SCOPE_WARNING = (
 _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
     "Workspace-scoped channel routing is unavailable in single-tenant runtime mode."
 )
-
-WORKSPACE_CHANNEL_NAMES = ("feishu", "dingtalk")
-
+_WORKSPACE_ROUTING_HELP_SLUG = "workspace-routing-and-binding"
 
 SENSITIVE_KEYS = {
     "token",
@@ -326,12 +330,12 @@ def _ensure_channel(name: str) -> None:
 
 
 def _workspace_channel_names() -> tuple[str, ...]:
-    return WORKSPACE_CHANNEL_NAMES
+    return workspace_routing_channel_names()
 
 
 def _ensure_workspace_channel(name: str) -> str:
-    normalized = str(name or "").strip().lower()
-    if normalized not in _workspace_channel_names():
+    normalized = normalize_workspace_routing_channel_name(name)
+    if not is_workspace_routing_channel(normalized):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workspace channel")
     return normalized
 
@@ -346,11 +350,13 @@ def _workspace_require_mention(policy: str) -> bool:
 
 def _workspace_binding_instructions(name: str) -> str:
     normalized = _ensure_workspace_channel(name)
-    channel_display = "Feishu" if normalized == "feishu" else "DingTalk"
+    channel_display = workspace_routing_channel_display_name(normalized)
     return (
-        "1. In any identity already linked to the workspace, send `!link` to generate a one-time code.\n"
-        f"2. In {channel_display}, send `!link <CODE>` to bind the current identity.\n"
-        "3. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
+        "1. (Safety) Run `!link` in a private chat/DM to avoid leaking the one-time code in a group.\n"
+        "2. In any identity already linked to the workspace, send `!link` to generate a one-time code.\n"
+        f"3. In {channel_display}, send `!link <CODE>` to bind the current identity.\n"
+        "4. Run `!whoami` to verify the tenant_id and linked identities.\n"
+        "5. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
     )
 
 
@@ -419,6 +425,7 @@ def _workspace_runtime_meta(
     payload["config_scope"] = ConfigScope.WORKSPACE.value
     payload["takes_effect"] = _workspace_takes_effect()
     payload["runtime_warning"] = _WORKSPACE_ROUTING_SCOPE_WARNING
+    payload["help_slug"] = _WORKSPACE_ROUTING_HELP_SLUG
     payload.update(_workspace_write_status(request, channel_name=channel_name))
     return payload
 

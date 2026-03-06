@@ -14,7 +14,7 @@ from pathlib import Path
 
 from nanobot.utils.fs import dir_size_bytes
 
-_SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 @dataclass(frozen=True)
@@ -33,7 +33,7 @@ class SkillUninstallResult:
 
 
 class SkillManagementService:
-    """Workspace skill installation/uninstallation from a local store directory."""
+    """Workspace skill installation/uninstallation from local filesystem sources."""
 
     def __init__(self, *, skill_store_dir: Path) -> None:
         self.skill_store_dir = Path(skill_store_dir).expanduser()
@@ -43,9 +43,9 @@ class SkillManagementService:
         if not root.exists():
             return []
         names: list[str] = []
-        for p in root.iterdir():
-            if p.is_dir() and (p / "SKILL.md").exists():
-                names.append(p.name)
+        for path in root.iterdir():
+            if path.is_dir() and (path / "SKILL.md").exists():
+                names.append(path.name)
         return sorted(names)
 
     def list_installable(self) -> list[str]:
@@ -55,20 +55,23 @@ class SkillManagementService:
         ws = Path(workspace).expanduser()
         return self._list_skill_dirs(ws / "skills")
 
-    def install_from_store(
+    def install_from_source(
         self,
         *,
         name: str,
+        source: str,
+        source_dir: Path,
         workspace: Path,
         workspace_quota_mib: int = 0,
     ) -> SkillInstallResult:
         skill_name = str(name or "").strip()
+        source_name = str(source or "store").strip() or "store"
         if not _SKILL_NAME_RE.fullmatch(skill_name):
-            return SkillInstallResult(installed=False, reason_code="invalid_name")
+            return SkillInstallResult(installed=False, reason_code="invalid_name", source=source_name)
 
-        src = self.skill_store_dir / skill_name
+        src = Path(source_dir).expanduser()
         if not (src / "SKILL.md").exists():
-            return SkillInstallResult(installed=False, reason_code="not_found")
+            return SkillInstallResult(installed=False, reason_code="not_found", source=source_name)
 
         ws = Path(workspace).expanduser()
         dst_root = ws / "skills"
@@ -76,7 +79,7 @@ class SkillManagementService:
         dst = dst_root / skill_name
 
         if (dst / "SKILL.md").exists():
-            return SkillInstallResult(installed=True, already_installed=True)
+            return SkillInstallResult(installed=True, already_installed=True, source=source_name)
 
         quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
         if quota_bytes > 0:
@@ -85,7 +88,11 @@ class SkillManagementService:
             skill_size = dir_size_bytes(src)
             projected_size = max(0, current_size - existing_size) + skill_size
             if projected_size > quota_bytes:
-                return SkillInstallResult(installed=False, reason_code="workspace_quota_exceeded")
+                return SkillInstallResult(
+                    installed=False,
+                    reason_code="workspace_quota_exceeded",
+                    source=source_name,
+                )
 
         tmp_dst = dst_root / f".{skill_name}.tmp-{uuid.uuid4().hex}"
         backup_dst = dst_root / f".{skill_name}.bak-{uuid.uuid4().hex}"
@@ -102,7 +109,27 @@ class SkillManagementService:
             if backup_dst.exists():
                 shutil.rmtree(backup_dst, ignore_errors=True)
 
-        return SkillInstallResult(installed=True, already_installed=False, repaired=repaired)
+        return SkillInstallResult(
+            installed=True,
+            already_installed=False,
+            repaired=repaired,
+            source=source_name,
+        )
+
+    def install_from_store(
+        self,
+        *,
+        name: str,
+        workspace: Path,
+        workspace_quota_mib: int = 0,
+    ) -> SkillInstallResult:
+        return self.install_from_source(
+            name=name,
+            source="store",
+            source_dir=self.skill_store_dir / str(name or "").strip(),
+            workspace=workspace,
+            workspace_quota_mib=workspace_quota_mib,
+        )
 
     def uninstall(
         self,

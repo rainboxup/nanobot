@@ -229,7 +229,9 @@ async def test_skill_install_local_source_rejects_slug_or_version(http_client, a
         json={"name": "clawhub", "source": "local", "slug": "remote-skill"},
     )
     assert bad.status_code == 422
-    assert "cannot include slug or version" in str(bad.json().get("detail") or "")
+    detail = dict(bad.json().get("detail") or {})
+    assert detail.get("reason_code") == "local_source_disallows_slug_or_version"
+    assert "cannot include slug or version" in str(detail.get("message") or "")
 
 
 @pytest.mark.integration
@@ -258,7 +260,9 @@ async def test_skill_install_from_clawhub_rejects_malicious_zip_paths(
         json={"name": "remote-malicious", "source": "clawhub", "slug": "remote-malicious"},
     )
     assert install.status_code == 502
-    assert "ClawHub package error" in str(install.json().get("detail") or "")
+    detail = dict(install.json().get("detail") or {})
+    assert detail.get("reason_code") == "clawhub_package_error"
+    assert "ClawHub package error" in str(detail.get("message") or "")
 
     tenant_ctx = web_ctx.tenant_store.ensure_tenant_files("admin")
     installed_dir = tenant_ctx.workspace / "skills" / "remote-malicious"
@@ -409,6 +413,17 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
         json={"name": "../bad"},
     )
     assert bad_name.status_code == 422
+    bad_name_detail = dict(bad_name.json().get("detail") or {})
+    assert bad_name_detail.get("reason_code") == "invalid_skill_name"
+
+    non_object = await http_client.post(
+        "/api/skills/install",
+        headers=await auth_headers_for("admin-skill-non-object", role="admin", tenant_id="admin-skill-non-object"),
+        json=[],
+    )
+    assert non_object.status_code == 422
+    non_object_detail = dict(non_object.json().get("detail") or {})
+    assert non_object_detail.get("reason_code") == "invalid_skill_install_request"
 
     unknown_fields = await http_client.post(
         "/api/skills/install",
@@ -416,6 +431,10 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
         json={"name": "not-exists-skill", "unexpected_field": True},
     )
     assert unknown_fields.status_code == 422
+    unknown_fields_detail = dict(unknown_fields.json().get("detail") or {})
+    assert unknown_fields_detail.get("reason_code") == "invalid_skill_install_request"
+    errors = list(dict(unknown_fields_detail.get("details") or {}).get("errors") or [])
+    assert any("unexpected_field" in str(error.get("loc") or "") for error in errors)
 
     missing = await http_client.post(
         "/api/skills/install",
@@ -423,6 +442,9 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
         json={"name": "not-exists-skill"},
     )
     assert missing.status_code == 404
+    missing_detail = dict(missing.json().get("detail") or {})
+    assert missing_detail.get("reason_code") == "skill_not_found"
+    assert dict(missing_detail.get("details") or {}).get("name") == "not-exists-skill"
 
 
 @pytest.mark.integration
@@ -478,6 +500,17 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "filesystem", "name": "bad/name"},
     )
     assert bad_name.status_code == 422
+    bad_name_detail = dict(bad_name.json().get("detail") or {})
+    assert bad_name_detail.get("reason_code") == "invalid_mcp_server_name"
+
+    non_object = await http_client.post(
+        "/api/mcp/install",
+        headers=await auth_headers_for("admin-mcp-non-object", role="admin", tenant_id="admin-mcp-non-object"),
+        json=[],
+    )
+    assert non_object.status_code == 422
+    non_object_detail = dict(non_object.json().get("detail") or {})
+    assert non_object_detail.get("reason_code") == "invalid_mcp_install_request"
 
     bad_preset = await http_client.post(
         "/api/mcp/install",
@@ -485,6 +518,9 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "missing-preset"},
     )
     assert bad_preset.status_code == 404
+    bad_preset_detail = dict(bad_preset.json().get("detail") or {})
+    assert bad_preset_detail.get("reason_code") == "mcp_preset_not_found"
+    assert dict(bad_preset_detail.get("details") or {}).get("preset") == "missing-preset"
 
     unknown_fields = await http_client.post(
         "/api/mcp/install",
@@ -492,6 +528,10 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "missing-preset", "unexpected_field": True},
     )
     assert unknown_fields.status_code == 422
+    unknown_fields_detail = dict(unknown_fields.json().get("detail") or {})
+    assert unknown_fields_detail.get("reason_code") == "invalid_mcp_install_request"
+    errors = list(dict(unknown_fields_detail.get("details") or {}).get("errors") or [])
+    assert any("unexpected_field" in str(error.get("loc") or "") for error in errors)
 
     first = await http_client.post(
         "/api/mcp/install",
@@ -505,6 +545,9 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "filesystem", "name": "dup-server"},
     )
     assert second.status_code == 409
+    second_detail = dict(second.json().get("detail") or {})
+    assert second_detail.get("reason_code") == "mcp_server_already_installed"
+    assert dict(second_detail.get("details") or {}).get("name") == "dup-server"
 
 
 @pytest.mark.integration
@@ -591,6 +634,19 @@ async def test_tools_policy_put_requires_admin(http_client, auth_headers_for) ->
         json={"exec_enabled": True, "web_enabled": True},
     )
     assert denied.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_tools_policy_put_validates_non_object_payload(http_client, auth_headers) -> None:
+    invalid = await http_client.put(
+        "/api/tools/policy",
+        headers=auth_headers,
+        json=[],
+    )
+    assert invalid.status_code == 422
+    detail = dict(invalid.json().get("detail") or {})
+    assert detail.get("reason_code") == "invalid_tool_policy_request"
 
 
 @pytest.mark.integration
@@ -775,7 +831,9 @@ async def test_tools_policy_exposes_runtime_and_write_metadata_in_single_mode(
         json={"exec_enabled": True, "web_enabled": True},
     )
     assert denied.status_code == 409
-    assert "single-tenant runtime mode" in str(denied.json().get("detail") or "").lower()
+    denied_detail = dict(denied.json().get("detail") or {})
+    assert denied_detail.get("reason_code") == "single_tenant_runtime_mode"
+    assert "single-tenant runtime mode" in str(denied_detail.get("message") or "").lower()
 
 
 @pytest.mark.integration
@@ -970,3 +1028,40 @@ async def test_skill_catalog_includes_workspace_only_installed_skill(
     assert bool(item.get("installed")) is True
     assert item.get("source") == "workspace"
 
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_and_mcp_writes_are_blocked_in_single_mode(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+    admin_headers = await auth_headers_for("single-mode-admin", role="admin", tenant_id="tenant-single")
+
+    blocked_skill = await http_client.post(
+        "/api/skills/install",
+        headers=admin_headers,
+        json={"name": "clawhub"},
+    )
+    assert blocked_skill.status_code == 409
+    blocked_skill_detail = dict(blocked_skill.json().get("detail") or {})
+    assert blocked_skill_detail.get("reason_code") == "single_tenant_runtime_mode"
+
+    blocked_skill_delete = await http_client.delete("/api/skills/clawhub", headers=admin_headers)
+    assert blocked_skill_delete.status_code == 409
+    blocked_skill_delete_detail = dict(blocked_skill_delete.json().get("detail") or {})
+    assert blocked_skill_delete_detail.get("reason_code") == "single_tenant_runtime_mode"
+
+    blocked_mcp = await http_client.post(
+        "/api/mcp/install",
+        headers=admin_headers,
+        json={"preset": "filesystem"},
+    )
+    assert blocked_mcp.status_code == 409
+    blocked_mcp_detail = dict(blocked_mcp.json().get("detail") or {})
+    assert blocked_mcp_detail.get("reason_code") == "single_tenant_runtime_mode"
+
+    blocked_mcp_delete = await http_client.delete("/api/mcp/servers/filesystem", headers=admin_headers)
+    assert blocked_mcp_delete.status_code == 409
+    blocked_mcp_delete_detail = dict(blocked_mcp_delete.json().get("detail") or {})
+    assert blocked_mcp_delete_detail.get("reason_code") == "single_tenant_runtime_mode"

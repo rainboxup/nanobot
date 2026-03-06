@@ -19,6 +19,17 @@ from nanobot.services.soul_layering import (
     SoulLayer,
     SoulLayeringService,
 )
+from nanobot.services.workspace_mcp import (
+    DEFAULT_MCP_PRESETS,
+    WorkspaceMCPError,
+    WorkspaceMCPService,
+)
+from nanobot.services.workspace_skill_installs import (
+    SkillInstallPlan,
+    WorkspaceSkillInstallError,
+    WorkspaceSkillInstallService,
+)
+from nanobot.services.workspace_tool_policy import WorkspaceToolPolicyService
 
 __all__ = [
     "ConfigOwnershipService",
@@ -32,4 +43,11 @@ __all__ = [
     "EffectiveSoul",
     "SoulLayer",
     "SoulLayeringService",
+    "DEFAULT_MCP_PRESETS",
+    "WorkspaceMCPError",
+    "WorkspaceMCPService",
+    "SkillInstallPlan",
+    "WorkspaceSkillInstallError",
+    "WorkspaceSkillInstallService",
+    "WorkspaceToolPolicyService",
 ]

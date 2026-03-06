@@ -2,27 +2,22 @@
 
 from __future__ import annotations
 
-import asyncio
 import base64
-import io
 import json
 import re
-import shutil
-import stat
-import tempfile
-import threading
-import uuid
-import zipfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from nanobot.agent.skills import SkillsLoader
-from nanobot.config.schema import MCPServerConfig
-from nanobot.tenants.policy import allowlist_match, resolve_exec_effective, resolve_web_effective
-from nanobot.utils.fs import dir_size_bytes
+from nanobot.services.workspace_mcp import WorkspaceMCPError, WorkspaceMCPService
+from nanobot.services.workspace_skill_installs import (
+    WorkspaceSkillInstallError,
+    WorkspaceSkillInstallService,
+)
+from nanobot.services.workspace_tool_policy import WorkspaceToolPolicyService
 from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.services.clawhub_client import ClawHubClient, ClawHubClientError
@@ -31,52 +26,15 @@ from nanobot.web.tenant import load_tenant_config, save_tenant_config
 from nanobot.web.user_store import ROLE_OWNER
 
 router = APIRouter()
+_TOOL_POLICY_SERVICE = WorkspaceToolPolicyService()
+_MCP_SERVICE = WorkspaceMCPService()
 _SINGLE_TENANT_WRITE_BLOCK_DETAIL = (
     "Tenant-scoped updates are disabled in single-tenant runtime mode; "
     "update global runtime configuration instead."
 )
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-_SKILL_SLUG_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
-_SKILL_VERSION_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CATALOG_SOURCES = {"local", "clawhub", "all"}
 _CATALOG_CURSOR_PREFIX = "nbc1:"
-_ZIP_MAX_ENTRIES = 512
-_ZIP_MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
-_ZIP_MAX_SINGLE_FILE = 8 * 1024 * 1024
-_ZIP_MAX_PATH_DEPTH = 12
-_ZIP_MAX_COMPRESSION_RATIO = 200.0
-_lock_registry_guard = threading.Lock()
-_skill_locks: dict[str, asyncio.Lock] = {}
-_tenant_locks: dict[str, asyncio.Lock] = {}
-
-_MCP_PRESETS: list[dict[str, Any]] = [
-    {
-        "id": "filesystem",
-        "name": "Filesystem",
-        "category": "Local",
-        "description": "访问 tenant workspace 目录（推荐首装）。",
-        "transport": "stdio",
-        "config": {
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-filesystem", "{workspace}"],
-            "tool_timeout": 30,
-        },
-    },
-    {
-        "id": "fetch",
-        "name": "Fetch",
-        "category": "Web",
-        "description": "抓取与解析网页内容。",
-        "transport": "stdio",
-        "config": {
-            "command": "npx",
-            "args": ["-y", "@modelcontextprotocol/server-fetch"],
-            "tool_timeout": 30,
-        },
-    },
-]
-
 
 class SkillInstallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -101,24 +59,6 @@ class ToolPolicyUpdateRequest(BaseModel):
     web_enabled: bool | None = None
 
 
-def _skill_lock(key: str) -> asyncio.Lock:
-    with _lock_registry_guard:
-        lock = _skill_locks.get(key)
-        if lock is None:
-            lock = asyncio.Lock()
-            _skill_locks[key] = lock
-        return lock
-
-
-def _tenant_lock(tenant_id: str) -> asyncio.Lock:
-    with _lock_registry_guard:
-        lock = _tenant_locks.get(tenant_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            _tenant_locks[tenant_id] = lock
-        return lock
-
-
 def _tenant_skills_loader(
     request: Request, user: dict[str, Any]
 ) -> tuple[SkillsLoader, str, Any, Any, Path]:
@@ -130,10 +70,6 @@ def _tenant_skills_loader(
 def _runtime_mode(request: Request) -> str:
     mode = str(getattr(request.app.state, "runtime_mode", "multi") or "multi").strip().lower()
     return "single" if mode == "single" else "multi"
-
-
-def _runtime_scope(runtime_mode: str) -> str:
-    return "global" if runtime_mode == "single" else "tenant"
 
 
 def _runtime_warning(runtime_mode: str) -> str | None:
@@ -156,23 +92,103 @@ def _write_status(runtime_mode: str) -> dict[str, Any]:
     }
 
 
+def _normalize_query(value: str | None) -> str | None:
+    normalized = str(value or "").strip()
+    return normalized or None
+
+
+def _api_error_detail(
+    reason_code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "reason_code": str(reason_code or "").strip() or "skills_api_error",
+        "message": str(message or "").strip() or "Request failed.",
+    }
+    if details:
+        payload["details"] = details
+    return payload
+
+
+def _service_http_exception(exc: Any) -> HTTPException:
+    return HTTPException(
+        status_code=int(getattr(exc, "status_code", status.HTTP_500_INTERNAL_SERVER_ERROR)),
+        detail=_api_error_detail(
+            str(getattr(exc, "reason_code", "skills_api_error") or "skills_api_error"),
+            str(exc),
+            details=getattr(exc, "details", None) or None,
+        ),
+    )
+
+
+def _tool_policy_payload(
+    request: Request,
+    *,
+    user: dict[str, Any],
+    tenant_id: str,
+    cfg: Any,
+) -> dict[str, Any]:
+    runtime_mode = _runtime_mode(request)
+    return _TOOL_POLICY_SERVICE.build_payload(
+        system_cfg=getattr(request.app.state, "config", None),
+        tenant_cfg=cfg,
+        tenant_id=tenant_id,
+        identities=_web_identities(user, tenant_id),
+        role=str(user.get("role") or ""),
+        runtime_mode=runtime_mode,
+        write_status=_write_status(runtime_mode),
+        runtime_cache=web_session_cache_metrics(request.app),
+        runtime_warning=_runtime_warning(runtime_mode),
+        owner_role=ROLE_OWNER,
+    )
+
+
+def _list_skill_dirs(root: Path | None) -> dict[str, Path]:
+    result: dict[str, Path] = {}
+    if root is None or not root.exists():
+        return result
+    for skill_dir in root.iterdir():
+        if not skill_dir.is_dir():
+            continue
+        if (skill_dir / "SKILL.md").exists():
+            result[skill_dir.name] = skill_dir
+    return result
+
+
+def _workspace_skill_names(loader: SkillsLoader) -> set[str]:
+    return set(_list_skill_dirs(loader.workspace_skills))
+
+
+def _validate_request_model(
+    model_cls: type[BaseModel],
+    payload: Any = Body(default=None),
+    *,
+    reason_code: str,
+) -> BaseModel:
+    try:
+        return model_cls.model_validate(payload)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=_api_error_detail(
+                reason_code,
+                "Request payload is invalid.",
+                details={"errors": exc.errors(include_url=False)},
+            ),
+        ) from exc
+
+
 def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
     if _runtime_mode(request) == "single":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL)
-
-
-def _to_str_set(values: Any) -> set[str]:
-    out: set[str] = set()
-    if isinstance(values, (list, tuple, set)):
-        for item in values:
-            text = str(item or "").strip()
-            if text:
-                out.add(text)
-    return out
-
-
-def _allowlist_match(wl: set[str], tenant_id: str, identities: list[str]) -> bool:
-    return allowlist_match(wl, tenant_id, identities)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "single_tenant_runtime_mode",
+                _SINGLE_TENANT_WRITE_BLOCK_DETAIL,
+            ),
+        )
 
 
 def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
@@ -190,148 +206,6 @@ def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
         seen.add(item)
         deduped.append(item)
     return deduped
-
-
-def _redacted_runtime_cache_payload() -> dict[str, Any]:
-    return {
-        "max_entries": 0,
-        "current_cached_tenant_session_managers": 0,
-        "evictions_total": 0,
-        "utilization": 0.0,
-    }
-
-
-def _tool_policy_payload(
-    request: Request,
-    *,
-    user: dict[str, Any],
-    tenant_id: str,
-    cfg: Any,
-) -> dict[str, Any]:
-    runtime_mode = _runtime_mode(request)
-    runtime_scope = _runtime_scope(runtime_mode)
-    runtime_warn = _runtime_warning(runtime_mode)
-    write_status = _write_status(runtime_mode)
-
-    system_cfg = getattr(request.app.state, "config", None)
-    identities = _web_identities(user, tenant_id)
-    tools_cfg = getattr(cfg, "tools", None)
-    tenant_exec_cfg = getattr(tools_cfg, "exec", None)
-    tenant_web_cfg = getattr(tools_cfg, "web", None)
-
-    system_exec_enabled = bool(
-        getattr(getattr(getattr(system_cfg, "tools", None), "exec", None), "enabled", True)
-    )
-    system_exec_wl = _to_str_set(
-        getattr(getattr(getattr(system_cfg, "tools", None), "exec", None), "whitelist", None)
-    )
-    role = str(user.get("role") or "").strip().lower()
-    can_view_runtime_cache = role == ROLE_OWNER
-    can_view_system_whitelist = role == ROLE_OWNER
-    can_view_subject_identities = role == ROLE_OWNER
-    system_exec_allowlisted = _allowlist_match(system_exec_wl, tenant_id, identities)
-
-    tenant_exec_wl = _to_str_set(getattr(tenant_exec_cfg, "whitelist", None))
-    tenant_exec_policy = True if not tenant_exec_wl else _allowlist_match(tenant_exec_wl, tenant_id, identities)
-    user_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
-    tenant_exec_enabled = bool(getattr(tenant_exec_cfg, "enabled", True))
-    effective_exec, exec_reason_codes = resolve_exec_effective(
-        system_enabled=system_exec_enabled,
-        system_allowlisted=system_exec_allowlisted,
-        tenant_enabled=tenant_exec_enabled,
-        tenant_has_allowlist=bool(tenant_exec_wl),
-        tenant_allowlisted=tenant_exec_policy,
-        user_enabled=user_exec_enabled,
-    )
-
-    system_web_enabled = bool(
-        getattr(getattr(getattr(system_cfg, "tools", None), "web", None), "enabled", True)
-    )
-    tenant_web_policy = bool(getattr(tenant_web_cfg, "enabled", True))
-    user_web_enabled = bool(getattr(tenant_web_cfg, "enabled", True))
-    effective_web, web_reason_codes = resolve_web_effective(
-        system_enabled=system_web_enabled,
-        tenant_enabled=tenant_web_policy,
-        user_enabled=user_web_enabled,
-    )
-
-    warnings: list[str] = []
-    if user_exec_enabled and not effective_exec:
-        warnings.append("exec is requested but capped by system or tenant policy")
-    if user_web_enabled and not effective_web:
-        warnings.append("web tools are requested but capped by system policy")
-
-    subject_identities = identities if can_view_subject_identities else []
-    runtime_cache = (
-        web_session_cache_metrics(request.app)
-        if can_view_runtime_cache
-        else _redacted_runtime_cache_payload()
-    )
-    payload: dict[str, Any] = {
-        "runtime_mode": runtime_mode,
-        "runtime_scope": runtime_scope,
-        "runtime_cache": runtime_cache,
-        # Compatibility alias with ops/runtime naming.
-        "web_session_cache": runtime_cache,
-        "runtime_cache_redacted": bool(not can_view_runtime_cache),
-        "writable": bool(write_status["writable"]),
-        "write_block_reason_code": write_status["write_block_reason_code"],
-        "write_block_reason": write_status["write_block_reason"],
-        "takes_effect": {"exec": "runtime", "web": "runtime"},
-        "subject": {
-            "tenant_id": tenant_id,
-            "identities": subject_identities,
-            "identity_count": len(identities),
-            "identities_redacted": bool(not can_view_subject_identities and bool(identities)),
-        },
-        "system_cap": {
-            "exec": {
-                "enabled": bool(system_exec_enabled),
-                "whitelist": sorted(list(system_exec_wl)) if can_view_system_whitelist else [],
-                "whitelist_redacted": bool(not can_view_system_whitelist and bool(system_exec_wl)),
-            },
-            "web": {
-                "enabled": bool(system_web_enabled),
-            },
-        },
-        "tenant_policy": {
-            "exec": {
-                "whitelist": sorted(list(tenant_exec_wl)),
-                "allowlisted": bool(tenant_exec_policy),
-            },
-            "web": {
-                "allowlisted": bool(tenant_web_policy),
-            },
-        },
-        "user_setting": {
-            "exec": {"enabled": bool(user_exec_enabled)},
-            "web": {"enabled": bool(user_web_enabled)},
-        },
-        "effective": {
-            "exec": {"enabled": bool(effective_exec), "reason_codes": exec_reason_codes},
-            "web": {"enabled": bool(effective_web), "reason_codes": web_reason_codes},
-        },
-        "warnings": warnings,
-    }
-    if runtime_warn:
-        payload["runtime_warning"] = runtime_warn
-    return payload
-
-
-def _list_skill_dirs(root: Path | None) -> dict[str, Path]:
-    result: dict[str, Path] = {}
-    if root is None or not root.exists():
-        return result
-    for skill_dir in root.iterdir():
-        if not skill_dir.is_dir():
-            continue
-        if (skill_dir / "SKILL.md").exists():
-            result[skill_dir.name] = skill_dir
-    return result
-
-
-def _workspace_skill_names(loader: SkillsLoader) -> set[str]:
-    return set(_list_skill_dirs(loader.workspace_skills).keys())
 
 
 def _read_skill_description(skill_file: Path) -> str | None:
@@ -395,51 +269,6 @@ def _normalize_catalog_source(source: str | None) -> str:
             detail="source must be one of: local, clawhub, all",
         )
     return value
-
-
-def _normalize_install_source(source: str | None) -> str | None:
-    if source is None:
-        return None
-    value = str(source).strip().lower()
-    if not value:
-        return None
-    if value in {"builtin", "store", "workspace"}:
-        return "local"
-    if value not in {"local", "clawhub"}:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="source must be one of: local, clawhub",
-        )
-    return value
-
-
-def _normalize_query(value: str | None) -> str | None:
-    normalized = str(value or "").strip()
-    return normalized or None
-
-
-def _normalize_slug(value: str | None) -> str | None:
-    slug = _normalize_query(value)
-    if slug is None:
-        return None
-    if not _SKILL_SLUG_RE.fullmatch(slug):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid skill slug",
-        )
-    return slug
-
-
-def _normalize_version(value: str | None) -> str | None:
-    version = _normalize_query(value)
-    if version is None:
-        return None
-    if not _SKILL_VERSION_RE.fullmatch(version):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid skill version",
-        )
-    return version
 
 
 def _catalog_search_match(item: dict[str, Any], query: str | None) -> bool:
@@ -569,100 +398,6 @@ def _catalog_payload_from_clawhub_item(
         }
     )
     return payload
-
-
-def _safe_extract_skill_zip(zip_bytes: bytes, dst_root: Path) -> Path:
-    dst_root.mkdir(parents=True, exist_ok=True)
-    dst_root_resolved = dst_root.resolve()
-    with zipfile.ZipFile(io.BytesIO(zip_bytes), mode="r") as archive:
-        entries = archive.infolist()
-        if len(entries) > _ZIP_MAX_ENTRIES:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="Skill archive has too many files",
-            )
-        total_uncompressed = 0
-        for entry in entries:
-            raw_name = str(entry.filename or "")
-            normalized = raw_name.replace("\\", "/").strip()
-            while normalized.startswith("./"):
-                normalized = normalized[2:]
-            normalized = normalized.lstrip("/")
-            if not normalized:
-                continue
-
-            pure = PurePosixPath(normalized)
-            first_part = pure.parts[0] if pure.parts else ""
-            if pure.is_absolute() or ".." in pure.parts or ":" in first_part:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Invalid skill archive path",
-                )
-
-            entry_mode = (int(entry.external_attr) >> 16) & 0xFFFF
-            if stat.S_ISLNK(entry_mode):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Skill archive contains unsupported symlink",
-                )
-            if len(pure.parts) > _ZIP_MAX_PATH_DEPTH:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Skill archive path depth is too large",
-                )
-            if not entry.is_dir():
-                file_size = max(0, int(entry.file_size))
-                compressed_size = max(0, int(entry.compress_size))
-                if file_size > _ZIP_MAX_SINGLE_FILE:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="Skill archive contains oversized file",
-                    )
-                total_uncompressed += file_size
-                if total_uncompressed > _ZIP_MAX_TOTAL_UNCOMPRESSED:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="Skill archive size exceeds limit",
-                    )
-                if compressed_size > 0 and (file_size / compressed_size) > _ZIP_MAX_COMPRESSION_RATIO:
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="Skill archive compression ratio is suspicious",
-                    )
-
-            rel = Path(*pure.parts)
-            target = dst_root / rel
-            target_resolved = target.resolve()
-            try:
-                target_resolved.relative_to(dst_root_resolved)
-            except ValueError:
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Invalid skill archive path",
-                )
-            if entry.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-                continue
-
-            target.parent.mkdir(parents=True, exist_ok=True)
-            with archive.open(entry, "r") as src, target.open("wb") as out:
-                shutil.copyfileobj(src, out, length=1024 * 1024)
-
-    root_skill = dst_root / "SKILL.md"
-    if root_skill.exists():
-        return dst_root
-
-    candidates = [
-        child
-        for child in dst_root.iterdir()
-        if child.is_dir() and (child / "SKILL.md").exists()
-    ]
-    if len(candidates) == 1:
-        return candidates[0]
-    raise HTTPException(
-        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        detail="Skill archive missing SKILL.md",
-    )
 
 
 def _skill_payload(
@@ -839,80 +574,6 @@ async def _build_catalog_response(
     }
 
 
-def _resolve_skill_install_source(
-    loader: SkillsLoader,
-    *,
-    skill_store_dir: Path,
-    name: str,
-) -> tuple[str, Path] | None:
-    store_src_dir = skill_store_dir / name
-    if (store_src_dir / "SKILL.md").exists():
-        return "store", store_src_dir
-    builtin_root = loader.builtin_skills
-    if builtin_root is not None:
-        builtin_src_dir = builtin_root / name
-        if (builtin_src_dir / "SKILL.md").exists():
-            return "builtin", builtin_src_dir
-    return None
-
-
-def _mcp_preset_by_id(preset_id: str) -> dict[str, Any] | None:
-    pid = str(preset_id or "").strip().lower()
-    for preset in _MCP_PRESETS:
-        if str(preset.get("id") or "").strip().lower() == pid:
-            return preset
-    return None
-
-
-def _resolve_preset_config(preset: dict[str, Any], workspace: Path) -> dict[str, Any]:
-    raw = dict(preset.get("config") or {})
-    args = [
-        str(x).replace("{workspace}", str(Path(str(workspace)).resolve()))
-        for x in list(raw.get("args") or [])
-    ]
-    return {
-        "command": str(raw.get("command") or ""),
-        "args": args,
-        "url": str(raw.get("url") or ""),
-        "headers": dict(raw.get("headers") or {}),
-        "tool_timeout": int(raw.get("tool_timeout") or 30),
-    }
-
-
-def _is_mcp_preset_installed(cfg, preset: dict[str, Any], workspace: Path) -> bool:
-    expected = _resolve_preset_config(preset, workspace)
-    servers = getattr(getattr(cfg, "tools", None), "mcp_servers", {}) or {}
-    for server in servers.values():
-        command = str(getattr(server, "command", "") or "")
-        url = str(getattr(server, "url", "") or "")
-        args = [str(x) for x in list(getattr(server, "args", []) or [])]
-        if expected["url"]:
-            if url == expected["url"]:
-                return True
-            continue
-        if command == expected["command"] and args == expected["args"]:
-            return True
-    return False
-
-
-def _mcp_list_payload(cfg) -> list[dict[str, Any]]:
-    servers = getattr(getattr(cfg, "tools", None), "mcp_servers", {}) or {}
-    result: list[dict[str, Any]] = []
-    for name, server in sorted(servers.items(), key=lambda item: item[0]):
-        transport = "http" if str(getattr(server, "url", "") or "").strip() else "stdio"
-        result.append(
-            {
-                "name": name,
-                "transport": transport,
-                "command": str(getattr(server, "command", "") or ""),
-                "args": list(getattr(server, "args", []) or []),
-                "url": str(getattr(server, "url", "") or ""),
-                "tool_timeout": int(getattr(server, "tool_timeout", 30)),
-            }
-        )
-    return result
-
-
 @router.get("/api/skills")
 async def list_skills(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -981,137 +642,65 @@ async def list_installable_skills_v2(
 
 @router.post("/api/skills/install", status_code=status.HTTP_201_CREATED)
 async def install_skill(
-    payload: SkillInstallRequest,
     request: Request,
+    payload: Any = Body(default=None),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     _ensure_tenant_scoped_writes_allowed(request)
-    name = str(payload.name or "").strip()
-    if not _SKILL_NAME_RE.fullmatch(name):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid skill name",
-        )
-    source_hint = _normalize_install_source(payload.source)
-    slug_hint = _normalize_slug(payload.slug)
-    version_hint = _normalize_version(payload.version)
-    if source_hint is None and version_hint is not None and slug_hint is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="version requires source=clawhub or a valid slug",
-        )
-    if source_hint == "local" and (slug_hint is not None or version_hint is not None):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="source=local cannot include slug or version",
-        )
-    use_clawhub = source_hint == "clawhub" or (source_hint is None and slug_hint is not None)
+    validated = _validate_request_model(
+        SkillInstallRequest,
+        payload,
+        reason_code="invalid_skill_install_request",
+    )
 
     loader, tenant_id, _store, cfg, _workspace = _tenant_skills_loader(request, user)
-    dst_root = loader.workspace_skills
-    dst_root.mkdir(parents=True, exist_ok=True)
-    dst = dst_root / name
-    tenant_lock = _tenant_lock(tenant_id)
-    skill_lock = _skill_lock(f"{tenant_id}:{name}")
-
-    source = "clawhub" if use_clawhub else "local"
-    staged_remote_root: Path | None = None
-    src_dir: Path | None = None
+    install_service = WorkspaceSkillInstallService(
+        skill_store_dir=_resolve_skill_store_dir(request),
+        builtin_root=loader.builtin_skills,
+    )
     try:
-        if use_clawhub:
-            remote_slug = slug_hint or name
-            if not _SKILL_SLUG_RE.fullmatch(remote_slug):
-                raise HTTPException(
-                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                    detail="Invalid skill slug",
-                )
+        plan = install_service.prepare_install(
+            name=validated.name,
+            source=validated.source,
+            slug=validated.slug,
+            version=validated.version,
+        )
+        quota_mib = int(
+            getattr(getattr(getattr(cfg, "tools", None), "filesystem", None), "workspace_quota_mib", 0)
+        )
+        if plan.source == "clawhub":
             try:
                 zip_bytes = await get_clawhub_client(request).download_skill_zip(
-                    slug=remote_slug,
-                    version=version_hint,
+                    slug=plan.remote_slug or plan.name,
+                    version=plan.version,
                 )
             except ClawHubClientError as exc:
                 _raise_clawhub_http_error(exc)
-            staged_remote_root = Path(tempfile.mkdtemp(prefix=f"nanobot-skill-{name}-"))
-            try:
-                src_dir = _safe_extract_skill_zip(zip_bytes, staged_remote_root)
-            except HTTPException as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=f"ClawHub package error: {exc.detail}",
-                ) from exc
-            except Exception as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail="Failed to extract ClawHub package",
-                ) from exc
+            result = await install_service.install_clawhub_zip(
+                plan=plan,
+                tenant_id=tenant_id,
+                workspace=loader.workspace,
+                workspace_quota_mib=quota_mib,
+                zip_bytes=zip_bytes,
+            )
+        else:
+            result = await install_service.install_local(
+                plan=plan,
+                tenant_id=tenant_id,
+                workspace=loader.workspace,
+                workspace_quota_mib=quota_mib,
+            )
+    except WorkspaceSkillInstallError as exc:
+        raise _service_http_exception(exc) from exc
 
-        installed_from_partial = False
-        async with tenant_lock:
-            async with skill_lock:
-                if (dst / "SKILL.md").exists():
-                    return {"name": name, "installed": True, "already_installed": True}
-
-                if not use_clawhub:
-                    install_source = _resolve_skill_install_source(
-                        loader,
-                        skill_store_dir=_resolve_skill_store_dir(request),
-                        name=name,
-                    )
-                    if install_source is None:
-                        raise HTTPException(
-                            status_code=status.HTTP_404_NOT_FOUND,
-                            detail="Skill not found in skill store or builtin skills",
-                        )
-                    source, src_dir = install_source
-
-                if src_dir is None:
-                    raise HTTPException(
-                        status_code=status.HTTP_502_BAD_GATEWAY,
-                        detail="Skill package is unavailable",
-                    )
-
-                quota_mib = int(
-                    getattr(getattr(getattr(cfg, "tools", None), "filesystem", None), "workspace_quota_mib", 0)
-                )
-                quota_bytes = max(0, quota_mib) * 1024 * 1024
-                if quota_bytes > 0:
-                    workspace = loader.workspace
-                    current_size = dir_size_bytes(workspace)
-                    existing_size = dir_size_bytes(dst) if dst.exists() else 0
-                    skill_size = dir_size_bytes(src_dir)
-                    projected_size = max(0, current_size - existing_size) + skill_size
-                    if projected_size > quota_bytes:
-                        raise HTTPException(
-                            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                            detail="Installing this skill would exceed workspace quota",
-                        )
-
-                tmp_dst = dst_root / f".{name}.tmp-{uuid.uuid4().hex}"
-                backup_dst = dst_root / f".{name}.bak-{uuid.uuid4().hex}"
-                try:
-                    shutil.copytree(src_dir, tmp_dst)
-                    if dst.exists():
-                        installed_from_partial = True
-                        dst.replace(backup_dst)
-                    tmp_dst.replace(dst)
-                finally:
-                    if tmp_dst.exists():
-                        shutil.rmtree(tmp_dst, ignore_errors=True)
-                    if backup_dst.exists():
-                        shutil.rmtree(backup_dst, ignore_errors=True)
-
-        return {
-            "name": name,
-            "installed": True,
-            "already_installed": False,
-            "repaired": bool(installed_from_partial),
-            "source": source,
-        }
-    finally:
-        if staged_remote_root and staged_remote_root.exists():
-            shutil.rmtree(staged_remote_root, ignore_errors=True)
+    return {
+        "name": plan.name,
+        "installed": bool(result.installed),
+        "already_installed": bool(result.already_installed),
+        "repaired": bool(result.repaired),
+        "source": result.source,
+    }
 
 
 @router.delete("/api/skills/{name}")
@@ -1122,33 +711,22 @@ async def uninstall_skill(
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     _ensure_tenant_scoped_writes_allowed(request)
-    skill_name = str(name or "").strip()
-    if not _SKILL_NAME_RE.fullmatch(skill_name):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid skill name",
-        )
 
     loader, tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
-    dst_root = loader.workspace_skills
-    dst = dst_root / skill_name
-    tenant_lock = _tenant_lock(tenant_id)
-    skill_lock = _skill_lock(f"{tenant_id}:{skill_name}")
-
-    async with tenant_lock:
-        async with skill_lock:
-            if not (dst / "SKILL.md").exists():
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not installed")
-            tmp_removed = dst_root / f".{skill_name}.del-{uuid.uuid4().hex}"
-            try:
-                dst.replace(tmp_removed)
-            except FileNotFoundError as exc:
-                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not installed") from exc
-            finally:
-                if tmp_removed.exists():
-                    shutil.rmtree(tmp_removed, ignore_errors=True)
-
-    return {"name": skill_name, "removed": True}
+    install_service = WorkspaceSkillInstallService(
+        skill_store_dir=_resolve_skill_store_dir(request),
+        builtin_root=loader.builtin_skills,
+    )
+    try:
+        skill_name = install_service.validate_skill_name(name)
+        result = await install_service.uninstall(
+            tenant_id=tenant_id,
+            name=skill_name,
+            workspace=loader.workspace,
+        )
+    except WorkspaceSkillInstallError as exc:
+        raise _service_http_exception(exc) from exc
+    return {"name": skill_name, "removed": bool(result.removed)}
 
 
 @router.get("/api/mcp/catalog")
@@ -1157,21 +735,7 @@ async def list_mcp_catalog(
 ) -> list[dict[str, Any]]:
     tenant_id, store, cfg = load_tenant_config(request, user)
     workspace = store.ensure_tenant_files(tenant_id).workspace
-    result: list[dict[str, Any]] = []
-    for preset in _MCP_PRESETS:
-        pid = str(preset.get("id") or "")
-        result.append(
-            {
-                "id": pid,
-                "name": str(preset.get("name") or pid),
-                "category": str(preset.get("category") or "General"),
-                "description": str(preset.get("description") or ""),
-                "transport": str(preset.get("transport") or "stdio"),
-                "installed": _is_mcp_preset_installed(cfg, preset, workspace),
-                "default_server_name": pid,
-            }
-        )
-    return result
+    return _MCP_SERVICE.list_catalog(cfg=cfg, workspace=workspace)
 
 
 @router.get("/api/mcp/servers")
@@ -1179,7 +743,7 @@ async def list_mcp_servers(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
     _tenant_id, _store, cfg = load_tenant_config(request, user)
-    return _mcp_list_payload(cfg)
+    return _MCP_SERVICE.list_servers(cfg=cfg)
 
 
 @router.get("/api/tools/policy")
@@ -1194,20 +758,26 @@ async def get_tools_policy(
 
 @router.put("/api/tools/policy")
 async def update_tools_policy(
-    payload: ToolPolicyUpdateRequest,
     request: Request,
+    payload: Any = Body(default=None),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     _ensure_tenant_scoped_writes_allowed(request)
+    validated = _validate_request_model(
+        ToolPolicyUpdateRequest,
+        payload,
+        reason_code="invalid_tool_policy_request",
+    )
 
     tenant_id, store, cfg = load_tenant_config(request, user)
-    data = payload.model_dump(exclude_unset=True)
-    if "exec_enabled" in data:
-        cfg.tools.exec.enabled = bool(data["exec_enabled"])
-    if "web_enabled" in data:
-        cfg.tools.web.enabled = bool(data["web_enabled"])
-    if data:
+    data = validated.model_dump(exclude_unset=True)
+    changed = _TOOL_POLICY_SERVICE.apply_updates(
+        cfg,
+        exec_enabled=data.get("exec_enabled") if "exec_enabled" in data else None,
+        web_enabled=data.get("web_enabled") if "web_enabled" in data else None,
+    )
+    if changed:
         await save_tenant_config(request, tenant_id, store, cfg)
 
     return _tool_policy_payload(request, user=user, tenant_id=tenant_id, cfg=cfg)
@@ -1215,52 +785,31 @@ async def update_tools_policy(
 
 @router.post("/api/mcp/install", status_code=status.HTTP_201_CREATED)
 async def install_mcp_server(
-    payload: MCPInstallRequest,
     request: Request,
+    payload: Any = Body(default=None),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     _ensure_tenant_scoped_writes_allowed(request)
-    preset = _mcp_preset_by_id(payload.preset)
-    if not preset:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MCP preset not found")
-
-    server_name = str(payload.name or preset.get("id") or "").strip()
-    if not _MCP_NAME_RE.fullmatch(server_name):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid MCP server name",
-        )
+    validated = _validate_request_model(
+        MCPInstallRequest,
+        payload,
+        reason_code="invalid_mcp_install_request",
+    )
 
     tenant_id, store, cfg = load_tenant_config(request, user)
-    servers = dict(getattr(cfg.tools, "mcp_servers", {}) or {})
-    if server_name in servers:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="MCP server already installed")
-
     workspace = store.ensure_tenant_files(tenant_id).workspace
-    resolved = _resolve_preset_config(preset, workspace)
-    model_payload = {
-        "command": resolved["command"],
-        "args": resolved["args"],
-        "env": dict((preset.get("config") or {}).get("env") or {}),
-        "url": resolved["url"],
-        "headers": resolved["headers"],
-        "tool_timeout": resolved["tool_timeout"],
-    }
-    servers[server_name] = MCPServerConfig.model_validate(model_payload)
-    cfg.tools.mcp_servers = servers
+    try:
+        result = _MCP_SERVICE.install_preset(
+            cfg=cfg,
+            preset_id=validated.preset,
+            server_name=validated.name,
+            workspace=workspace,
+        )
+    except WorkspaceMCPError as exc:
+        raise _service_http_exception(exc) from exc
     await save_tenant_config(request, tenant_id, store, cfg)
-
-    transport = "http" if model_payload["url"] else "stdio"
-    return {
-        "name": server_name,
-        "preset": str(preset.get("id") or ""),
-        "transport": transport,
-        "command": model_payload["command"],
-        "args": model_payload["args"],
-        "url": model_payload["url"],
-        "tool_timeout": model_payload["tool_timeout"],
-    }
+    return result.to_dict()
 
 
 @router.delete("/api/mcp/servers/{name}")
@@ -1271,22 +820,14 @@ async def uninstall_mcp_server(
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     _ensure_tenant_scoped_writes_allowed(request)
-    server_name = str(name or "").strip()
-    if not _MCP_NAME_RE.fullmatch(server_name):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail="Invalid MCP server name",
-        )
 
     tenant_id, store, cfg = load_tenant_config(request, user)
-    servers = dict(getattr(cfg.tools, "mcp_servers", {}) or {})
-    if server_name not in servers:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found")
-
-    servers.pop(server_name, None)
-    cfg.tools.mcp_servers = servers
+    try:
+        result = _MCP_SERVICE.uninstall_server(cfg=cfg, server_name=name)
+    except WorkspaceMCPError as exc:
+        raise _service_http_exception(exc) from exc
     await save_tenant_config(request, tenant_id, store, cfg)
-    return {"name": server_name, "removed": True}
+    return result.to_dict()
 
 
 @router.get("/api/skills/{name}")

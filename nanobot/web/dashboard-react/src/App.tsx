@@ -11,6 +11,8 @@ import { Chat } from "./pages/Chat"
 import { Settings, SettingsIndex, getAllowedSettingsTabs, getDefaultSettingsTab, type SettingsTab } from "./pages/Settings"
 import { Providers } from "./pages/settings/Providers"
 import { Channels } from "./pages/settings/Channels"
+import { ChannelsAdmin } from "./pages/settings/ChannelsAdmin"
+import { ChannelsWorkspace } from "./pages/settings/ChannelsWorkspace"
 import { Soul } from "./pages/settings/Soul"
 import { ToolsPolicy } from "./pages/settings/ToolsPolicy"
 import { Cron } from "./pages/settings/Cron"
@@ -106,7 +108,11 @@ export default function App() {
           <Route path="settings" element={<Settings />}>
             <Route index element={<SettingsIndex />} />
             <Route path="providers" element={<SettingsRouteGuard tab="providers"><Providers /></SettingsRouteGuard>} />
-            <Route path="channels" element={<SettingsRouteGuard tab="channels"><Channels /></SettingsRouteGuard>} />
+            <Route path="channels/*" element={<SettingsRouteGuard tab="channels"><Channels /></SettingsRouteGuard>}>
+              <Route index element={<Navigate to="workspace" replace />} />
+              <Route path="workspace" element={<ChannelsWorkspace />} />
+              <Route path="admin" element={<ChannelsAdmin />} />
+            </Route>
             <Route path="soul" element={<SettingsRouteGuard tab="soul"><Soul /></SettingsRouteGuard>} />
             <Route path="tools" element={<SettingsRouteGuard tab="tools"><ToolsPolicy /></SettingsRouteGuard>} />
             <Route path="cron" element={<SettingsRouteGuard tab="cron"><Cron /></SettingsRouteGuard>} />

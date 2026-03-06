@@ -16,6 +16,10 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel, MessageType
 from nanobot.config.schema import DingTalkConfig
+from nanobot.services.channel_routing import (
+    normalize_dingtalk_conversation_type,
+    normalize_sender_id,
+)
 
 try:
     from dingtalk_stream import (
@@ -67,13 +71,19 @@ class NanobotDingTalkHandler(CallbackHandler):
                 )
                 return AckMessage.STATUS_OK, "OK"
 
-            sender_id = chatbot_msg.sender_staff_id or chatbot_msg.sender_id
+            sender_id = normalize_sender_id(chatbot_msg.sender_staff_id or chatbot_msg.sender_id)
             sender_name = chatbot_msg.sender_nick or "Unknown"
+            if not sender_id:
+                logger.warning("Dropping DingTalk message with missing sender identity")
+                return AckMessage.STATUS_OK, "OK"
 
             # Extract conversation type and ID for group chat support
             # conversationType: "1" = private, "2" = group
-            conversation_type = message.data.get("conversationType", "1")
+            conversation_type = normalize_dingtalk_conversation_type(
+                message.data.get("conversationType", chatbot_msg.conversation_type)
+            )
             conversation_id = message.data.get("conversationId")
+            mentioned = bool(chatbot_msg.is_in_at_list)
 
             logger.info(
                 "Received DingTalk message from {} ({}) [type={}]: {}",
@@ -84,7 +94,12 @@ class NanobotDingTalkHandler(CallbackHandler):
             # Store reference to prevent GC before task completes.
             task = asyncio.create_task(
                 self.channel._on_message(
-                    content, sender_id, sender_name, conversation_type, conversation_id
+                    content,
+                    sender_id,
+                    sender_name,
+                    conversation_type,
+                    conversation_id,
+                    mentioned=mentioned,
                 )
             )
             self.channel._background_tasks.add(task)
@@ -439,6 +454,8 @@ class DingTalkChannel(BaseChannel):
         sender_name: str,
         conversation_type: str = "1",
         conversation_id: str | None = None,
+        *,
+        mentioned: bool = False,
     ) -> None:
         """Handle incoming message (called by NanobotDingTalkHandler).
 
@@ -454,6 +471,11 @@ class DingTalkChannel(BaseChannel):
         """
         try:
             logger.info("DingTalk inbound: {} from {}", content, sender_name)
+            sender_id = normalize_sender_id(sender_id)
+            if not sender_id:
+                logger.warning("Dropping DingTalk message with missing sender identity")
+                return
+            conversation_type = normalize_dingtalk_conversation_type(conversation_type)
 
             # Determine message type and group_id based on conversation_type
             message_type = MessageType.PRIVATE
@@ -477,6 +499,8 @@ class DingTalkChannel(BaseChannel):
                     "platform": "dingtalk",
                     "conversation_type": conversation_type,
                     "conversation_id": conversation_id,
+                    "mentioned": bool(mentioned),
+                    "is_in_at_list": bool(mentioned),
                 },
                 message_type=message_type,
                 group_id=group_id,

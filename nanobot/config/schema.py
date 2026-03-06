@@ -196,9 +196,25 @@ class TenantChannelOverride(Base):
     - All overrides are audited
     """
 
-    allow_from: list[str] | None = None  # Tenant-specific allow list (must be subset of system allow_from)
-    enable_group_chat: bool = False  # Explicit opt-in for group chat support (default: private-only)
+    enabled: bool = True  # Workspace-level routing gate; does not control system connections.
+    allow_from: list[str] | None = None  # Tenant-specific allow list (subset of system allow_from)
+    group_policy: Literal["open", "mention", "allowlist"] = "mention"
+    group_allow_from: list[str] | None = None
+    enable_group_chat: bool = False  # Legacy compatibility flag; derived from group_policy in new flows.
     audit_overrides: bool = True  # Log all override usage for security auditing
+
+
+class WorkspaceChannelsConfig(Base):
+    """Workspace-scoped channel routing policies."""
+
+    feishu: TenantChannelOverride = Field(default_factory=TenantChannelOverride)
+    dingtalk: TenantChannelOverride = Field(default_factory=TenantChannelOverride)
+
+
+class WorkspaceConfig(Base):
+    """Workspace-scoped configuration persisted per tenant."""
+
+    channels: WorkspaceChannelsConfig = Field(default_factory=WorkspaceChannelsConfig)
 
 
 class ChannelsConfig(Base):
@@ -391,6 +407,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
 
     @property
     def workspace_path(self) -> Path:

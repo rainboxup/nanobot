@@ -2,9 +2,15 @@ import asyncio
 
 import pytest
 
-from nanobot.bus.broker import BUSY_TEXT, TenantIngressBroker, build_web_tenant_claim_proof
+from nanobot.bus.broker import (
+    _SILENT_REJECTION_REASONS,
+    BUSY_TEXT,
+    TenantIngressBroker,
+    build_web_tenant_claim_proof,
+)
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import Config
 from nanobot.tenants.store import TenantStore
 
 
@@ -213,3 +219,131 @@ async def test_tenant_ingress_broker_ignores_canonical_sender_override_metadata(
 
     inbound = await bus.consume_inbound()
     assert inbound.metadata.get("tenant_id") == tenant_u1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "message", "configure"),
+    [
+        (
+            "missing_sender_id",
+            InboundMessage(channel="feishu", sender_id="unknown", chat_id="c-1", content="hi"),
+            None,
+        ),
+        (
+            "workspace_channel_disabled",
+            InboundMessage(channel="feishu", sender_id="alice", chat_id="c-1", content="hi"),
+            lambda cfg: setattr(cfg.workspace.channels.feishu, "enabled", False),
+        ),
+        (
+            "sender_not_allowlisted",
+            InboundMessage(channel="feishu", sender_id="alice", chat_id="c-1", content="hi"),
+            lambda cfg: setattr(cfg.workspace.channels.feishu, "allow_from", ["bob"]),
+        ),
+        (
+            "bot_not_mentioned",
+            InboundMessage(
+                channel="feishu",
+                sender_id="alice",
+                chat_id="group-1",
+                content="hi",
+                message_type="group",
+                group_id="group-1",
+            ),
+            None,
+        ),
+    ],
+)
+async def test_tenant_ingress_broker_silently_drops_workspace_routing_denials(
+    tmp_path, label, message, configure
+) -> None:
+    cfg = Config()
+    cfg.channels.feishu.enabled = True
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    lock = asyncio.Lock()
+    broker = TenantIngressBroker(bus=bus, store=store, store_lock=lock)
+
+    if message.sender_id and message.sender_id != "unknown":
+        tenant_id = store.ensure_tenant(message.channel, message.sender_id)
+        if configure is not None:
+            tenant_cfg = store.load_tenant_config(tenant_id)
+            configure(tenant_cfg)
+            store.save_tenant_config(tenant_id, tenant_cfg)
+
+    await broker.publish_inbound(message)
+
+    assert bus.inbound.qsize() == 0, label
+    assert bus.outbound.qsize() == 0, label
+
+
+def test_workspace_routing_rejection_reasons_stay_silent_contract() -> None:
+    assert {
+        "missing_sender_id",
+        "workspace_channel_disabled",
+        "sender_not_allowlisted",
+        "bot_not_mentioned",
+        "group_not_allowlisted",
+        "unsupported_group_policy",
+    }.issubset(_SILENT_REJECTION_REASONS)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_name", "metadata"),
+    [("feishu", {"mentioned": True}), ("dingtalk", {"is_in_at_list": True})],
+)
+async def test_tenant_ingress_broker_attaches_workspace_routing_metadata_when_allowed(
+    tmp_path, channel_name, metadata
+) -> None:
+    cfg = Config()
+    getattr(cfg.channels, channel_name).enabled = True
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    lock = asyncio.Lock()
+    broker = TenantIngressBroker(bus=bus, store=store, store_lock=lock)
+
+    tenant_id = store.ensure_tenant(channel_name, "alice")
+    tenant_cfg = store.load_tenant_config(tenant_id)
+    getattr(tenant_cfg.workspace.channels, channel_name).group_policy = "mention"
+    store.save_tenant_config(tenant_id, tenant_cfg)
+
+    await broker.publish_inbound(
+        InboundMessage(
+            channel=channel_name,
+            sender_id="alice",
+            chat_id="group-1",
+            content="hello",
+            message_type="group",
+            group_id="group-1",
+            metadata=metadata,
+        )
+    )
+
+    inbound = await bus.consume_inbound()
+    assert inbound.metadata.get("tenant_id") == tenant_id
+    assert inbound.metadata.get("canonical_sender_id") == "alice"
+    assert isinstance(inbound.metadata.get("workspace_channel_routing"), dict)
+
+
+@pytest.mark.asyncio
+async def test_tenant_ingress_broker_blocks_linked_identity_outside_sender_allowlist(tmp_path) -> None:
+    cfg = Config()
+    cfg.channels.feishu.enabled = True
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    lock = asyncio.Lock()
+    broker = TenantIngressBroker(bus=bus, store=store, store_lock=lock)
+
+    tenant_id = store.ensure_tenant("feishu", "alice")
+    store.link_identity(tenant_id, "feishu", "bob")
+    tenant_cfg = store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.allow_from = ["alice"]
+    store.save_tenant_config(tenant_id, tenant_cfg)
+
+    await broker.publish_inbound(
+        InboundMessage(channel="feishu", sender_id="bob", chat_id="c-2", content="hello")
+    )
+
+    assert bus.inbound.qsize() == 0
+    assert bus.outbound.qsize() == 0

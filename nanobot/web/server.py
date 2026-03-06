@@ -402,7 +402,9 @@ def create_app(
     if tenant_store is None:
         from nanobot.tenants.store import TenantStore
 
-        tenant_store = TenantStore()
+        tenant_store = TenantStore(system_config=config)
+    elif hasattr(tenant_store, "bind_system_config"):
+        tenant_store.bind_system_config(config)
 
     app.state.config = config
     app.state.bus = bus

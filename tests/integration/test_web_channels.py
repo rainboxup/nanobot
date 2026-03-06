@@ -1,11 +1,21 @@
+import json
+
 import pytest
 
-from nanobot.config.loader import load_config
+from nanobot.config.loader import load_config, save_config
 
 
 def _system_cfg(web_ctx):
     return load_config(
         config_path=web_ctx.config_path,
+        allow_env_override=False,
+        strict=True,
+    )
+
+
+def _tenant_cfg(web_ctx, tenant_id: str):
+    return load_config(
+        config_path=web_ctx.tenant_store.tenant_config_path(tenant_id),
         allow_env_override=False,
         strict=True,
     )
@@ -353,3 +363,187 @@ async def test_non_owner_admin_channel_list_is_read_only(http_client, auth_heade
     assert all(str(row.get("write_block_reason_code") or "") for row in data)
     assert all(row.get("config_scope") == "system" for row in data)
     assert all(row.get("takes_effect") == "restart" for row in data)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_admin_alias_list_matches_system_channels(http_client, auth_headers) -> None:
+    legacy = await http_client.get("/api/channels", headers=auth_headers)
+    assert legacy.status_code == 200
+
+    admin_alias = await http_client.get("/api/admin/channels", headers=auth_headers)
+    assert admin_alias.status_code == 200
+    assert admin_alias.json() == legacy.json()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_roundtrip_is_tenant_isolated(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    alice_headers = await auth_headers_for("alice-routing", role="admin", tenant_id="tenant-routing-a")
+    bob_headers = await auth_headers_for("bob-routing", role="admin", tenant_id="tenant-routing-b")
+
+    update_resp = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=alice_headers,
+        json={
+            "enabled": False,
+            "group_policy": "allowlist",
+            "group_allow_from": ["group-alpha"],
+            "allow_from": ["user-alpha"],
+        },
+    )
+    assert update_resp.status_code == 200
+    alice_payload = update_resp.json()
+    assert alice_payload["name"] == "feishu"
+    assert alice_payload["config_scope"] == "workspace"
+    assert alice_payload["workspace_enabled"] is False
+    assert alice_payload["group_policy"] == "allowlist"
+    assert alice_payload["group_allow_from"] == ["group-alpha"]
+    assert alice_payload["allow_from"] == ["user-alpha"]
+    assert alice_payload["require_mention"] is False
+
+    alice_get = await http_client.get("/api/channels/feishu/routing", headers=alice_headers)
+    assert alice_get.status_code == 200
+    assert alice_get.json()["group_allow_from"] == ["group-alpha"]
+
+    bob_get = await http_client.get("/api/channels/feishu/routing", headers=bob_headers)
+    assert bob_get.status_code == 200
+    bob_payload = bob_get.json()
+    assert bob_payload["workspace_enabled"] is True
+    assert bob_payload["group_policy"] == "mention"
+    assert bob_payload["group_allow_from"] == []
+    assert bob_payload["allow_from"] == []
+
+    tenant_cfg = _tenant_cfg(web_ctx, "tenant-routing-a")
+    assert tenant_cfg.workspace.channels.feishu.enabled is False
+    assert tenant_cfg.workspace.channels.feishu.group_policy == "allowlist"
+    assert tenant_cfg.workspace.channels.feishu.group_allow_from == ["group-alpha"]
+    assert tenant_cfg.workspace.channels.feishu.allow_from == ["user-alpha"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_binding_instructions_are_readable(
+    http_client, auth_headers_for
+) -> None:
+    alice_headers = await auth_headers_for("alice-binding", role="admin", tenant_id="tenant-binding")
+
+    workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
+    assert workspace_list.status_code == 200
+    rows = {row["name"]: row for row in workspace_list.json()}
+    assert {"feishu", "dingtalk"}.issubset(rows)
+    assert rows["feishu"]["config_scope"] == "workspace"
+    assert rows["dingtalk"]["config_scope"] == "workspace"
+
+    binding_resp = await http_client.get(
+        "/api/channels/dingtalk/binding-instructions",
+        headers=alice_headers,
+    )
+    assert binding_resp.status_code == 200
+    body = binding_resp.json()
+    assert body["name"] == "dingtalk"
+    assert body["channel"] == "dingtalk"
+    assert "!link" in body["instructions"]
+    assert body["config_scope"] == "workspace"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_headers_for) -> None:
+    admin_headers = await auth_headers_for("alice-routing-admin", role="admin", tenant_id="tenant-routing-admin")
+    member_headers = await auth_headers_for(
+        "member-routing",
+        role="member",
+        tenant_id="tenant-routing-member",
+    )
+
+    routing_update = await http_client.put(
+        "/api/channels/dingtalk/routing",
+        headers=admin_headers,
+        json={"group_policy": "open", "enabled": True},
+    )
+    assert routing_update.status_code == 200
+    assert routing_update.json()["group_policy"] == "open"
+    assert routing_update.json()["require_mention"] is False
+
+    member_update = await http_client.put(
+        "/api/channels/dingtalk/routing",
+        headers=member_headers,
+        json={"group_policy": "mention"},
+    )
+    assert member_update.status_code == 403
+
+    system_update = await http_client.put(
+        "/api/channels/dingtalk",
+        headers=admin_headers,
+        json={"client_id": "new-client"},
+    )
+    assert system_update.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_load_returns_422_for_invalid_persisted_subset(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.config.channels.feishu.allow_from = ["system-user"]
+    save_config(web_ctx.app.state.config, config_path=web_ctx.config_path)
+
+    tenant_id = "tenant-routing-invalid-subset"
+    web_ctx.tenant_store.ensure_tenant_files(tenant_id)
+    web_ctx.tenant_store.tenant_config_path(tenant_id).write_text(
+        json.dumps(
+            {
+                "workspace": {
+                    "channels": {
+                        "feishu": {
+                            "allowFrom": ["system-user", "rogue-user"],
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    headers = await auth_headers_for(
+        "alice-routing-invalid-subset",
+        role="admin",
+        tenant_id=tenant_id,
+    )
+    response = await http_client.get(
+        "/api/channels/feishu/routing",
+        headers=headers,
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["reason_code"] == "subset_constraint"
+    assert "subset" in str(detail["message"]).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_rejects_allowlist_expansion_against_system_scope(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.config.channels.feishu.allow_from = ["system-user"]
+    save_config(web_ctx.app.state.config, config_path=web_ctx.config_path)
+
+    headers = await auth_headers_for(
+        "alice-routing-subset",
+        role="admin",
+        tenant_id="tenant-routing-subset",
+    )
+    response = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"allow_from": ["system-user", "rogue-user"]},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["reason_code"] == "subset_constraint"
+    assert "subset" in str(detail["message"]).lower()

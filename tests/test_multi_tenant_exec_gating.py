@@ -477,6 +477,113 @@ async def test_process_inbound_ignores_canonical_sender_override_metadata_for_no
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("message", "configure"),
+    [
+        (
+            InboundMessage(channel="feishu", sender_id="unknown", chat_id="c-1", content="hi"),
+            None,
+        ),
+        (
+            InboundMessage(channel="feishu", sender_id="alice", chat_id="c-2", content="hi"),
+            lambda cfg: setattr(cfg.workspace.channels.feishu, "enabled", False),
+        ),
+        (
+            InboundMessage(
+                channel="feishu",
+                sender_id="alice",
+                chat_id="group-1",
+                content="hi",
+                message_type="group",
+                group_id="group-1",
+            ),
+            None,
+        ),
+    ],
+)
+async def test_process_inbound_drops_when_workspace_routing_denies(
+    tmp_path: Path, monkeypatch, message: InboundMessage, configure
+) -> None:
+    cfg = Config()
+    cfg.channels.feishu.enabled = True
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    loop = MultiTenantAgentLoop(
+        bus=MessageBus(),
+        system_config=cfg,
+        store=store,
+        skill_store_dir=tmp_path / "store",
+    )
+
+    if message.sender_id and message.sender_id != "unknown":
+        tenant_id = store.ensure_tenant(message.channel, message.sender_id)
+        if configure is not None:
+            tenant_cfg = store.load_tenant_config(tenant_id)
+            configure(tenant_cfg)
+            store.save_tenant_config(tenant_id, tenant_cfg)
+
+    async def _should_not_run(*_args, **_kwargs):
+        raise AssertionError("_process_for_tenant should not be called when routing denies")
+
+    monkeypatch.setattr(loop, "_process_for_tenant", _should_not_run)
+
+    out = await loop._process_inbound(message)
+    assert out is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("channel_name", "metadata"),
+    [("feishu", {"mentioned": True}), ("dingtalk", {"is_in_at_list": True})],
+)
+async def test_process_inbound_allows_when_workspace_routing_allows(
+    tmp_path: Path, monkeypatch, channel_name: str, metadata: dict[str, bool]
+) -> None:
+    cfg = Config()
+    getattr(cfg.channels, channel_name).enabled = True
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    loop = MultiTenantAgentLoop(
+        bus=MessageBus(),
+        system_config=cfg,
+        store=store,
+        skill_store_dir=tmp_path / "store",
+    )
+
+    tenant_id = store.ensure_tenant(channel_name, "alice")
+    store.ensure_tenant_files(tenant_id)
+    tenant_cfg = store.load_tenant_config(tenant_id)
+    getattr(tenant_cfg.workspace.channels, channel_name).group_policy = "mention"
+    store.save_tenant_config(tenant_id, tenant_cfg)
+
+    observed: dict[str, str] = {}
+
+    async def _fake_process_for_tenant(msg, canonical_sender, resolved_tenant_id, tenant):
+        observed["tenant_id"] = resolved_tenant_id
+        observed["canonical_sender"] = canonical_sender
+        return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content="ok")
+
+    monkeypatch.setattr(loop, "_process_for_tenant", _fake_process_for_tenant)
+
+    msg = InboundMessage(
+        channel=channel_name,
+        sender_id="alice",
+        chat_id="group-1",
+        content="hello",
+        message_type="group",
+        group_id="group-1",
+        metadata=metadata,
+    )
+    out = await loop._process_inbound(msg)
+
+    assert out is not None
+    assert out.content == "ok"
+    assert observed.get("tenant_id") == tenant_id
+    assert observed.get("canonical_sender") == "alice"
+    assert msg.metadata.get("tenant_id") == tenant_id
+    assert msg.metadata.get("canonical_sender_id") == "alice"
+    assert isinstance(msg.metadata.get("workspace_channel_routing"), dict)
+
+
+@pytest.mark.asyncio
 async def test_web_claim_proof_end_to_end_through_ingress_and_loop(
     tmp_path: Path, monkeypatch
 ) -> None:

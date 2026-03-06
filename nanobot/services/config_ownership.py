@@ -40,7 +40,7 @@ class ConfigOwnershipService:
         if key.startswith(("channels.", "gateway.")):
             return ConfigScope.SYSTEM
 
-        if key.startswith(("providers.", "agents.", "tools.")):
+        if key.startswith(("providers.", "agents.", "tools.", "workspace.")):
             return ConfigScope.WORKSPACE
 
         return ConfigScope.WORKSPACE
@@ -87,6 +87,15 @@ class ConfigOwnershipService:
             )
 
         return OwnershipDecision(allowed=True, scope=ConfigScope.WORKSPACE)
+
+    @classmethod
+    def check_workspace_channel_routing_ownership(
+        cls, *, runtime_mode: str, channel_name: str
+    ) -> OwnershipDecision:
+        return cls.check_workspace_config_ownership(
+            runtime_mode=runtime_mode,
+            config_key=f"workspace.channels.{str(channel_name or '').strip().lower()}",
+        )
 
     @classmethod
     def validate_config_change(

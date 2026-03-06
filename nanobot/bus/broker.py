@@ -23,23 +23,32 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
 from nanobot.tenants.store import TenantStore
 from nanobot.utils.metrics import METRICS
 
 BUSY_TEXT = "System busy, please try again later"
 _WEB_TENANT_PROOF_FIELD = "web_tenant_proof"
+_SILENT_REJECTION_REASONS = {
+    "missing_sender_id",
+    "workspace_channel_disabled",
+    "sender_not_allowlisted",
+    "bot_not_mentioned",
+    "group_not_allowlisted",
+    "unsupported_group_policy",
+}
 
 
 def _canonical_sender_id(msg: InboundMessage) -> str:
     # Prefer stable numeric IDs when channels provide it.
     if isinstance(msg.metadata, dict) and "user_id" in msg.metadata:
         try:
-            return str(int(msg.metadata["user_id"]))
+            return normalize_sender_id(str(int(msg.metadata["user_id"])))
         except Exception:
-            return str(msg.metadata["user_id"])
+            return normalize_sender_id(msg.metadata["user_id"])
     # Telegram sender_id may be "id|username" for allowlist compat.
     sender = str(msg.sender_id or "")
-    return sender.split("|", 1)[0] if sender else ""
+    return normalize_sender_id(sender.split("|", 1)[0] if sender else "")
 
 
 @dataclass(frozen=True)
@@ -105,6 +114,9 @@ class TenantIngressBroker:
                 f"channel={msg.channel} sender={msg.sender_id} reason={res.reason}"
             )
 
+        if res.reason in _SILENT_REJECTION_REASONS:
+            return
+
         # Best-effort: notify user that we're busy. Do not crash if outbound is full.
         try:
             ok = await self.bus.publish_outbound(
@@ -144,9 +156,7 @@ class TenantIngressBroker:
     async def _admit(self, msg: InboundMessage) -> AdmitResult:
         canonical_sender = _canonical_sender_id(msg)
         if not canonical_sender:
-            # If we can't resolve identity, let it pass through (it will fail later anyway).
-            ok = await self.bus.publish_inbound(msg)
-            return AdmitResult(accepted=bool(ok), reason="" if ok else "inbound_queue_full")
+            return AdmitResult(accepted=False, reason="missing_sender_id")
 
         # Resolve tenant_id deterministically (and create if missing).
         # Web dashboard messages are authenticated by JWT and can provide an explicit tenant_id.
@@ -175,6 +185,22 @@ class TenantIngressBroker:
 
             # Ensure file layout exists; keeps downstream code simple.
             self.store.ensure_tenant_files(tenant_id)
+            tenant_cfg = self.store.load_tenant_config(tenant_id)
+
+        routing_decision = evaluate_workspace_channel_routing(
+            config=tenant_cfg,
+            channel_name=msg.channel,
+            sender_id=canonical_sender,
+            message_type=msg.message_type,
+            group_id=msg.group_id,
+            metadata=msg.metadata,
+        )
+        if not routing_decision.allowed:
+            return AdmitResult(
+                accepted=False,
+                tenant_id=tenant_id,
+                reason=routing_decision.reason_code or "workspace_channel_denied",
+            )
 
         # Enforce per-tenant pending limit (counts queued + inflight).
         async with self._pending_lock:
@@ -191,6 +217,10 @@ class TenantIngressBroker:
             msg.metadata = {}
         msg.metadata["tenant_id"] = tenant_id
         msg.metadata["canonical_sender_id"] = canonical_sender
+        if routing_decision.policy is not None:
+            msg.metadata["workspace_channel_routing"] = routing_decision.policy.model_dump(
+                exclude_none=True
+            )
 
         ok = await self.bus.publish_inbound(msg)
         if ok:

@@ -27,7 +27,7 @@ from nanobot.utils.helpers import get_data_path
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.services.clawhub_client import ClawHubClient, ClawHubClientError
 from nanobot.web.session_cache import web_session_cache_metrics
-from nanobot.web.tenant import load_tenant_config
+from nanobot.web.tenant import load_tenant_config, save_tenant_config
 from nanobot.web.user_store import ROLE_OWNER
 
 router = APIRouter()
@@ -1208,7 +1208,7 @@ async def update_tools_policy(
     if "web_enabled" in data:
         cfg.tools.web.enabled = bool(data["web_enabled"])
     if data:
-        store.save_tenant_config(tenant_id, cfg)
+        save_tenant_config(request, tenant_id, store, cfg)
 
     return _tool_policy_payload(request, user=user, tenant_id=tenant_id, cfg=cfg)
 
@@ -1249,7 +1249,7 @@ async def install_mcp_server(
     }
     servers[server_name] = MCPServerConfig.model_validate(model_payload)
     cfg.tools.mcp_servers = servers
-    store.save_tenant_config(tenant_id, cfg)
+    save_tenant_config(request, tenant_id, store, cfg)
 
     transport = "http" if model_payload["url"] else "stdio"
     return {
@@ -1285,7 +1285,7 @@ async def uninstall_mcp_server(
 
     servers.pop(server_name, None)
     cfg.tools.mcp_servers = servers
-    store.save_tenant_config(tenant_id, cfg)
+    save_tenant_config(request, tenant_id, store, cfg)
     return {"name": server_name, "removed": True}
 
 

@@ -24,6 +24,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
 from nanobot.session.manager import SessionManager
 from nanobot.tenants.commands import configure_link_throttle, try_handle
@@ -48,12 +49,12 @@ def _canonical_sender_id(msg: InboundMessage) -> str:
     # Prefer stable numeric IDs when channels provide it.
     if "user_id" in msg.metadata:
         try:
-            return str(int(msg.metadata["user_id"]))
+            return normalize_sender_id(str(int(msg.metadata["user_id"])))
         except Exception:
-            return str(msg.metadata["user_id"])
+            return normalize_sender_id(msg.metadata["user_id"])
     # Telegram sender_id may be "id|username" for allowlist compat.
     sender = str(msg.sender_id or "")
-    return sender.split("|", 1)[0] if sender else ""
+    return normalize_sender_id(sender.split("|", 1)[0] if sender else "")
 
 
 def _tenant_session_id(msg: InboundMessage, canonical_sender: str) -> str:
@@ -93,6 +94,8 @@ class MultiTenantAgentLoop:
         self.bus = bus
         self.system_config = system_config
         self.store = store or TenantStore()
+        if hasattr(self.store, "bind_system_config"):
+            self.store.bind_system_config(system_config)
         self.skill_store_dir = skill_store_dir or (get_data_path() / "store" / "skills")
         self.max_inflight = max(1, int(max_inflight))
         self.ingress = ingress
@@ -193,11 +196,8 @@ class MultiTenantAgentLoop:
 
         canonical_sender = _canonical_sender_id(msg)
         if not canonical_sender:
-            return OutboundMessage(
-                channel=msg.channel,
-                chat_id=msg.chat_id,
-                content="Sorry, I couldn't identify you (missing sender_id).",
-            )
+            logger.warning("Dropping inbound message with missing canonical sender_id: {}", msg.channel)
+            return None
 
         tenant_id = ""
         if msg.channel == "web":
@@ -215,11 +215,33 @@ class MultiTenantAgentLoop:
             elif msg.channel == "web":
                 self.store.link_identity(tenant_id, msg.channel, canonical_sender)
             tenant = self.store.ensure_tenant_files(tenant_id)
+            tenant_cfg = self.store.load_tenant_config(tenant_id)
+
+        routing_decision = evaluate_workspace_channel_routing(
+            config=tenant_cfg,
+            channel_name=msg.channel,
+            sender_id=canonical_sender,
+            message_type=msg.message_type,
+            group_id=msg.group_id,
+            metadata=msg.metadata,
+        )
+        if not routing_decision.allowed:
+            logger.info(
+                "Workspace routing denied inbound message channel={} tenant={} reason={}",
+                msg.channel,
+                tenant_id,
+                routing_decision.reason_code,
+            )
+            return None
 
         if not isinstance(msg.metadata, dict):
             msg.metadata = {}
         msg.metadata["tenant_id"] = tenant_id
         msg.metadata["canonical_sender_id"] = canonical_sender
+        if routing_decision.policy is not None:
+            msg.metadata["workspace_channel_routing"] = routing_decision.policy.model_dump(
+                exclude_none=True
+            )
 
         self._touch_tenant(tenant_id)
         lock = self._tenant_locks.setdefault(tenant_id, asyncio.Lock())

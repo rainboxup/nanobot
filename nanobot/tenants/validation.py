@@ -64,6 +64,7 @@ WORKSPACE_ALLOWED_KEYS = {
     "agents",
     "tools",
     "providers",
+    "workspace",
 }
 
 
@@ -218,6 +219,21 @@ class ConfigOwnershipValidator:
 
         return ValidationResult(valid=True)
 
+    def _workspace_channel_overrides(
+        self, tenant_config_dict: dict[str, Any]
+    ) -> dict[str, dict[str, Any]]:
+        workspace_cfg = tenant_config_dict.get("workspace")
+        if not isinstance(workspace_cfg, dict):
+            return {}
+        channels_cfg = workspace_cfg.get("channels")
+        if not isinstance(channels_cfg, dict):
+            return {}
+        return {
+            str(channel_name): channel_cfg
+            for channel_name, channel_cfg in channels_cfg.items()
+            if isinstance(channel_cfg, dict)
+        }
+
     def _validate_subset_constraint(
         self, tenant_config_dict: dict[str, Any], tenant_id: str
     ) -> ValidationResult:
@@ -253,6 +269,34 @@ class ConfigOwnershipValidator:
                                 "system_whitelist": list(system_whitelist),
                             },
                         )
+
+        for channel_name, channel_override in self._workspace_channel_overrides(tenant_config_dict).items():
+            system_channel = getattr(self.system_config.channels, channel_name, None)
+            if system_channel is None:
+                return ValidationResult(
+                    valid=False,
+                    reason_code="subset_constraint",
+                    message=f"Unknown workspace channel override: {channel_name}",
+                    details={"tenant_id": tenant_id, "channel": channel_name},
+                )
+
+            tenant_allow_from = set(channel_override.get("allow_from") or [])
+            system_allow_from = set(getattr(system_channel, "allow_from", []) or [])
+            if system_allow_from and not tenant_allow_from.issubset(system_allow_from):
+                invalid_entries = sorted(tenant_allow_from - system_allow_from)
+                return ValidationResult(
+                    valid=False,
+                    reason_code="subset_constraint",
+                    message=(
+                        f"Workspace channel allow_from must be subset of system allow_from for {channel_name}"
+                    ),
+                    details={
+                        "tenant_id": tenant_id,
+                        "channel": channel_name,
+                        "invalid_entries": invalid_entries,
+                        "system_allow_from": sorted(system_allow_from),
+                    },
+                )
 
         return ValidationResult(valid=True)
 

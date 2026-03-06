@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, get_args, get_origin
+from typing import Any, Literal, get_args, get_origin
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from nanobot.config.loader import save_config
-from nanobot.config.schema import ChannelsConfig, Config
+from nanobot.config.schema import ChannelsConfig, Config, TenantChannelOverride
+from nanobot.services.config_ownership import ConfigOwnershipService, ConfigScope
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
+from nanobot.web.tenant import load_tenant_config, save_tenant_config
 
 router = APIRouter()
 
@@ -22,6 +24,14 @@ _CHANNEL_CONFIG_SYSTEM_SCOPE_WARNING = (
 )
 
 _CHANNEL_CONFIG_WRITE_BLOCK_DETAIL = "Only owner can modify system channel configuration."
+_WORKSPACE_ROUTING_SCOPE_WARNING = (
+    "Workspace channel routing is tenant-scoped. Changes apply immediately and do not restart channel connections."
+)
+_WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
+    "Workspace-scoped channel routing is unavailable in single-tenant runtime mode."
+)
+
+WORKSPACE_CHANNEL_NAMES = ("feishu", "dingtalk")
 
 
 SENSITIVE_KEYS = {
@@ -66,6 +76,18 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
 REQUIRED_TRUE_FIELDS: dict[str, list[str]] = {
     "email": ["consent_granted"],
 }
+
+
+class WorkspaceRoutingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    group_policy: Literal["open", "mention", "allowlist"] | None = None
+    group_allow_from: list[str] | None = None
+    allow_from: list[str] | None = None
+    require_mention: bool | None = None
+    enable_group_chat: bool | None = None
+    audit_overrides: bool | None = None
 
 
 def _mask_value(value: str) -> str:
@@ -277,6 +299,110 @@ def _ensure_channel(name: str) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown channel")
 
 
+def _workspace_channel_names() -> tuple[str, ...]:
+    return WORKSPACE_CHANNEL_NAMES
+
+
+def _ensure_workspace_channel(name: str) -> str:
+    normalized = str(name or "").strip().lower()
+    if normalized not in _workspace_channel_names():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workspace channel")
+    return normalized
+
+
+def _workspace_takes_effect() -> str:
+    return "immediate"
+
+
+def _workspace_require_mention(policy: str) -> bool:
+    return str(policy or "").strip().lower() == "mention"
+
+
+def _workspace_binding_instructions(name: str) -> str:
+    normalized = _ensure_workspace_channel(name)
+    channel_display = "Feishu" if normalized == "feishu" else "DingTalk"
+    return (
+        "1. In any identity already linked to the workspace, send `!link` to generate a one-time code.\n"
+        f"2. In {channel_display}, send `!link <CODE>` to bind the current identity.\n"
+        "3. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
+    )
+
+
+def _workspace_write_status(request: Request, *, channel_name: str) -> dict[str, Any]:
+    decision = ConfigOwnershipService.check_workspace_channel_routing_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if decision.allowed:
+        return {
+            "writable": True,
+            "write_block_reason_code": None,
+            "write_block_reason": None,
+        }
+    if decision.reason_code == "single_tenant_runtime_mode":
+        reason = _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
+    else:
+        reason = "Only workspace admins can modify channel routing."
+    return {
+        "writable": False,
+        "write_block_reason_code": decision.reason_code,
+        "write_block_reason": reason,
+    }
+
+
+def _workspace_runtime_meta(
+    request: Request, *, channel_name: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload["runtime_mode"] = _runtime_mode(request)
+    payload["runtime_scope"] = "tenant"
+    payload["config_scope"] = ConfigScope.WORKSPACE.value
+    payload["takes_effect"] = _workspace_takes_effect()
+    payload["runtime_warning"] = _WORKSPACE_ROUTING_SCOPE_WARNING
+    payload.update(_workspace_write_status(request, channel_name=channel_name))
+    return payload
+
+
+def _workspace_routing_payload(
+    request: Request,
+    *,
+    name: str,
+    system_channel: BaseModel,
+    routing: TenantChannelOverride,
+) -> dict[str, Any]:
+    workspace_enabled = bool(routing.enabled)
+    system_enabled = bool(getattr(system_channel, "enabled", False))
+    payload = {
+        "name": name,
+        "enabled": workspace_enabled,
+        "workspace_enabled": workspace_enabled,
+        "system_enabled": system_enabled,
+        "effective_enabled": workspace_enabled and system_enabled,
+        "group_policy": routing.group_policy,
+        "group_allow_from": list(routing.group_allow_from or []),
+        "allow_from": list(routing.allow_from or []),
+        "require_mention": _workspace_require_mention(routing.group_policy),
+        "binding_supported": True,
+    }
+    return _workspace_runtime_meta(request, channel_name=name, payload=payload)
+
+
+def _normalize_workspace_routing_update(
+    update: WorkspaceRoutingUpdate,
+) -> dict[str, Any]:
+    data = update.model_dump(exclude_unset=True)
+    require_mention = data.pop("require_mention", None)
+    group_policy = data.get("group_policy")
+    if require_mention is not None:
+        derived_policy = "mention" if require_mention else "open"
+        if group_policy is not None and group_policy != derived_policy:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="require_mention conflicts with group_policy",
+            )
+        data["group_policy"] = derived_policy
+    return data
+
+
 def _config_summary(name: str, cfg: BaseModel) -> dict[str, Any]:
     data = cfg.model_dump()
     if name == "telegram":
@@ -447,6 +573,8 @@ def _audit(
     *,
     event: str,
     user: dict[str, Any],
+    config_scope: str = "system",
+    tenant_id: str | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> None:
     logger = getattr(request.app.state, "audit_logger", None)
@@ -456,16 +584,17 @@ def _audit(
         event=event,
         status="succeeded",
         actor=str(user.get("sub") or "").strip() or None,
-        tenant_id=None,
+        tenant_id=tenant_id,
         ip=request_ip(request),
         metadata={
-            "config_scope": "system",
+            "config_scope": config_scope,
             **({"actor_tenant_id": str(user.get("tenant_id") or "").strip()} if user.get("tenant_id") else {}),
             **(metadata or {}),
         },
     )
 
 
+@router.get("/api/admin/channels")
 @router.get("/api/channels")
 async def list_channels(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -499,6 +628,105 @@ async def list_channels(
     return result
 
 
+@router.get("/api/channels/workspace")
+async def list_workspace_channels(
+    request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> list[dict[str, Any]]:
+    require_min_role(user, "admin")
+    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    system_cfg = _system_config(request)
+
+    result: list[dict[str, Any]] = []
+    for name in _workspace_channel_names():
+        result.append(
+            _workspace_routing_payload(
+                request,
+                name=name,
+                system_channel=getattr(system_cfg.channels, name),
+                routing=getattr(tenant_cfg.workspace.channels, name),
+            )
+        )
+    return result
+
+
+@router.get("/api/channels/{name}/binding-instructions")
+async def get_channel_binding_instructions(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    payload = {
+        "name": channel_name,
+        "channel": channel_name,
+        "instructions": _workspace_binding_instructions(channel_name),
+    }
+    return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
+
+
+@router.get("/api/channels/{name}/routing")
+async def get_workspace_channel_routing(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    system_cfg = _system_config(request)
+    return _workspace_routing_payload(
+        request,
+        name=channel_name,
+        system_channel=getattr(system_cfg.channels, channel_name),
+        routing=getattr(tenant_cfg.workspace.channels, channel_name),
+    )
+
+
+@router.put("/api/channels/{name}/routing")
+async def update_workspace_channel_routing(
+    name: str,
+    update: WorkspaceRoutingUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    decision = ConfigOwnershipService.check_workspace_channel_routing_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if not decision.allowed:
+        detail = _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
+        status_code = status.HTTP_409_CONFLICT
+        raise HTTPException(status_code=status_code, detail=detail)
+
+    tenant_id, store, tenant_cfg = load_tenant_config(request, user)
+    system_cfg = _system_config(request)
+    current = getattr(tenant_cfg.workspace.channels, channel_name)
+    data = _normalize_workspace_routing_update(update)
+    merged = current.model_dump()
+    merged.update(data)
+    try:
+        updated = TenantChannelOverride.model_validate(merged)
+    except ValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+
+    setattr(tenant_cfg.workspace.channels, channel_name, updated)
+    save_tenant_config(request, tenant_id, store, tenant_cfg)
+    _audit(
+        request,
+        event="config.channel.routing.update",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name},
+    )
+    return _workspace_routing_payload(
+        request,
+        name=channel_name,
+        system_channel=getattr(system_cfg.channels, channel_name),
+        routing=updated,
+    )
+
+
+@router.get("/api/admin/channels/{name}")
 @router.get("/api/channels/{name}")
 async def get_channel(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -520,6 +748,7 @@ async def get_channel(
     return _attach_runtime_meta(request, user=user, payload=payload)
 
 
+@router.get("/api/admin/channels/{name}/status")
 @router.get("/api/channels/{name}/status")
 async def get_channel_status(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -531,6 +760,7 @@ async def get_channel_status(
     return _channel_status_payload(name, ch_cfg, request, user=user)
 
 
+@router.put("/api/admin/channels/{name}")
 @router.put("/api/channels/{name}")
 async def update_channel(
     name: str,
@@ -564,6 +794,7 @@ async def update_channel(
         return _attach_runtime_meta(request, user=user, payload=payload)
 
 
+@router.post("/api/admin/channels/{name}/toggle")
 @router.post("/api/channels/{name}/toggle")
 async def toggle_channel(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)

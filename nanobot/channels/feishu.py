@@ -15,6 +15,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel, MessageType
 from nanobot.config.schema import FeishuConfig
+from nanobot.services.channel_routing import normalize_sender_id
 
 try:
     import lark_oapi as lark
@@ -738,7 +739,10 @@ class FeishuChannel(BaseChannel):
             if sender.sender_type == "bot":
                 return
 
-            sender_id = sender.sender_id.open_id if sender.sender_id else "unknown"
+            sender_id = normalize_sender_id(sender.sender_id.open_id if sender.sender_id else "")
+            if not sender_id:
+                logger.warning("Dropping Feishu message with missing sender identity: {}", message_id)
+                return
             chat_id = message.chat_id
             chat_type = message.chat_type
             msg_type = message.message_type
@@ -750,9 +754,8 @@ class FeishuChannel(BaseChannel):
             if chat_type == "group":
                 message_type = MessageType.GROUP
                 group_id = chat_id
-                # For group messages, check if bot is mentioned (optional: can be enforced by config)
-                # Currently allowing all group messages where bot is added
                 logger.debug("Received group message from chat_id={}", chat_id)
+            mentioned = bool(chat_type == "group" and self._is_bot_mentioned(message))
 
             # Add reaction
             await self._add_reaction(message_id, self.config.react_emoji)
@@ -817,6 +820,8 @@ class FeishuChannel(BaseChannel):
                     "message_id": message_id,
                     "chat_type": chat_type,
                     "msg_type": msg_type,
+                    "mentioned": mentioned,
+                    "is_bot_mentioned": mentioned,
                 },
                 message_type=message_type,
                 group_id=group_id,

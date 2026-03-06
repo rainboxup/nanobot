@@ -12,7 +12,7 @@ from nanobot.config.schema import ProviderConfig, ProvidersConfig
 from nanobot.providers.registry import PROVIDERS, find_by_model, find_by_name
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
-from nanobot.web.tenant import load_tenant_config
+from nanobot.web.tenant import load_tenant_config, save_tenant_config
 
 router = APIRouter()
 
@@ -359,7 +359,7 @@ async def update_provider_defaults(
 
     defaults.model = next_model
     defaults.provider = next_provider
-    store.save_tenant_config(tenant_id, cfg)
+    save_tenant_config(request, tenant_id, store, cfg)
     _audit(
         request,
         event="config.agent_defaults.update",
@@ -412,7 +412,7 @@ async def update_provider(
 
     updated = current.model_copy(update=data)
     setattr(cfg.providers, name, updated)
-    store.save_tenant_config(tenant_id, cfg)
+    save_tenant_config(request, tenant_id, store, cfg)
     _audit(
         request,
         event="config.provider.update",

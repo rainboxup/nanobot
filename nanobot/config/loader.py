@@ -22,6 +22,7 @@ from nanobot.config.schema import (
     ProvidersConfig,
     ToolsConfig,
     TrafficConfig,
+    WorkspaceConfig,
 )
 
 
@@ -43,6 +44,7 @@ def _build_config_without_env(data: dict[str, Any], *, strict_section_types: boo
         gateway=_section("gateway", GatewayConfig),
         tools=_section("tools", ToolsConfig),
         traffic=_section("traffic", TrafficConfig),
+        workspace=_section("workspace", WorkspaceConfig),
     )
 
 

@@ -86,8 +86,33 @@ class WorkspaceRoutingUpdate(BaseModel):
     group_allow_from: list[str] | None = None
     allow_from: list[str] | None = None
     require_mention: bool | None = None
-    enable_group_chat: bool | None = None
-    audit_overrides: bool | None = None
+
+
+def _api_error_detail(
+    reason_code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    detail = {
+        "reason_code": reason_code,
+        "message": message,
+    }
+    if details:
+        detail["details"] = details
+    return detail
+
+
+def _unprocessable_entity(
+    reason_code: str,
+    message: str,
+    *,
+    details: dict[str, Any] | None = None,
+) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        detail=_api_error_detail(reason_code, message, details=details),
+    )
 
 
 def _mask_value(value: str) -> str:
@@ -268,9 +293,10 @@ def _collect_unknown_fields(
 def _ensure_no_unknown_fields(model_cls: type[BaseModel], payload: dict[str, Any]) -> None:
     unknown_fields = sorted(set(_collect_unknown_fields(model_cls, payload)))
     if unknown_fields:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=f"Unknown fields: {', '.join(unknown_fields)}",
+        raise _unprocessable_entity(
+            "channel_config_unknown_fields",
+            "Channel update contains unknown fields.",
+            details={"fields": unknown_fields},
         )
 
 
@@ -328,6 +354,43 @@ def _workspace_binding_instructions(name: str) -> str:
     )
 
 
+def _channel_validation_error(
+    reason_code: str,
+    message: str,
+    *,
+    exc: ValidationError | None = None,
+) -> HTTPException:
+    details = None
+    if exc is not None:
+        details = {"errors": exc.errors(include_url=False)}
+    return _unprocessable_entity(reason_code, message, details=details)
+
+
+def _workspace_routing_ownership_error(decision) -> tuple[int, str, str]:
+    reason_code = str(decision.reason_code or "workspace_routing_unavailable")
+    if reason_code == "single_tenant_runtime_mode":
+        return status.HTTP_409_CONFLICT, reason_code, _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
+    if reason_code == "system_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel routing is system-scoped and cannot be modified here.",
+        )
+    if reason_code == "session_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel routing is session-scoped and cannot be persisted here.",
+        )
+    if reason_code == "insufficient_permissions":
+        return (
+            status.HTTP_403_FORBIDDEN,
+            reason_code,
+            "Only workspace admins can modify channel routing.",
+        )
+    return status.HTTP_409_CONFLICT, reason_code, "Workspace channel routing is unavailable."
+
+
 def _workspace_write_status(request: Request, *, channel_name: str) -> dict[str, Any]:
     decision = ConfigOwnershipService.check_workspace_channel_routing_ownership(
         runtime_mode=_runtime_mode(request),
@@ -339,13 +402,11 @@ def _workspace_write_status(request: Request, *, channel_name: str) -> dict[str,
             "write_block_reason_code": None,
             "write_block_reason": None,
         }
-    if decision.reason_code == "single_tenant_runtime_mode":
-        reason = _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
-    else:
-        reason = "Only workspace admins can modify channel routing."
+    status_code, reason_code, reason = _workspace_routing_ownership_error(decision)
+    del status_code
     return {
         "writable": False,
-        "write_block_reason_code": decision.reason_code,
+        "write_block_reason_code": reason_code,
         "write_block_reason": reason,
     }
 
@@ -395,9 +456,9 @@ def _normalize_workspace_routing_update(
     if require_mention is not None:
         derived_policy = "mention" if require_mention else "open"
         if group_policy is not None and group_policy != derived_policy:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail="require_mention conflicts with group_policy",
+            raise _unprocessable_entity(
+                "workspace_routing_conflict",
+                "require_mention conflicts with group_policy",
             )
         data["group_policy"] = derived_policy
     return data
@@ -693,9 +754,11 @@ async def update_workspace_channel_routing(
         channel_name=channel_name,
     )
     if not decision.allowed:
-        detail = _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
-        status_code = status.HTTP_409_CONFLICT
-        raise HTTPException(status_code=status_code, detail=detail)
+        status_code, reason_code, reason = _workspace_routing_ownership_error(decision)
+        raise HTTPException(
+            status_code=status_code,
+            detail=_api_error_detail(reason_code, reason),
+        )
 
     tenant_id, store, tenant_cfg = load_tenant_config(request, user)
     system_cfg = _system_config(request)
@@ -705,11 +768,15 @@ async def update_workspace_channel_routing(
     merged.update(data)
     try:
         updated = TenantChannelOverride.model_validate(merged)
-    except ValidationError as e:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+    except ValidationError as exc:
+        raise _channel_validation_error(
+            "workspace_routing_invalid",
+            "Workspace routing update is invalid.",
+            exc=exc,
+        ) from exc
 
     setattr(tenant_cfg.workspace.channels, channel_name, updated)
-    save_tenant_config(request, tenant_id, store, tenant_cfg)
+    await save_tenant_config(request, tenant_id, store, tenant_cfg)
     _audit(
         request,
         event="config.channel.routing.update",
@@ -779,8 +846,12 @@ async def update_channel(
         merged = _deep_merge(current.model_dump(), update)
         try:
             updated = current.__class__.model_validate(merged)
-        except ValidationError as e:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+        except ValidationError as exc:
+            raise _channel_validation_error(
+                "channel_config_invalid",
+                "Channel configuration is invalid.",
+                exc=exc,
+            ) from exc
         setattr(cfg.channels, name, updated)
         save_config(cfg, config_path=_system_config_path(request))
         _audit(
@@ -808,8 +879,12 @@ async def toggle_channel(
         new_enabled = not bool(getattr(current, "enabled", False))
         try:
             updated = current.__class__.model_validate({**current.model_dump(), "enabled": new_enabled})
-        except ValidationError as e:
-            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(e)) from e
+        except ValidationError as exc:
+            raise _channel_validation_error(
+                "channel_config_invalid",
+                "Channel configuration is invalid.",
+                exc=exc,
+            ) from exc
         setattr(cfg.channels, name, updated)
         save_config(cfg, config_path=_system_config_path(request))
         _audit(

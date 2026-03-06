@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { HashRouter as Router, Routes, Route, Navigate } from "react-router-dom"
+import { HashRouter as Router, Routes, Route, Navigate, useNavigate } from "react-router-dom"
 import { useEffect } from "react"
 import { Layout } from "./components/layout/Layout"
 import { Login } from "./pages/Login"
@@ -46,6 +46,35 @@ function SettingsRouteGuard({ tab, children }: { tab: SettingsTab; children: Rea
   const allowed = getAllowedSettingsTabs(role, isBetaAdmin)
   if (allowed.includes(tab)) return <>{children}</>
   return <Navigate to={`/settings/${getDefaultSettingsTab(role, isBetaAdmin)}`} replace />
+}
+
+function RedirectWithToast({ to, message, dedupeKey }: { to: string; message: string; dedupeKey: string }) {
+  const navigate = useNavigate()
+  const { addToast } = useStore()
+
+  useEffect(() => {
+    addToast({
+      type: "warning",
+      message,
+      dedupeKey,
+    })
+    navigate(to, { replace: true })
+  }, [addToast, dedupeKey, message, navigate, to])
+
+  return null
+}
+
+function OwnerRouteGuard({ children, fallbackTo }: { children: React.ReactNode; fallbackTo: string }) {
+  const { user } = useStore()
+  const role = String(user?.role || "member").toLowerCase()
+  if (role === "owner") return <>{children}</>
+  return (
+    <RedirectWithToast
+      to={fallbackTo}
+      message="Platform Admin is owner-only. Contact the workspace owner if you need channel credential changes."
+      dedupeKey="channels-owner-only"
+    />
+  )
 }
 
 export default function App() {
@@ -111,7 +140,7 @@ export default function App() {
             <Route path="channels/*" element={<SettingsRouteGuard tab="channels"><Channels /></SettingsRouteGuard>}>
               <Route index element={<Navigate to="workspace" replace />} />
               <Route path="workspace" element={<ChannelsWorkspace />} />
-              <Route path="admin" element={<ChannelsAdmin />} />
+              <Route path="admin" element={<OwnerRouteGuard fallbackTo="/settings/channels/workspace"><ChannelsAdmin /></OwnerRouteGuard>} />
             </Route>
             <Route path="soul" element={<SettingsRouteGuard tab="soul"><Soul /></SettingsRouteGuard>} />
             <Route path="tools" element={<SettingsRouteGuard tab="tools"><ToolsPolicy /></SettingsRouteGuard>} />

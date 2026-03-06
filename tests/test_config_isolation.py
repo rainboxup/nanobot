@@ -1,10 +1,12 @@
+import errno
 import json
 
 import pytest
 
 from nanobot.config.loader import load_config
 from nanobot.config.schema import Config
-from nanobot.tenants.store import TenantStore
+from nanobot.tenants import store as tenant_store_module
+from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError, TenantStore
 from nanobot.tenants.validation import ConfigValidationError
 
 
@@ -115,6 +117,122 @@ def test_tenant_store_save_uses_load_time_baseline_snapshot(tmp_path) -> None:
     raw = json.loads(store.tenant_config_path(tenant_id).read_text(encoding="utf-8"))
     assert "agents" not in raw
     assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
+
+
+def test_tenant_store_rejects_stale_snapshot_on_save(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-6")
+
+    first = store.load_tenant_config(tenant_id)
+    stale = store.load_tenant_config(tenant_id)
+
+    first.workspace.channels.feishu.enabled = False
+    store.save_tenant_config(tenant_id, first)
+
+    stale.workspace.channels.feishu.group_policy = "open"
+    with pytest.raises(TenantConfigConflictError, match="reload and retry"):
+        store.save_tenant_config(tenant_id, stale)
+
+
+
+def test_tenant_store_load_without_snapshot_skips_write_tracking(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-6b")
+
+    cfg = store.load_tenant_config(tenant_id, remember_snapshot=False)
+
+    assert store._loaded_config_snapshot(cfg) is None
+
+
+def test_tenant_store_save_preserves_unknown_tenant_root_keys(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-7")
+    config_path = store.tenant_config_path(tenant_id)
+    config_path.write_text(
+        json.dumps(
+            {
+                "workspace": {"channels": {"feishu": {"groupPolicy": "mention"}}},
+                "futureFeature": {"mode": "keep-me"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.workspace.channels.feishu.enabled = False
+    store.save_tenant_config(tenant_id, cfg)
+
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["futureFeature"] == {"mode": "keep-me"}
+    assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
+
+
+
+def test_tenant_store_save_preserves_explicit_override_matching_baseline(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-7b")
+    config_path = store.tenant_config_path(tenant_id)
+    config_path.write_text(
+        json.dumps(
+            {
+                "workspace": {
+                    "channels": {
+                        "feishu": {
+                            "groupPolicy": "mention",
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.workspace.channels.feishu.enabled = False
+    store.save_tenant_config(tenant_id, cfg)
+
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["workspace"]["channels"]["feishu"]["groupPolicy"] == "mention"
+    assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
+
+
+def test_tenant_store_save_preserves_migrated_legacy_enabled_override(tmp_path) -> None:
+    system_cfg = Config()
+    system_cfg.channels.feishu.enabled = False
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=system_cfg)
+    tenant_id = store.ensure_tenant("telegram", "u-8")
+    config_path = store.tenant_config_path(tenant_id)
+    config_path.write_text(
+        json.dumps({"channels": {"feishu": {"enabled": False}}}),
+        encoding="utf-8",
+    )
+
+    cfg = store.load_tenant_config(tenant_id)
+    system_cfg.channels.feishu.enabled = True
+    store.save_tenant_config(tenant_id, cfg)
+
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    assert raw["workspace"]["channels"]["feishu"]["enabled"] is False
+
+
+
+def test_tenant_store_save_raises_busy_when_config_lock_cannot_be_acquired(monkeypatch, tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-9")
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.workspace.channels.feishu.enabled = False
+
+    monkeypatch.setattr(tenant_store_module, "_TENANT_CONFIG_LOCK_TIMEOUT_SECONDS", 0.0)
+
+    def always_busy(_handle) -> None:
+        raise BlockingIOError(errno.EAGAIN, "busy")
+
+    monkeypatch.setattr(tenant_store_module, "_acquire_file_lock", always_busy)
+
+    with pytest.raises(TenantConfigBusyError) as exc_info:
+        store.save_tenant_config(tenant_id, cfg)
+
+    assert exc_info.value.reason_code == "tenant_config_busy"
 
 
 def test_load_config_strict_raises_on_invalid_json(tmp_path) -> None:

@@ -1,4 +1,5 @@
-import { Navigate, NavLink, Outlet, useLocation } from "react-router-dom"
+import { useMemo } from "react"
+import { NavLink, Outlet, useLocation } from "react-router-dom"
 
 import { cn } from "@/src/lib/utils"
 import { useStore } from "@/src/store/useStore"
@@ -8,14 +9,6 @@ export function Channels() {
   const location = useLocation()
   const role = String(user?.role || "member").toLowerCase()
   const isOwner = role === "owner"
-
-  if (location.pathname === "/settings/channels" || location.pathname === "/settings/channels/") {
-    return <Navigate to="/settings/channels/workspace" replace />
-  }
-
-  if (!isOwner && location.pathname.startsWith("/settings/channels/admin")) {
-    return <Navigate to="/settings/channels/workspace" replace />
-  }
 
   const tabs = [
     {
@@ -33,6 +26,10 @@ export function Channels() {
         ]
       : []),
   ]
+
+  const activeDescription = useMemo(() => {
+    return tabs.find((tab) => location.pathname.startsWith(tab.to))?.description || tabs[0]?.description
+  }, [location.pathname, tabs])
 
   return (
     <div className="space-y-6">
@@ -64,7 +61,7 @@ export function Channels() {
         </div>
 
         <div className="text-sm text-muted-foreground">
-          {tabs.find((tab) => location.pathname.startsWith(tab.to))?.description || tabs[0]?.description}
+          {activeDescription}
         </div>
       </div>
 

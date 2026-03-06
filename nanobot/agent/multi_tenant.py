@@ -209,13 +209,26 @@ class MultiTenantAgentLoop:
             )
         async with self._store_lock:
             if not tenant_id:
-                tenant_id = self.store.resolve_tenant(
-                    msg.channel, canonical_sender
-                ) or self.store.ensure_tenant(msg.channel, canonical_sender)
+                tenant_id = await asyncio.to_thread(
+                    self.store.resolve_tenant,
+                    msg.channel,
+                    canonical_sender,
+                )
+                if not tenant_id:
+                    tenant_id = await asyncio.to_thread(
+                        self.store.ensure_tenant,
+                        msg.channel,
+                        canonical_sender,
+                    )
             elif msg.channel == "web":
-                self.store.link_identity(tenant_id, msg.channel, canonical_sender)
-            tenant = self.store.ensure_tenant_files(tenant_id)
-            tenant_cfg = self.store.load_tenant_config(tenant_id)
+                await asyncio.to_thread(
+                    self.store.link_identity,
+                    tenant_id,
+                    msg.channel,
+                    canonical_sender,
+                )
+            tenant = await asyncio.to_thread(self.store.ensure_tenant_files, tenant_id)
+            tenant_cfg = await asyncio.to_thread(self.store.load_runtime_tenant_config, tenant_id)
 
         routing_decision = evaluate_workspace_channel_routing(
             config=tenant_cfg,
@@ -280,7 +293,7 @@ class MultiTenantAgentLoop:
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id, content=cmd.reply)
 
         # Require tenant API key before invoking the LLM
-        tenant_cfg = self.store.load_tenant_config(tenant_id)
+        tenant_cfg = await asyncio.to_thread(self.store.load_runtime_tenant_config, tenant_id)
         p = tenant_cfg.get_provider()
         api_key = p.api_key if p else None
         if not api_key and not tenant_cfg.agents.defaults.model.startswith("bedrock/"):

@@ -1208,7 +1208,7 @@ async def update_tools_policy(
     if "web_enabled" in data:
         cfg.tools.web.enabled = bool(data["web_enabled"])
     if data:
-        save_tenant_config(request, tenant_id, store, cfg)
+        await save_tenant_config(request, tenant_id, store, cfg)
 
     return _tool_policy_payload(request, user=user, tenant_id=tenant_id, cfg=cfg)
 
@@ -1249,7 +1249,7 @@ async def install_mcp_server(
     }
     servers[server_name] = MCPServerConfig.model_validate(model_payload)
     cfg.tools.mcp_servers = servers
-    save_tenant_config(request, tenant_id, store, cfg)
+    await save_tenant_config(request, tenant_id, store, cfg)
 
     transport = "http" if model_payload["url"] else "stdio"
     return {
@@ -1285,7 +1285,7 @@ async def uninstall_mcp_server(
 
     servers.pop(server_name, None)
     cfg.tools.mcp_servers = servers
-    save_tenant_config(request, tenant_id, store, cfg)
+    await save_tenant_config(request, tenant_id, store, cfg)
     return {"name": server_name, "removed": True}
 
 

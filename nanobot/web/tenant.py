@@ -5,9 +5,19 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import HTTPException, status
+from starlette.concurrency import run_in_threadpool
 
 from nanobot.config.schema import Config
-from nanobot.tenants.store import TenantStore, validate_tenant_id
+from nanobot.tenants.store import (
+    TenantConfigBusyError,
+    TenantConfigConflictError,
+    TenantConfigError,
+    TenantConfigLoadError,
+    TenantConfigStorageError,
+    TenantStore,
+    TenantStoreCorruptionError,
+    validate_tenant_id,
+)
 from nanobot.tenants.validation import ConfigValidationError
 
 
@@ -18,8 +28,18 @@ def tenant_id_from_claims(claims: dict[str, Any]) -> str:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token claims")
     try:
         return validate_tenant_id(tenant_id)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token claims") from e
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token claims") from exc
+
+
+def _tenant_store_http_exception(_exc: TenantStoreCorruptionError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "reason_code": "tenant_store_corrupted",
+            "message": "Tenant store is unavailable.",
+        },
+    )
 
 
 def get_tenant_store(app) -> TenantStore:
@@ -28,25 +48,57 @@ def get_tenant_store(app) -> TenantStore:
     if isinstance(store, TenantStore):
         return store
 
-    store = TenantStore(system_config=getattr(app.state, "config", None))
+    try:
+        store = TenantStore(system_config=getattr(app.state, "config", None))
+    except TenantStoreCorruptionError as exc:
+        raise _tenant_store_http_exception(exc) from exc
     app.state.tenant_store = store
     return store
 
 
-def tenant_config_http_exception(exc: ConfigValidationError | ValueError) -> HTTPException:
+def _safe_validation_details(exc: ConfigValidationError) -> dict[str, Any]:
+    details = dict(exc.details or {})
+    return {
+        key: value
+        for key, value in details.items()
+        if key != "tenant_id" and not str(key).startswith("system_")
+    }
+
+
+def _tenant_config_error_status(exc: TenantConfigError) -> int:
+    if isinstance(exc, (TenantConfigConflictError, TenantConfigBusyError)):
+        return status.HTTP_409_CONFLICT
+    if isinstance(exc, TenantConfigLoadError):
+        return status.HTTP_422_UNPROCESSABLE_CONTENT
+    if isinstance(exc, TenantConfigStorageError):
+        return status.HTTP_503_SERVICE_UNAVAILABLE
+    return status.HTTP_422_UNPROCESSABLE_CONTENT
+
+
+def tenant_config_http_exception(exc: ConfigValidationError | TenantConfigError) -> HTTPException:
     """Convert tenant-config validation/persistence failures into safe API errors."""
     if isinstance(exc, ConfigValidationError):
-        detail = {
+        status_code = (
+            status.HTTP_409_CONFLICT
+            if exc.reason_code in {"privilege_escalation", "subset_constraint"}
+            else status.HTTP_422_UNPROCESSABLE_CONTENT
+        )
+        detail: dict[str, Any] = {
             "reason_code": exc.reason_code,
             "message": exc.message,
-            "details": exc.details,
         }
-    else:
-        detail = {
-            "reason_code": "tenant_config_invalid",
-            "message": str(exc),
-        }
-    return HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=detail)
+        safe_details = _safe_validation_details(exc)
+        if safe_details:
+            detail["details"] = safe_details
+        return HTTPException(status_code=status_code, detail=detail)
+
+    detail = {
+        "reason_code": exc.reason_code,
+        "message": exc.message,
+    }
+    if exc.details:
+        detail["details"] = exc.details
+    return HTTPException(status_code=_tenant_config_error_status(exc), detail=detail)
 
 
 def load_tenant_config(request, claims: dict[str, Any]) -> tuple[str, TenantStore, Config]:
@@ -55,14 +107,14 @@ def load_tenant_config(request, claims: dict[str, Any]) -> tuple[str, TenantStor
     store = get_tenant_store(request.app)
     try:
         cfg = store.load_tenant_config(tenant_id)
-    except (ConfigValidationError, ValueError) as exc:
+    except (ConfigValidationError, TenantConfigError) as exc:
         raise tenant_config_http_exception(exc) from exc
     return tenant_id, store, cfg
 
 
-def save_tenant_config(_request, tenant_id: str, store: TenantStore, config: Config) -> None:
+async def save_tenant_config(_request, tenant_id: str, store: TenantStore, config: Config) -> None:
     """Persist tenant config and map validation failures to structured API errors."""
     try:
-        store.save_tenant_config(tenant_id, config)
-    except (ConfigValidationError, ValueError) as exc:
+        await run_in_threadpool(store.save_tenant_config, tenant_id, config)
+    except (ConfigValidationError, TenantConfigError) as exc:
         raise tenant_config_http_exception(exc) from exc

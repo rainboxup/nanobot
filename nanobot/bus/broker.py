@@ -172,20 +172,34 @@ class TenantIngressBroker:
         async with self.store_lock:
             if claimed_tenant_id:
                 tenant_id = str(claimed_tenant_id)
-                self.store.link_identity(tenant_id, msg.channel, canonical_sender)
+                await asyncio.to_thread(
+                    self.store.link_identity,
+                    tenant_id,
+                    msg.channel,
+                    canonical_sender,
+                )
             else:
-                tenant_id = self.store.resolve_tenant(msg.channel, canonical_sender)
+                tenant_id = await asyncio.to_thread(
+                    self.store.resolve_tenant,
+                    msg.channel,
+                    canonical_sender,
+                )
                 if not tenant_id:
-                    if self.store.count_tenants() >= self.max_total_tenants:
+                    tenant_count = await asyncio.to_thread(self.store.count_tenants)
+                    if tenant_count >= self.max_total_tenants:
                         return AdmitResult(accepted=False, reason="tenant_capacity_reached")
                     if not self._allow_new_tenant_creation():
                         return AdmitResult(accepted=False, reason="new_tenant_rate_limited")
-                    tenant_id = self.store.ensure_tenant(msg.channel, canonical_sender)
+                    tenant_id = await asyncio.to_thread(
+                        self.store.ensure_tenant,
+                        msg.channel,
+                        canonical_sender,
+                    )
                     METRICS.inc("new_tenant_created_total")
 
             # Ensure file layout exists; keeps downstream code simple.
-            self.store.ensure_tenant_files(tenant_id)
-            tenant_cfg = self.store.load_tenant_config(tenant_id)
+            await asyncio.to_thread(self.store.ensure_tenant_files, tenant_id)
+            tenant_cfg = await asyncio.to_thread(self.store.load_runtime_tenant_config, tenant_id)
 
         routing_decision = evaluate_workspace_channel_routing(
             config=tenant_cfg,

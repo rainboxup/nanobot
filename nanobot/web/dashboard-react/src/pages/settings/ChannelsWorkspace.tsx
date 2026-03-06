@@ -159,6 +159,9 @@ export function ChannelsWorkspace() {
               <span>{runtimeWarning}</span>
             </div>
           )}
+          <div className="rounded-md border border-warning/30 bg-yellow-500/10 px-3 py-2 text-sm text-yellow-800 dark:text-yellow-300">
+            Workspace routing only narrows inbound access for this workspace. System channel allowlists still apply before messages reach the workspace, so workspace sender IDs must stay within the system policy.
+          </div>
         </div>
         <Button variant="outline" onClick={() => loadChannels().catch(() => {})} disabled={loading}>
           <RefreshCw className="mr-2 h-4 w-4" />
@@ -306,9 +309,12 @@ export function ChannelsWorkspace() {
                 className="min-h-28 w-full rounded-md border bg-background px-3 py-2 text-sm"
                 value={allowFromText}
                 onChange={(event) => setAllowFromText(event.target.value)}
-                placeholder="One sender ID per line. Leave empty to inherit the system rule."
+                placeholder="One sender ID per line. Leave empty to avoid adding workspace restrictions; system channel allow_from still applies."
                 disabled={!editing.writable || saving}
               />
+              <div className="text-xs text-muted-foreground">
+                If the system channel allow_from is non-empty, this list must remain a subset of that system allowlist.
+              </div>
             </label>
 
             <label className="space-y-2 text-sm">

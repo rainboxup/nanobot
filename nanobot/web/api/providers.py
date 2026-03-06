@@ -359,7 +359,7 @@ async def update_provider_defaults(
 
     defaults.model = next_model
     defaults.provider = next_provider
-    save_tenant_config(request, tenant_id, store, cfg)
+    await save_tenant_config(request, tenant_id, store, cfg)
     _audit(
         request,
         event="config.agent_defaults.update",
@@ -412,7 +412,7 @@ async def update_provider(
 
     updated = current.model_copy(update=data)
     setattr(cfg.providers, name, updated)
-    save_tenant_config(request, tenant_id, store, cfg)
+    await save_tenant_config(request, tenant_id, store, cfg)
     _audit(
         request,
         event="config.provider.update",

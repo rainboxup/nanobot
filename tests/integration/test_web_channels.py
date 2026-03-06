@@ -3,6 +3,7 @@ import json
 import pytest
 
 from nanobot.config.loader import load_config, save_config
+from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError
 
 
 def _system_cfg(web_ctx):
@@ -14,11 +15,7 @@ def _system_cfg(web_ctx):
 
 
 def _tenant_cfg(web_ctx, tenant_id: str):
-    return load_config(
-        config_path=web_ctx.tenant_store.tenant_config_path(tenant_id),
-        allow_env_override=False,
-        strict=True,
-    )
+    return web_ctx.tenant_store.load_tenant_config(tenant_id)
 
 
 @pytest.mark.integration
@@ -258,6 +255,8 @@ async def test_channel_update_validation_rejects_bad_types(http_client, auth_hea
         "/api/channels/telegram", headers=auth_headers, json={"enabled": {"not": "bool"}}
     )
     assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["reason_code"] == "channel_config_invalid"
 
 
 @pytest.mark.integration
@@ -269,6 +268,7 @@ async def test_channel_update_rejects_unknown_fields(http_client, auth_headers) 
         json={"tokenn": "token-123"},
     )
     assert top_level.status_code == 422
+    assert top_level.json()["detail"]["reason_code"] == "channel_config_unknown_fields"
 
     nested_model = await http_client.put(
         "/api/channels/slack",
@@ -485,7 +485,7 @@ async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_workspace_routing_load_returns_422_for_invalid_persisted_subset(
+async def test_workspace_routing_load_returns_409_for_invalid_persisted_subset(
     http_client, auth_headers_for, web_ctx
 ) -> None:
     web_ctx.app.state.config.channels.feishu.allow_from = ["system-user"]
@@ -518,10 +518,13 @@ async def test_workspace_routing_load_returns_422_for_invalid_persisted_subset(
         headers=headers,
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail["reason_code"] == "subset_constraint"
     assert "subset" in str(detail["message"]).lower()
+    assert detail["details"]["channel"] == "feishu"
+    assert detail["details"]["invalid_entries"] == ["rogue-user"]
+    assert "system_allow_from" not in detail["details"]
 
 
 @pytest.mark.integration
@@ -543,7 +546,113 @@ async def test_workspace_routing_rejects_allowlist_expansion_against_system_scop
         json={"allow_from": ["system-user", "rogue-user"]},
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 409
     detail = response.json()["detail"]
     assert detail["reason_code"] == "subset_constraint"
     assert "subset" in str(detail["message"]).lower()
+    assert detail["details"]["channel"] == "feishu"
+    assert detail["details"]["invalid_entries"] == ["rogue-user"]
+    assert "system_allow_from" not in detail["details"]
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_rejects_removed_legacy_fields(http_client, auth_headers_for) -> None:
+    headers = await auth_headers_for(
+        "alice-routing-legacy",
+        role="admin",
+        tenant_id="tenant-routing-legacy",
+    )
+
+    response = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"enable_group_chat": True},
+    )
+
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert any((item.get("loc") or [None])[-1] == "enable_group_chat" for item in errors)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_single_runtime_mode_returns_structured_conflict(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+    headers = await auth_headers_for(
+        "alice-routing-single",
+        role="admin",
+        tenant_id="tenant-routing-single",
+    )
+
+    response = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"group_policy": "open"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason_code"] == "single_tenant_runtime_mode"
+    assert "single-tenant runtime mode" in str(detail["message"]).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_conflicting_flags_return_structured_422(
+    http_client, auth_headers_for
+) -> None:
+    headers = await auth_headers_for(
+        "alice-routing-conflict",
+        role="admin",
+        tenant_id="tenant-routing-conflict",
+    )
+
+    response = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"group_policy": "open", "require_mention": True},
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail["reason_code"] == "workspace_routing_conflict"
+    assert "conflicts" in str(detail["message"]).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error_factory", "reason_code"),
+    [
+        (lambda tenant_id: TenantConfigConflictError(tenant_id), "tenant_config_conflict"),
+        (lambda tenant_id: TenantConfigBusyError(tenant_id), "tenant_config_busy"),
+    ],
+)
+async def test_workspace_routing_save_maps_structured_store_errors(
+    http_client, auth_headers_for, web_ctx, monkeypatch, error_factory, reason_code
+) -> None:
+    tenant_id = "tenant-routing-save-error"
+    headers = await auth_headers_for(
+        "alice-routing-save-error",
+        role="admin",
+        tenant_id=tenant_id,
+    )
+
+    def fail_save(saved_tenant_id: str, _cfg) -> None:
+        raise error_factory(saved_tenant_id)
+
+    monkeypatch.setattr(web_ctx.tenant_store, "save_tenant_config", fail_save)
+
+    response = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"group_policy": "open"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason_code"] == reason_code
+    assert detail["details"]["tenant_id"] == tenant_id

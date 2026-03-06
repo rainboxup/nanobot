@@ -9,19 +9,28 @@ Each tenant has its own isolated data directory containing:
 
 from __future__ import annotations
 
+import errno
+import inspect
 import json
 import os
 import secrets
 import shutil
 import tempfile
 import threading
+import time
 import uuid
 import weakref
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 from nanobot.config.loader import (
     _build_config_without_env,
@@ -67,8 +76,71 @@ class LinkTarget:
     expires_at: datetime
 
 
+@dataclass
+class LoadedTenantConfigSnapshot:
+    ref: weakref.ReferenceType[Config]
+    baseline: dict[str, Any]
+    effective_allowed: dict[str, Any]
+    override_payload: dict[str, Any]
+    source_document: dict[str, Any]
+
+
 class TenantStoreCorruptionError(RuntimeError):
     """Raised when tenants index is corrupted and startup must abort."""
+
+
+class TenantStoreBusyError(RuntimeError):
+    """Raised when the tenant index is locked by another writer."""
+
+    def __init__(self):
+        super().__init__("Tenant store is busy; retry the operation.")
+
+
+class TenantStoreAccessError(RuntimeError):
+    """Raised when the tenant index cannot be accessed safely."""
+
+    def __init__(self):
+        super().__init__("Tenant store is unavailable.")
+
+
+class TenantConfigError(ValueError):
+    """Structured tenant-config error with a stable reason code."""
+
+    def __init__(self, reason_code: str, message: str, *, details: dict[str, Any] | None = None):
+        self.reason_code = reason_code
+        self.message = message
+        self.details = details or {}
+        super().__init__(self.message)
+
+
+class TenantConfigLoadError(TenantConfigError):
+    """Raised when tenant config cannot be parsed or validated."""
+
+
+class TenantConfigStorageError(TenantConfigError):
+    """Raised when tenant config storage is unavailable."""
+
+
+class TenantConfigBusyError(TenantConfigError):
+    """Raised when tenant config is locked by another writer."""
+
+    def __init__(self, tenant_id: str):
+        super().__init__(
+            "tenant_config_busy",
+            "Tenant configuration is busy; retry your update.",
+            details={"tenant_id": tenant_id},
+        )
+
+
+class TenantConfigConflictError(TenantConfigError):
+    """Raised when a tenant config changed since it was loaded."""
+
+    def __init__(self, tenant_id: str):
+        super().__init__(
+            "tenant_config_conflict",
+            "Tenant configuration changed; reload and retry your update.",
+            details={"tenant_id": tenant_id},
+        )
 
 
 _RESERVED_TENANT_IDS = {
@@ -107,6 +179,11 @@ _LEGACY_WORKSPACE_ROUTING_FIELDS = (
     "enable_group_chat",
     "audit_overrides",
 )
+_TENANT_CONFIG_SOURCE_EXCLUDED_ROOT_KEYS = {"channels", "gateway", "traffic", "session"}
+_TENANT_CONFIG_LOCK_TIMEOUT_SECONDS = 5.0
+_TENANT_INDEX_LOCK_TIMEOUT_SECONDS = 5.0
+_FILE_LOCK_POLL_INTERVAL_SECONDS = 0.05
+_MISSING = object()
 
 
 def _deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -148,6 +225,139 @@ def _parse_legacy_bool(value: Any) -> bool | None:
     return None
 
 
+def _tenant_allowed_root_data(data: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: deepcopy(data[key])
+        for key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS
+        if key in data
+    }
+
+
+def _tenant_source_passthrough(data: dict[str, Any]) -> dict[str, Any]:
+    passthrough: dict[str, Any] = {}
+    for key, value in data.items():
+        if key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS or key in _TENANT_CONFIG_SOURCE_EXCLUDED_ROOT_KEYS:
+            continue
+        passthrough[key] = deepcopy(value)
+    return passthrough
+
+
+def _reconcile_tenant_override_payload(
+    current: dict[str, Any],
+    baseline: dict[str, Any],
+    original_effective: dict[str, Any],
+    original_override: dict[str, Any],
+) -> dict[str, Any]:
+    reconciled: dict[str, Any] = {}
+    keys: set[str] = set()
+    for candidate in (current, baseline, original_effective, original_override):
+        if isinstance(candidate, dict):
+            keys.update(candidate.keys())
+
+    for key in keys:
+        current_value = current.get(key, _MISSING)
+        baseline_value = baseline.get(key, _MISSING)
+        original_effective_value = original_effective.get(key, _MISSING)
+        original_override_value = original_override.get(key, _MISSING)
+
+        nested_candidates = (
+            current_value,
+            baseline_value,
+            original_effective_value,
+            original_override_value,
+        )
+        if all(value is _MISSING or isinstance(value, dict) for value in nested_candidates):
+            nested = _reconcile_tenant_override_payload(
+                current_value if isinstance(current_value, dict) else {},
+                baseline_value if isinstance(baseline_value, dict) else {},
+                original_effective_value if isinstance(original_effective_value, dict) else {},
+                original_override_value if isinstance(original_override_value, dict) else {},
+            )
+            if nested:
+                reconciled[key] = nested
+            continue
+
+        if current_value == original_effective_value:
+            if original_override_value is not _MISSING:
+                reconciled[key] = deepcopy(original_override_value)
+            continue
+
+        if current_value is _MISSING or current_value == baseline_value:
+            continue
+
+        reconciled[key] = deepcopy(current_value)
+
+    return reconciled
+
+
+def _tenant_config_load_error(
+    tenant_id: str,
+    reason_code: str,
+    message: str,
+) -> TenantConfigLoadError:
+    return TenantConfigLoadError(reason_code, message, details={"tenant_id": tenant_id})
+
+
+def _tenant_config_storage_error(tenant_id: str) -> TenantConfigStorageError:
+    return TenantConfigStorageError(
+        "tenant_config_unavailable",
+        "Tenant configuration storage is unavailable.",
+        details={"tenant_id": tenant_id},
+    )
+
+
+def _tenant_config_schema_error(tenant_id: str, exc: ValueError) -> TenantConfigLoadError:
+    message = str(exc or "").strip()
+    normalized = message.lower()
+    if "unknown config keys in strict mode" in normalized:
+        return _tenant_config_load_error(
+            tenant_id,
+            "tenant_config_unknown_keys",
+            "Tenant configuration contains unsupported keys.",
+        )
+    if (
+        "failed to validate config" in normalized
+        or "config section" in normalized
+        or "config root must be an object" in normalized
+    ):
+        return _tenant_config_load_error(
+            tenant_id,
+            "tenant_config_invalid_shape",
+            "Tenant configuration shape is invalid.",
+        )
+    return _tenant_config_load_error(
+        tenant_id,
+        "tenant_config_invalid",
+        "Tenant configuration is invalid.",
+    )
+
+
+def _is_lock_contention_error(exc: OSError) -> bool:
+    if isinstance(exc, (BlockingIOError, PermissionError)):
+        return True
+    return getattr(exc, "errno", None) in {errno.EACCES, errno.EAGAIN}
+
+
+def _acquire_file_lock(handle) -> None:
+    if os.name == "nt":
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _release_file_lock(handle) -> None:
+    if os.name == "nt":
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class TenantStore:
     """A tiny JSON store for tenant identities and link codes."""
 
@@ -159,7 +369,7 @@ class TenantStore:
         self._tenant_config_locks_guard = threading.Lock()
         self._tenant_config_locks: dict[str, threading.RLock] = {}
         self._loaded_config_snapshots_guard = threading.Lock()
-        self._loaded_config_baselines: dict[int, tuple[weakref.ReferenceType[Config], dict[str, Any]]] = {}
+        self._loaded_config_snapshots: dict[int, LoadedTenantConfigSnapshot] = {}
 
         # Initialize config ownership validator
         self._system_config = None
@@ -205,7 +415,7 @@ class TenantStore:
     def ensure_tenant(self, channel: str, sender_id: str) -> str:
         """Resolve or create a tenant for an identity."""
         key = f"{channel}:{sender_id}"
-        with self._index_lock:
+        with self._index_mutation_lock():
             data = self._load()
             existing = data["identity_to_tenant"].get(key)
             if existing:
@@ -236,9 +446,14 @@ class TenantStore:
         # Bootstrap workspace templates (idempotent).
         create_workspace_templates(workspace)
 
-        with self._tenant_config_lock(config_path):
-            if not config_path.exists():
-                self._write_tenant_config(config_path, {})
+        if not config_path.exists():
+            with self._tenant_config_file_lock(config_path, tenant_id):
+                with self._tenant_config_lock(config_path):
+                    if not config_path.exists():
+                        try:
+                            self._write_tenant_config(config_path, {})
+                        except OSError as exc:
+                            raise _tenant_config_storage_error(tenant_id) from exc
 
         return TenantContext(
             tenant_id=tenant_id,
@@ -267,7 +482,7 @@ class TenantStore:
 
     def create_link_code(self, tenant_id: str, ttl_s: int = 10 * 60) -> str:
         tenant_id = validate_tenant_id(tenant_id)
-        with self._index_lock:
+        with self._index_mutation_lock():
             data = self._load()
             code = _make_link_code()
             expires_at = _utc_now() + timedelta(seconds=ttl_s)
@@ -279,7 +494,7 @@ class TenantStore:
             return code
 
     def consume_link_code(self, code: str) -> LinkTarget | None:
-        with self._index_lock:
+        with self._index_mutation_lock():
             data = self._load()
             raw = data["link_codes"].get(code)
             if not raw:
@@ -307,7 +522,7 @@ class TenantStore:
         """Attach an identity to a tenant (idempotent)."""
         tenant_id = validate_tenant_id(tenant_id)
         key = f"{channel}:{sender_id}"
-        with self._index_lock:
+        with self._index_mutation_lock():
             data = self._load()
 
             current = data["identity_to_tenant"].get(key)
@@ -329,28 +544,85 @@ class TenantStore:
             self._save(data)
         self.ensure_tenant_files(tenant_id)
 
-    def load_tenant_config(self, tenant_id: str) -> Config:
+    def load_tenant_config(self, tenant_id: str, *, remember_snapshot: bool = True) -> Config:
         tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
         with self._tenant_config_lock(ctx.config_path):
-            tenant_cfg_dict = self._read_tenant_config_data(ctx.config_path)
+            tenant_document = self._read_tenant_config_document(tenant_id, ctx.config_path)
+            tenant_cfg_dict = self._normalize_tenant_config_data(tenant_document)
             self._validate_tenant_config_payload(tenant_id, tenant_cfg_dict)
 
         baseline = self._baseline_config_data()
         effective_cfg_dict = _deep_merge_dicts(baseline, tenant_cfg_dict)
-        _ensure_no_unknown_config_keys(effective_cfg_dict)
-        config = _build_config_without_env(effective_cfg_dict, strict_section_types=True)
-        self._remember_loaded_config_baseline(config, baseline)
+        try:
+            _ensure_no_unknown_config_keys(effective_cfg_dict)
+            config = _build_config_without_env(effective_cfg_dict, strict_section_types=True)
+        except ValueError as exc:
+            raise _tenant_config_schema_error(tenant_id, exc) from exc
+
+        if remember_snapshot:
+            self._remember_loaded_config_snapshot(
+                config,
+                baseline=baseline,
+                effective_allowed=_tenant_allowed_root_data(effective_cfg_dict),
+                override_payload=tenant_cfg_dict,
+                source_document=self._source_tenant_config_document(tenant_document),
+            )
         return config
 
     def save_tenant_config(self, tenant_id: str, config: Config) -> None:
         tenant_id = validate_tenant_id(tenant_id)
         ctx = self.ensure_tenant_files(tenant_id)
-        baseline = self._loaded_config_baseline(config) or self._baseline_config_data()
-        payload = self._tenant_config_data(config, baseline=baseline)
-        with self._tenant_config_lock(ctx.config_path):
-            self._validate_tenant_config_payload(tenant_id, payload)
-            self._write_tenant_config(ctx.config_path, payload)
+        snapshot = self._loaded_config_snapshot(config)
+        baseline = deepcopy(snapshot.baseline) if snapshot is not None else self._baseline_config_data()
+        current_effective = _tenant_allowed_root_data(config.model_dump())
+        baseline_allowed = _tenant_allowed_root_data(baseline)
+
+        with self._tenant_config_file_lock(ctx.config_path, tenant_id):
+            with self._tenant_config_lock(ctx.config_path):
+                current_document = self._source_tenant_config_document(
+                    self._read_tenant_config_document(tenant_id, ctx.config_path)
+                )
+                if snapshot is not None and current_document != snapshot.source_document:
+                    raise TenantConfigConflictError(tenant_id)
+
+                if snapshot is not None:
+                    payload = _reconcile_tenant_override_payload(
+                        current_effective,
+                        baseline_allowed,
+                        snapshot.effective_allowed,
+                        snapshot.override_payload,
+                    )
+                    source_document = deepcopy(snapshot.source_document)
+                else:
+                    payload = _diff_dicts(current_effective, baseline_allowed)
+                    source_document = deepcopy(current_document)
+
+                self._validate_tenant_config_payload(tenant_id, payload)
+                final_document = _tenant_source_passthrough(source_document)
+                final_document.update(deepcopy(payload))
+                try:
+                    self._write_tenant_config(ctx.config_path, final_document)
+                except OSError as exc:
+                    raise _tenant_config_storage_error(tenant_id) from exc
+
+        self._remember_loaded_config_snapshot(
+            config,
+            baseline=baseline,
+            effective_allowed=current_effective,
+            override_payload=payload,
+            source_document=final_document,
+        )
+
+    def load_runtime_tenant_config(self, tenant_id: str) -> Config:
+        load_tenant_config = getattr(self, "load_tenant_config")
+        try:
+            parameters = inspect.signature(load_tenant_config).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "remember_snapshot" in parameters:
+            return load_tenant_config(tenant_id, remember_snapshot=False)
+        return load_tenant_config(tenant_id)
 
     def bind_system_config(self, system_config: Config | None) -> None:
         self._system_config = system_config
@@ -366,6 +638,69 @@ class TenantStore:
                 lock = threading.RLock()
                 self._tenant_config_locks[key] = lock
             return lock
+
+    @contextmanager
+    def _exclusive_file_lock(
+        self,
+        lock_path: Path,
+        *,
+        timeout_seconds: float,
+        timeout_factory: Callable[[], Exception],
+        error_factory: Callable[[OSError], Exception] | None = None,
+    ) -> Iterator[None]:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + timeout_seconds
+        try:
+            with open(lock_path, "a+b") as handle:
+                while True:
+                    try:
+                        _acquire_file_lock(handle)
+                        break
+                    except OSError as exc:
+                        if not _is_lock_contention_error(exc):
+                            if error_factory is not None:
+                                raise error_factory(exc) from exc
+                            raise
+                        if time.monotonic() >= deadline:
+                            raise timeout_factory() from exc
+                        time.sleep(_FILE_LOCK_POLL_INTERVAL_SECONDS)
+
+                try:
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(f"{os.getpid()}\n".encode("utf-8"))
+                    handle.flush()
+                    yield
+                finally:
+                    try:
+                        _release_file_lock(handle)
+                    except OSError:
+                        pass
+        except OSError as exc:
+            if error_factory is not None:
+                raise error_factory(exc) from exc
+            raise
+
+    @contextmanager
+    def _index_mutation_lock(self) -> Iterator[None]:
+        with self._exclusive_file_lock(
+            self.index_path.with_name(f"{self.index_path.name}.lock"),
+            timeout_seconds=_TENANT_INDEX_LOCK_TIMEOUT_SECONDS,
+            timeout_factory=TenantStoreBusyError,
+            error_factory=lambda _exc: TenantStoreAccessError(),
+        ):
+            with self._index_lock:
+                yield
+
+    @contextmanager
+    def _tenant_config_file_lock(self, config_path: Path, tenant_id: str) -> Iterator[None]:
+        with self._exclusive_file_lock(
+            config_path.with_name(f"{config_path.name}.lock"),
+            timeout_seconds=_TENANT_CONFIG_LOCK_TIMEOUT_SECONDS,
+            timeout_factory=lambda: TenantConfigBusyError(tenant_id),
+            error_factory=lambda _exc: _tenant_config_storage_error(tenant_id),
+        ):
+            yield
 
     def _validate_tenant_config_payload(self, tenant_id: str, payload: dict[str, Any]) -> None:
         if self._validator is None:
@@ -387,45 +722,45 @@ class TenantStore:
             )
             raise
 
-    def _remember_loaded_config_baseline(self, config: Config, baseline: dict[str, Any]) -> None:
+    def _remember_loaded_config_snapshot(
+        self,
+        config: Config,
+        *,
+        baseline: dict[str, Any],
+        effective_allowed: dict[str, Any],
+        override_payload: dict[str, Any],
+        source_document: dict[str, Any],
+    ) -> None:
         key = id(config)
 
         def _cleanup(_ref: weakref.ReferenceType[Config], *, config_id: int = key) -> None:
             with self._loaded_config_snapshots_guard:
-                self._loaded_config_baselines.pop(config_id, None)
+                self._loaded_config_snapshots.pop(config_id, None)
 
         with self._loaded_config_snapshots_guard:
-            self._loaded_config_baselines[key] = (
-                weakref.ref(config, _cleanup),
-                deepcopy(baseline),
+            self._loaded_config_snapshots[key] = LoadedTenantConfigSnapshot(
+                ref=weakref.ref(config, _cleanup),
+                baseline=deepcopy(baseline),
+                effective_allowed=deepcopy(effective_allowed),
+                override_payload=deepcopy(override_payload),
+                source_document=deepcopy(source_document),
             )
 
-    def _loaded_config_baseline(self, config: Config) -> dict[str, Any] | None:
+    def _loaded_config_snapshot(self, config: Config) -> LoadedTenantConfigSnapshot | None:
         with self._loaded_config_snapshots_guard:
-            stored = self._loaded_config_baselines.get(id(config))
+            stored = self._loaded_config_snapshots.get(id(config))
             if stored is None:
                 return None
-            ref, baseline = stored
-            if ref() is not config:
-                self._loaded_config_baselines.pop(id(config), None)
+            if stored.ref() is not config:
+                self._loaded_config_snapshots.pop(id(config), None)
                 return None
-            return deepcopy(baseline)
-
-    def _tenant_config_data(
-        self, config: Config, baseline: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        effective = config.model_dump()
-        baseline = deepcopy(baseline) if baseline is not None else self._baseline_config_data()
-        current = {
-            key: effective[key]
-            for key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS
-            if key in effective
-        }
-        baseline_allowed = {
-            key: baseline.get(key, {})
-            for key in _TENANT_CONFIG_ALLOWED_ROOT_KEYS
-        }
-        return _diff_dicts(current, baseline_allowed)
+            return LoadedTenantConfigSnapshot(
+                ref=stored.ref,
+                baseline=deepcopy(stored.baseline),
+                effective_allowed=deepcopy(stored.effective_allowed),
+                override_payload=deepcopy(stored.override_payload),
+                source_document=deepcopy(stored.source_document),
+            )
 
     def _baseline_config_data(self) -> dict[str, Any]:
         if self._system_config is not None:
@@ -437,19 +772,38 @@ class TenantStore:
         )
         return default_config.model_dump()
 
-    def _read_tenant_config_data(self, config_path: Path) -> dict[str, Any]:
+    def _read_tenant_config_document(self, tenant_id: str, config_path: Path) -> dict[str, Any]:
         if not config_path.exists():
             return {}
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Failed to load tenant config from {config_path}: {e}") from e
+        except json.JSONDecodeError as exc:
+            raise _tenant_config_load_error(
+                tenant_id,
+                "tenant_config_invalid_json",
+                "Tenant configuration contains invalid JSON.",
+            ) from exc
+        except OSError as exc:
+            raise _tenant_config_storage_error(tenant_id) from exc
 
         if not isinstance(raw, dict):
-            raise ValueError(f"Tenant config root must be an object: {config_path}")
+            raise _tenant_config_load_error(
+                tenant_id,
+                "tenant_config_invalid_root",
+                "Tenant configuration root must be an object.",
+            )
 
-        migrated = convert_keys(_migrate_config(raw))
-        return self._normalize_tenant_config_data(migrated)
+        return convert_keys(_migrate_config(raw))
+
+    def _read_tenant_config_data(self, tenant_id: str, config_path: Path) -> dict[str, Any]:
+        return self._normalize_tenant_config_data(
+            self._read_tenant_config_document(tenant_id, config_path)
+        )
+
+    def _source_tenant_config_document(self, data: dict[str, Any]) -> dict[str, Any]:
+        document = _tenant_source_passthrough(data)
+        document.update(self._normalize_tenant_config_data(data))
+        return document
 
     def _normalize_tenant_config_data(self, data: dict[str, Any]) -> dict[str, Any]:
         normalized: dict[str, Any] = {}
@@ -480,7 +834,6 @@ class TenantStore:
         if not isinstance(workspace_channels, dict):
             return
 
-        baseline_channels = self._baseline_config_data().get("channels", {})
         default_routing = TenantChannelOverride().model_dump(exclude_none=True)
 
         for channel_name in _WORKSPACE_ROUTING_CHANNELS:
@@ -488,7 +841,6 @@ class TenantStore:
             if not isinstance(legacy_channel, dict):
                 continue
 
-            system_channel = baseline_channels.get(channel_name, {})
             migrated: dict[str, Any] = {}
             for field in _LEGACY_WORKSPACE_ROUTING_FIELDS:
                 if field not in legacy_channel:
@@ -500,7 +852,7 @@ class TenantStore:
 
             if "enabled" in legacy_channel:
                 enabled = _parse_legacy_bool(legacy_channel["enabled"])
-                if enabled is not None and enabled != system_channel.get("enabled"):
+                if enabled is not None and enabled != default_routing.get("enabled"):
                     migrated["enabled"] = enabled
 
             if not migrated:

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nanobot.agent.skills import SkillsLoader
 from nanobot.services.workspace_mcp import WorkspaceMCPError, WorkspaceMCPService
@@ -74,6 +74,92 @@ class ToolPolicyUpdateRequest(BaseModel):
 
     exec_enabled: bool | None = None
     web_enabled: bool | None = None
+
+
+class SkillStoreIntegrityModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    algorithm: str
+    status: str
+    digest: str | None = None
+    manifest_present: bool
+    reason_code: str | None = None
+
+
+class SkillStoreMetadataModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    package_size_bytes: int
+    manifest_present: bool
+    integrity: SkillStoreIntegrityModel
+
+
+class SkillListItemModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    source: str | None = None
+    origin_source: str | None = None
+    path: str | None = None
+    description: str | None = None
+    installed: bool
+
+
+class SkillCatalogItemModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    source: str | None = None
+    origin_source: str | None = None
+    description: str | None = None
+    installed: bool
+    category: str | None = None
+    install_source: str | None = None
+    slug: str | None = None
+    version: str | None = None
+    author: str | None = None
+    homepage: str | None = None
+    store_metadata: SkillStoreMetadataModel | None = None
+
+
+class SkillCatalogWarningModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    source: str | None = None
+    status_code: int | None = None
+    upstream_status: int | None = None
+    detail: str | None = None
+
+
+class SkillCatalogV2ResponseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[SkillCatalogItemModel] = Field(default_factory=list)
+    next_cursor: str | None = None
+    partial: bool = False
+    warnings: list[SkillCatalogWarningModel] = Field(default_factory=list)
+
+
+class SkillDetailModel(SkillListItemModel):
+    model_config = ConfigDict(extra="forbid")
+
+    installed: bool | None = None
+    content: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    install_source: str | None = None
+    store_metadata: SkillStoreMetadataModel | None = None
+
+
+class SkillInstallResponseModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    installed: bool
+    already_installed: bool
+    repaired: bool
+    source: str | None = None
+    origin_source: str | None = None
+    install_source: str | None = None
 
 
 def _tenant_skills_loader(
@@ -666,7 +752,11 @@ async def _build_catalog_response(
     }
 
 
-@router.get("/api/skills")
+@router.get(
+    "/api/skills",
+    response_model=list[SkillListItemModel],
+    response_model_exclude_none=True,
+)
 async def list_skills(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
@@ -693,7 +783,11 @@ async def list_skills(
     return result
 
 
-@router.get("/api/skills/catalog")
+@router.get(
+    "/api/skills/catalog",
+    response_model=list[SkillCatalogItemModel],
+    response_model_exclude_none=True,
+)
 async def list_installable_skills(
     request: Request,
     source: str = Query(default="all"),
@@ -716,7 +810,11 @@ async def list_installable_skills(
     return list(payload.get("items") or [])
 
 
-@router.get("/api/skills/catalog/v2")
+@router.get(
+    "/api/skills/catalog/v2",
+    response_model=SkillCatalogV2ResponseModel,
+    response_model_exclude_none=True,
+)
 async def list_installable_skills_v2(
     request: Request,
     source: str = Query(default="all"),
@@ -738,7 +836,12 @@ async def list_installable_skills_v2(
     )
 
 
-@router.post("/api/skills/install", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/api/skills/install",
+    status_code=status.HTTP_201_CREATED,
+    response_model=SkillInstallResponseModel,
+    response_model_exclude_none=True,
+)
 async def install_skill(
     request: Request,
     payload: Any = Body(default=None),
@@ -932,7 +1035,11 @@ async def uninstall_mcp_server(
     return result.to_dict()
 
 
-@router.get("/api/skills/{name}")
+@router.get(
+    "/api/skills/{name}",
+    response_model=SkillDetailModel,
+    response_model_exclude_none=True,
+)
 async def get_skill(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:

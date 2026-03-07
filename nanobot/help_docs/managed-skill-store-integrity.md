@@ -14,14 +14,14 @@
 
 ---
 
-## 1) 当前行为：Store 仍是 install source，不是 runtime layer
+## 1) 当前行为：Managed store 仍是 install source，但 runtime canonical layer 已是 `managed`
 
 当前实现保持设计文档里的 MVP 边界：
 
-- **Managed store 只是安装来源**
-- 安装后，技能会被复制到目标 workspace
-- 运行时优先级仍然是 **workspace > bundled**
-- 还没有引入 read-only managed runtime cache layer
+- **Managed store 仍然是本地托管安装来源**
+- 对于来自这一层的技能，运行时对外暴露的 canonical `source` 已统一为 `managed`
+- 当前运行时优先级已经是 **workspace > managed > bundled**
+- 已安装到 workspace 的技能仍然优先于 managed / bundled
 
 因此，这里的完整性校验关注的是：
 
@@ -29,7 +29,7 @@
 - **包是否过大**
 - **包结构是否安全**
 
-而不是运行时热加载或统一缓存分发。
+同时，API 为了平滑迁移仍会保留兼容字段，用来区分“运行时 canonical source”和“来源追溯 / 安装来源”。
 
 ---
 
@@ -126,6 +126,43 @@ manifest 文件名固定为：
 ---
 
 ## 4) UI / API 里会看到什么？
+
+### 4.1 Skills source contract
+
+技能相关接口现在统一采用下面这组字段语义：
+
+- `source`：**运行时 canonical source**。客户端应该优先使用它做展示、筛选和分支判断。
+- `origin_source`：**兼容 / 来源追溯字段**。它保留迁移期来源信息，例如本地托管商店条目可能表现为 `source=managed`、`origin_source=store`。
+- `install_source`：**安装来源**。当前主值是 `local` 或 `clawhub`，表示安装动作来自本地来源还是 ClawHub 远端 ZIP。
+
+当前常见组合：
+
+- workspace 已安装技能：`source=workspace`，`origin_source=workspace`，`install_source=local`
+- 本地托管商店条目：`source=managed`，`origin_source=store`，`install_source=local`
+- bundled 技能：`source=builtin`，`origin_source=builtin`，`install_source=local`
+- ClawHub 远端目录条目：`source=clawhub`，`origin_source=clawhub`，`install_source=clawhub`
+
+主要接口的大致字段集合如下：
+
+- `GET /api/skills`：返回已知技能列表，重点字段包括 `name`、`description`、`path`、`source`、`origin_source`、`installed`
+- `GET /api/skills/{name}`：返回单个技能详情，在列表字段之外还会包含 `content`、`metadata`，以及适用时的 `install_source` / `store_metadata`
+- `GET /api/skills/catalog`：返回可安装目录项；条目字段以 `source`、`origin_source`、`install_source`、`installed` 为核心，可选带 `store_metadata`
+- `GET /api/skills/catalog/v2`：与 catalog 条目契约保持一致，但包装在 `items[]` 中，并带 `next_cursor` / `warnings`
+- `POST /api/skills/install`：请求体主路径应发送 `source=local|clawhub`；响应会返回 `name`、`installed`、`already_installed`、`repaired`、`source`、`origin_source`、`install_source`
+
+安装请求兼容策略：
+
+- 前端 / 新客户端主路径应发送 `local` 或 `clawhub`
+- 兼容期内，后端仍接受 `store`、`managed`、`builtin`、`workspace` 这类 alias，并将它们归一到本地安装路径
+- 客户端不应再把 `store` 当作 runtime canonical source；迁移完成后应仅以 `source` 为准
+
+产品展示建议：
+
+- 普通用户界面只应展示产品化后的主来源标签，例如“工作区”“平台托管”“内置”“ClawHub”
+- `origin_source`、`install_source` 这类技术字段更适合放在 Owner / Admin / Support 的详情、排障或 debug 视图中
+- 当产品展示与技术字段同时存在时，应始终以 `source` 作为主口径，`origin_source` 仅用于来源追溯
+
+### 4.2 托管商店完整性元数据
 
 当某个技能来自本地托管商店时，以下响应会额外带上 `store_metadata`：
 

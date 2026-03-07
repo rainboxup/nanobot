@@ -15,6 +15,8 @@ interface SkillListItem {
   name: string
   description?: string
   source?: string
+  origin_source?: string
+  install_source?: string
   path?: string
 }
 
@@ -30,6 +32,7 @@ interface SkillCatalogItem {
   version?: string
   slug?: string
   source?: string
+  origin_source?: string
   install_source?: string
   installed?: boolean
   category?: string
@@ -91,14 +94,32 @@ function normalizeSkillSource(source?: string): string {
   return normalized || "-"
 }
 
-function resolveSkillSourceContract(item: Pick<SkillCatalogItem, "source" | "install_source">): {
+function normalizeRawSkillSourceToken(source?: string): string {
+  const value = String(source || "").trim().toLowerCase()
+  return value || ""
+}
+
+function productizedSkillSourceLabel(source?: string): string {
+  const normalized = normalizeSkillSourceToken(source)
+  if (!normalized) return "-"
+  if (normalized === "workspace") return "工作区"
+  if (normalized === "managed") return "平台托管"
+  if (normalized === "builtin") return "内置"
+  if (normalized === "clawhub") return "ClawHub"
+  return normalized
+}
+
+function resolveSkillSourceContract(item: Pick<SkillCatalogItem, "source" | "origin_source" | "install_source">): {
   source: string
+  originSource: string
   installSource: string
   sourceLabel: string
+  originSourceLabel: string
   installSourceLabel: string
   installPayloadSource: InstallPayloadSource | ""
 } {
   const source = normalizeSkillSourceToken(item.source)
+  const originSource = normalizeRawSkillSourceToken(item.origin_source)
   const installSource = normalizeSkillSourceToken(item.install_source)
   const preferredSource = installSource || source
   const installPayloadSource: InstallPayloadSource | "" =
@@ -112,8 +133,10 @@ function resolveSkillSourceContract(item: Pick<SkillCatalogItem, "source" | "ins
         : ""
   return {
     source,
+    originSource,
     installSource,
-    sourceLabel: source || "-",
+    sourceLabel: productizedSkillSourceLabel(source),
+    originSourceLabel: originSource || "-",
     installSourceLabel: installSource || "-",
     installPayloadSource,
   }
@@ -208,7 +231,9 @@ async function fetchSkillCatalogWithFallback(): Promise<SkillCatalogItem[]> {
 }
 
 export function Skills() {
-  const { addToast } = useStore()
+  const { addToast, user } = useStore()
+  const role = String(user?.role || "member").trim().toLowerCase()
+  const canSeeTechnicalSourceDetails = role === "owner" || role === "admin"
 
   const [skills, setSkills] = useState<SkillListItem[]>([])
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogItem[]>([])
@@ -227,6 +252,7 @@ export function Skills() {
   )
   const detailRequestIdRef = useRef(0)
   const mutationInFlightRef = useRef(false)
+  const selectedSkillSourceContract = selectedSkill ? resolveSkillSourceContract(selectedSkill) : null
 
   useEffect(() => {
     const onResize = () => setViewportWidth(window.innerWidth)
@@ -330,18 +356,25 @@ export function Skills() {
       const sourceContract = resolveSkillSourceContract(item)
       const source = sourceContract.source
       const installSource = sourceContract.installSource
+      const technicalSourceMatch =
+        canSeeTechnicalSourceDetails &&
+        (
+          sourceContract.originSource.includes(q) ||
+          installSource.includes(q) ||
+          sourceContract.originSourceLabel.includes(q) ||
+          sourceContract.installSourceLabel.includes(q)
+        )
       return (
         name.includes(q) ||
         desc.includes(q) ||
         author.includes(q) ||
         version.includes(q) ||
         source.includes(q) ||
-        installSource.includes(q) ||
         sourceContract.sourceLabel.includes(q) ||
-        sourceContract.installSourceLabel.includes(q)
+        technicalSourceMatch
       )
     })
-  }, [searchQuery, skillCatalog])
+  }, [canSeeTechnicalSourceDetails, searchQuery, skillCatalog])
 
   const filteredMcpCatalog = useMemo(() => {
     const q = String(searchQuery || "").trim().toLowerCase()
@@ -409,7 +442,7 @@ export function Skills() {
   }
 
   const applySkillMutationFallback = (
-    item: Pick<SkillCatalogItem, "name" | "description" | "source" | "install_source">,
+    item: Pick<SkillCatalogItem, "name" | "description" | "source" | "origin_source" | "install_source">,
     installed: boolean
   ) => {
     const skillName = String(item.name || "").trim()
@@ -421,6 +454,7 @@ export function Skills() {
           name: skillName,
           description: item.description,
           source: item.source,
+          origin_source: item.origin_source,
           install_source: item.install_source,
           installed: true,
           category: "已安装",
@@ -640,7 +674,7 @@ export function Skills() {
                       <CardTitle className="text-base">{skill.name}</CardTitle>
                     </div>
                     <Badge variant="secondary" className="text-[10px] uppercase">
-                      {normalizeSkillSource(skill.source)}
+                      {productizedSkillSourceLabel(skill.source)}
                     </Badge>
                   </div>
                 </CardHeader>
@@ -713,7 +747,6 @@ export function Skills() {
                         const isInstalled = Boolean(item.installed)
                         const sourceContract = resolveSkillSourceContract(item)
                         const sourceLabel = sourceContract.sourceLabel
-                        const installSourceLabel = sourceContract.installSourceLabel
                         const authorLabel = formatSkillField(item.author)
                         const versionLabel = formatSkillField(item.version)
                         const installKey = `skill:install:${item.name}`
@@ -743,8 +776,9 @@ export function Skills() {
                               <div className="mt-2 grid grid-cols-2 gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
                                 <span className="truncate">作者：{authorLabel}</span>
                                 <span className="truncate">版本：{versionLabel}</span>
-                                <span className="truncate">来源：{sourceLabel}</span>
-                                <span className="truncate">安装源：{installSourceLabel}</span>
+                                {canSeeTechnicalSourceDetails ? (
+                                  <span className="truncate col-span-2">技术详情请查看技能详情面板</span>
+                                ) : null}
                               </div>
                             </CardContent>
                             <CardFooter className={INSTALL_CENTER_FOOTER_CLASS}>
@@ -926,9 +960,12 @@ export function Skills() {
         isOpen={selectedSkill !== null}
         onClose={() => setSelectedSkill(null)}
         title={selectedSkill?.name || "技能详情"}
-        description={`${selectedSkill?.source ? `来源: ${normalizeSkillSource(selectedSkill.source)}` : ""}${
-          selectedSkill?.path ? ` | 路径: ${String(selectedSkill.path)}` : ""
-        }`}
+        description={(() => {
+          const parts = [
+            selectedSkill?.source ? `来源: ${productizedSkillSourceLabel(selectedSkill.source)}` : "",
+          ].filter(Boolean)
+          return parts.join(" | ")
+        })()}
         footer={
           <>
             <Button variant="outline" onClick={() => setSelectedSkill(null)}>
@@ -948,6 +985,17 @@ export function Skills() {
               <h4 className="text-sm font-medium mb-2">描述</h4>
               <p className="text-sm text-muted-foreground">{selectedSkill.description || "（无描述）"}</p>
             </div>
+            {canSeeTechnicalSourceDetails ? (
+              <div>
+                <h4 className="text-sm font-medium mb-2">技术详情</h4>
+                <div className="grid grid-cols-1 gap-2 rounded-md border p-3 text-sm text-muted-foreground">
+                  <div>来源：{normalizeSkillSource(selectedSkill.source)}</div>
+                  <div>原始来源：{selectedSkillSourceContract?.originSourceLabel || "-"}</div>
+                  <div>安装源：{selectedSkillSourceContract?.installSourceLabel || "-"}</div>
+                  <div className="break-all">路径：{selectedSkill.path || "-"}</div>
+                </div>
+              </div>
+            ) : null}
             <div>
               <div className="flex items-center justify-between mb-2">
                 <h4 className="text-sm font-medium flex items-center gap-2">

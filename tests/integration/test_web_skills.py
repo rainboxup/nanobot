@@ -23,6 +23,37 @@ async def test_list_skills_returns_builtin_items(http_client, auth_headers) -> N
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_skills_openapi_declares_explicit_response_models(http_client) -> None:
+    resp = await http_client.get("/openapi.json")
+    assert resp.status_code == 200
+    payload = resp.json()
+
+    schemas = payload.get("components", {}).get("schemas", {})
+    assert "SkillListItemModel" in schemas
+    assert "SkillCatalogItemModel" in schemas
+    assert "SkillCatalogV2ResponseModel" in schemas
+    assert "SkillDetailModel" in schemas
+    assert "SkillInstallResponseModel" in schemas
+
+    paths = payload.get("paths", {})
+    skills_schema = paths["/api/skills"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert skills_schema["items"]["$ref"].endswith("/SkillListItemModel")
+
+    catalog_schema = paths["/api/skills/catalog"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert catalog_schema["items"]["$ref"].endswith("/SkillCatalogItemModel")
+
+    catalog_v2_schema = paths["/api/skills/catalog/v2"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert catalog_v2_schema["$ref"].endswith("/SkillCatalogV2ResponseModel")
+
+    install_schema = paths["/api/skills/install"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+    assert install_schema["$ref"].endswith("/SkillInstallResponseModel")
+
+    detail_schema = paths["/api/skills/{name}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    assert detail_schema["$ref"].endswith("/SkillDetailModel")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_get_skill_detail(http_client, auth_headers) -> None:
     skills_resp = await http_client.get("/api/skills", headers=auth_headers)
     assert skills_resp.status_code == 200
@@ -64,6 +95,7 @@ async def test_managed_skill_layer_is_visible_in_list_and_detail(
     managed_item = next((item for item in list_items if item.get("name") == "managed-layer-skill"), None)
     assert managed_item is not None
     assert managed_item.get("source") == "managed"
+    assert managed_item.get("origin_source") == "store"
     assert managed_item.get("path") == "managed://managed-layer-skill"
 
     detail_resp = await http_client.get("/api/skills/managed-layer-skill", headers=auth_headers)
@@ -71,6 +103,8 @@ async def test_managed_skill_layer_is_visible_in_list_and_detail(
     detail = detail_resp.json()
     assert detail.get("name") == "managed-layer-skill"
     assert detail.get("source") == "managed"
+    assert detail.get("origin_source") == "store"
+    assert detail.get("install_source") == "local"
     assert marker in str(detail.get("content") or "")
 
 
@@ -146,7 +180,11 @@ async def test_skill_catalog_clawhub_source_uses_local_installed_state(
     assert bool(installed_item.get("installed")) is True
     assert bool(fresh_item.get("installed")) is False
     assert installed_item.get("source") == "clawhub"
+    assert installed_item.get("origin_source") == "clawhub"
     assert installed_item.get("install_source") == "clawhub"
+    assert fresh_item.get("source") == "clawhub"
+    assert fresh_item.get("origin_source") == "clawhub"
+    assert fresh_item.get("install_source") == "clawhub"
 
     catalog_v2 = await http_client.get(
         "/api/skills/catalog/v2",
@@ -323,12 +361,14 @@ async def test_skill_catalog_source_all_deduplicates_same_name_with_local_preced
     assert len(shared_items) == 1
     shared_item = shared_items[0]
     assert shared_item.get("source") == "workspace"
+    assert shared_item.get("origin_source") == "workspace"
     assert shared_item.get("install_source") == "local"
     assert bool(shared_item.get("installed")) is True
 
     remote_only_item = next((item for item in items if item.get("name") == remote_only_name), None)
     assert remote_only_item is not None
     assert remote_only_item.get("source") == "clawhub"
+    assert remote_only_item.get("origin_source") == "clawhub"
     assert remote_only_item.get("install_source") == "clawhub"
 
 
@@ -525,6 +565,8 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     target = next((item for item in items if item.get("name") == "store-only-skill"), None)
     assert target is not None
     assert target.get("source") == "managed"
+    assert target.get("origin_source") == "store"
+    assert target.get("install_source") == "local"
     assert bool(target.get("installed")) is False
     assert target.get("store_metadata") is None
 
@@ -532,6 +574,7 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     assert detail_before_install.status_code == 200
     detail_before_body = detail_before_install.json()
     assert detail_before_body.get("source") == "managed"
+    assert detail_before_body.get("origin_source") == "store"
     assert detail_before_body.get("install_source") == "local"
     store_meta = detail_before_body.get("store_metadata")
     assert isinstance(store_meta, dict)
@@ -550,6 +593,9 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     v2_items = list(catalog_v2.json().get("items") or [])
     target_v2 = next((item for item in v2_items if item.get("name") == "store-only-skill"), None)
     assert target_v2 is not None
+    assert target_v2.get("source") == "managed"
+    assert target_v2.get("origin_source") == "store"
+    assert target_v2.get("install_source") == "local"
     assert target_v2.get("store_metadata") is None
 
     catalog_with_meta = await http_client.get(
@@ -598,6 +644,8 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     )
     assert installed_item is not None
     assert installed_item.get("source") == "workspace"
+    assert installed_item.get("origin_source") == "workspace"
+    assert installed_item.get("install_source") == "local"
     assert installed_item.get("store_metadata") is None
 
     detail = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
@@ -605,6 +653,8 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     detail_body = detail.json()
     assert marker in str(detail_body.get("content") or "")
     assert detail_body.get("source") == "workspace"
+    assert detail_body.get("origin_source") == "workspace"
+    assert detail_body.get("install_source") == "local"
     assert detail_body.get("store_metadata") is None
 
 

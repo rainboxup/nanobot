@@ -68,6 +68,30 @@ async def test_install_local_prefers_store_over_builtin(tmp_path: Path) -> None:
     assert content == "store-marker"
 
 
+@pytest.mark.asyncio
+async def test_install_local_falls_back_to_builtin_when_store_missing(tmp_path: Path) -> None:
+    store_dir = tmp_path / "store"
+    builtin_dir = tmp_path / "builtin"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    _make_skill(builtin_dir, "demo-skill", "builtin-marker")
+
+    service = WorkspaceSkillInstallService(skill_store_dir=store_dir, builtin_root=builtin_dir)
+    plan = service.prepare_install(name="demo-skill", source=None, slug=None, version=None)
+    result = await service.install_local(
+        plan=plan,
+        tenant_id="tenant-a",
+        workspace=workspace,
+        workspace_quota_mib=0,
+    )
+
+    assert result.installed is True
+    assert result.source == "builtin"
+    content = (workspace / "skills" / "demo-skill" / "SKILL.md").read_text(encoding="utf-8")
+    assert content == "builtin-marker"
+
+
 @pytest.mark.parametrize("source_alias", ["managed", "store", "builtin", "workspace"])
 def test_prepare_install_accepts_local_source_aliases(tmp_path: Path, source_alias: str) -> None:
     service = WorkspaceSkillInstallService(skill_store_dir=tmp_path / "store")

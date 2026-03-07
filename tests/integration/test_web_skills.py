@@ -161,6 +161,69 @@ async def test_skill_catalog_clawhub_source_uses_local_installed_state(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_skill_catalog_clawhub_source_ignores_store_metadata_flag(
+    http_client,
+    auth_headers,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote_name = "clawhub-source-with-meta-flag-skill"
+
+    class FakeClawHubClient:
+        async def list_catalog(self, *, cursor: str | None = None, limit: int = 200) -> dict:
+            return {
+                "items": [
+                    {
+                        "slug": remote_name,
+                        "summary": "remote skill for metadata flag test",
+                        "latestVersion": {"version": "1.0.0"},
+                    }
+                ],
+                "next_cursor": None,
+            }
+
+        async def download_skill_zip(self, *, slug: str, version: str | None = None) -> bytes:
+            raise AssertionError("download_skill_zip should not be called in catalog test")
+
+    calls: list[str] = []
+    original_describe = WorkspaceSkillInstallService.describe_local_source
+
+    def _spy_describe(self, *, name):  # type: ignore[no-untyped-def]
+        calls.append(str(name))
+        return original_describe(self, name=name)
+
+    monkeypatch.setattr(
+        "nanobot.web.api.skills.WorkspaceSkillInstallService.describe_local_source",
+        _spy_describe,
+    )
+    monkeypatch.setattr(skills_api, "get_clawhub_client", lambda _request: FakeClawHubClient())
+
+    catalog = await http_client.get(
+        "/api/skills/catalog",
+        headers=auth_headers,
+        params={"source": "clawhub", "include_store_metadata": "true"},
+    )
+    assert catalog.status_code == 200
+    item = next((entry for entry in catalog.json() if entry.get("name") == remote_name), None)
+    assert item is not None
+    assert item.get("source") == "clawhub"
+    assert "store_metadata" not in item
+
+    catalog_v2 = await http_client.get(
+        "/api/skills/catalog/v2",
+        headers=auth_headers,
+        params={"source": "clawhub", "include_store_metadata": "true"},
+    )
+    assert catalog_v2.status_code == 200
+    payload = catalog_v2.json()
+    v2_item = next((entry for entry in list(payload.get("items") or []) if entry.get("name") == remote_name), None)
+    assert v2_item is not None
+    assert v2_item.get("source") == "clawhub"
+    assert "store_metadata" not in v2_item
+    assert calls == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_skill_catalog_rejects_cursor_when_source_all(http_client, auth_headers) -> None:
     r = await http_client.get(
         "/api/skills/catalog/v2",
@@ -201,6 +264,72 @@ async def test_skill_catalog_source_all_reports_partial_when_clawhub_fails(
     assert warnings
     assert int(warnings[0].get("status_code") or 0) == 429
     assert isinstance(payload.get("items"), list)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_catalog_source_all_deduplicates_same_name_with_local_precedence(
+    web_ctx,
+    http_client,
+    auth_headers,
+    monkeypatch,
+) -> None:
+    shared_name = "source-all-dedupe-shared-skill"
+    remote_only_name = "source-all-dedupe-remote-only-skill"
+    tenant_ctx = web_ctx.tenant_store.ensure_tenant_files("admin")
+    local_dir = tenant_ctx.workspace / "skills" / shared_name
+    local_dir.mkdir(parents=True, exist_ok=True)
+    (local_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: Local duplicate source\n"
+        "---\n"
+        "\n"
+        "local dedupe marker\n",
+        encoding="utf-8",
+    )
+
+    class FakeClawHubClient:
+        async def list_catalog(self, *, cursor: str | None = None, limit: int = 200) -> dict:
+            return {
+                "items": [
+                    {
+                        "slug": shared_name,
+                        "summary": "Remote duplicate that should be deduped by local item.",
+                        "latestVersion": {"version": "9.9.9"},
+                    },
+                    {
+                        "slug": remote_only_name,
+                        "summary": "Remote item that should remain visible.",
+                        "latestVersion": {"version": "1.0.1"},
+                    },
+                ],
+                "next_cursor": None,
+            }
+
+        async def download_skill_zip(self, *, slug: str, version: str | None = None) -> bytes:
+            raise AssertionError("download_skill_zip should not be called in catalog test")
+
+    monkeypatch.setattr(skills_api, "get_clawhub_client", lambda _request: FakeClawHubClient())
+
+    catalog = await http_client.get(
+        "/api/skills/catalog/v2",
+        headers=auth_headers,
+        params={"source": "all"},
+    )
+    assert catalog.status_code == 200
+    items = list(catalog.json().get("items") or [])
+
+    shared_items = [item for item in items if item.get("name") == shared_name]
+    assert len(shared_items) == 1
+    shared_item = shared_items[0]
+    assert shared_item.get("source") == "workspace"
+    assert shared_item.get("install_source") == "local"
+    assert bool(shared_item.get("installed")) is True
+
+    remote_only_item = next((item for item in items if item.get("name") == remote_only_name), None)
+    assert remote_only_item is not None
+    assert remote_only_item.get("source") == "clawhub"
+    assert remote_only_item.get("install_source") == "clawhub"
 
 
 @pytest.mark.integration
@@ -246,7 +375,7 @@ async def test_skill_install_from_clawhub_zip_and_read_detail(
     assert install.status_code == 201
     install_body = install.json()
     assert install_body.get("name") == "remote-zip-skill"
-    assert install_body.get("source") == "clawhub"
+    assert install_body.get("source") == "workspace"
     assert install_body.get("origin_source") == "clawhub"
     assert install_body.get("install_source") == "clawhub"
     assert bool(install_body.get("installed")) is True
@@ -257,7 +386,18 @@ async def test_skill_install_from_clawhub_zip_and_read_detail(
 
     detail = await http_client.get("/api/skills/remote-zip-skill", headers=auth_headers)
     assert detail.status_code == 200
-    assert marker in str(detail.json().get("content") or "")
+    detail_body = detail.json()
+    assert detail_body.get("name") == "remote-zip-skill"
+    assert detail_body.get("source") == "workspace"
+    assert detail_body.get("install_source") == "local"
+    assert marker in str(detail_body.get("content") or "")
+    detail_path = str(detail_body.get("path") or "")
+    assert detail_path.startswith("workspace://skills/")
+    assert detail_path.endswith("/remote-zip-skill")
+    metadata = detail_body.get("metadata")
+    assert isinstance(metadata, dict)
+    assert metadata.get("description") == "Remote zip skill"
+    assert "store_metadata" not in detail_body
 
 
 @pytest.mark.integration
@@ -445,7 +585,7 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     assert install.status_code == 201
     body = install.json()
     assert body.get("name") == "store-only-skill"
-    assert body.get("source") == "managed"
+    assert body.get("source") == "workspace"
     assert body.get("origin_source") == "store"
     assert body.get("install_source") == "local"
     assert bool(body.get("installed")) is True

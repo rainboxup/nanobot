@@ -46,6 +46,13 @@ def _normalize_runtime_skill_source(source: Any) -> str | None:
     return value
 
 
+def _normalize_origin_skill_source(source: Any) -> str | None:
+    value = str(source or "").strip().lower()
+    if value == "managed":
+        return "store"
+    return value or None
+
+
 class SkillInstallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -436,12 +443,18 @@ def _skill_payload(
     *,
     name: str,
     source: str,
+    origin_source: str | None = None,
     installed: bool,
     description: str | None = None,
 ) -> dict[str, Any]:
+    runtime_source = _normalize_runtime_skill_source(source) or source
+    normalized_origin_source = _normalize_origin_skill_source(origin_source)
+    if normalized_origin_source is None:
+        normalized_origin_source = _normalize_origin_skill_source(source)
     return {
         "name": name,
-        "source": source,
+        "source": runtime_source,
+        "origin_source": normalized_origin_source,
         "description": description,
         "installed": bool(installed),
         "category": "已安装" if installed else "可安装",
@@ -493,17 +506,21 @@ def _build_skill_catalog(
         installed = name in workspace_skills
         if installed:
             source = "workspace"
+            origin_source = "workspace"
             source_file = workspace_skills[name] / "SKILL.md"
         elif name in store_skills:
             source = "managed"
+            origin_source = "store"
             source_file = store_skills[name] / "SKILL.md"
         else:
             source = "builtin"
+            origin_source = "builtin"
             source_file = builtin_skills[name] / "SKILL.md"
         items.append(
             _skill_payload(
                 name=name,
                 source=source,
+                origin_source=origin_source,
                 installed=installed,
                 description=_read_skill_description(source_file),
             )
@@ -661,12 +678,14 @@ async def list_skills(
     for s in skills:
         name = s.get("name", "")
         meta = loader.get_skill_metadata(name) or {}
-        source = s.get("source")
+        origin_source = _normalize_origin_skill_source(s.get("source"))
+        runtime_source = _normalize_runtime_skill_source(origin_source)
         result.append(
             {
                 "name": name,
-                "source": source,
-                "path": _skill_path_label(source, name),
+                "source": runtime_source,
+                "origin_source": origin_source,
+                "path": _skill_path_label(runtime_source, name),
                 "description": meta.get("description"),
                 "installed": name in installed_names,
             }
@@ -773,15 +792,16 @@ async def install_skill(
     except WorkspaceSkillInstallError as exc:
         raise _service_http_exception(exc) from exc
 
-    runtime_source = _normalize_runtime_skill_source(result.source)
+    origin_source = _normalize_origin_skill_source(result.source)
+    runtime_source = "workspace" if bool(result.installed) else _normalize_runtime_skill_source(origin_source)
     return {
         "name": plan.name,
         "installed": bool(result.installed),
         "already_installed": bool(result.already_installed),
         "repaired": bool(result.repaired),
         "source": runtime_source,
-        "origin_source": result.source,
-        "install_source": "clawhub" if str(result.source or "").strip().lower() == "clawhub" else "local",
+        "origin_source": origin_source,
+        "install_source": "clawhub" if origin_source == "clawhub" else "local",
     }
 
 
@@ -946,15 +966,17 @@ async def get_skill(
                 source = s.get("source")
                 break
 
-    runtime_source = _normalize_runtime_skill_source(source)
+    origin_source = _normalize_origin_skill_source(source)
+    runtime_source = _normalize_runtime_skill_source(origin_source)
     payload = {
         "name": skill_name,
         "source": runtime_source,
+        "origin_source": origin_source,
         "path": _skill_path_label(runtime_source, skill_name),
         "description": meta.get("description"),
         "content": content,
         "metadata": meta,
-        "install_source": "clawhub" if str(source or "").strip().lower() == "clawhub" else "local",
+        "install_source": "clawhub" if origin_source == "clawhub" else "local",
     }
     store_metadata = _store_metadata_for_skill(install_service, name=skill_name, source=runtime_source)
     if store_metadata is not None:

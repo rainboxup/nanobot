@@ -77,11 +77,46 @@ const INSTALL_CENTER_CARD_CLASS =
   "flex h-full flex-col border border-border/60 transition-all hover:border-primary/50 hover:shadow-md"
 const INSTALL_CENTER_FOOTER_CLASS = "mt-auto flex items-center justify-between gap-2 border-t pt-3"
 
-function normalizeSkillSource(source?: string): string {
+type InstallPayloadSource = "local" | "clawhub"
+
+function normalizeSkillSourceToken(source?: string): string {
   const value = String(source || "").trim().toLowerCase()
-  if (value === "workspace" || value === "builtin" || value === "store" || value === "clawhub" || value === "local")
-    return value
-  return value || "-"
+  if (!value) return ""
+  if (value === "store") return "managed"
+  return value
+}
+
+function normalizeSkillSource(source?: string): string {
+  const normalized = normalizeSkillSourceToken(source)
+  return normalized || "-"
+}
+
+function resolveSkillSourceContract(item: Pick<SkillCatalogItem, "source" | "install_source">): {
+  source: string
+  installSource: string
+  sourceLabel: string
+  installSourceLabel: string
+  installPayloadSource: InstallPayloadSource | ""
+} {
+  const source = normalizeSkillSourceToken(item.source)
+  const installSource = normalizeSkillSourceToken(item.install_source)
+  const preferredSource = installSource || source
+  const installPayloadSource: InstallPayloadSource | "" =
+    preferredSource === "clawhub"
+      ? "clawhub"
+      : preferredSource === "local" ||
+          preferredSource === "workspace" ||
+          preferredSource === "builtin" ||
+          preferredSource === "managed"
+        ? "local"
+        : ""
+  return {
+    source,
+    installSource,
+    sourceLabel: source || "-",
+    installSourceLabel: installSource || "-",
+    installPayloadSource,
+  }
 }
 
 function formatSkillField(value?: string): string {
@@ -117,7 +152,7 @@ function mergeSkillCatalogItems(localItems: SkillCatalogItem[], remoteItems: Ski
       author: existing.author || item.author,
       version: item.version || existing.version,
       slug: item.slug || existing.slug,
-      install_source: item.install_source || existing.install_source,
+      install_source: existing.install_source || item.install_source,
     })
   }
   return Array.from(merged.values()).sort((a, b) => {
@@ -292,15 +327,18 @@ export function Skills() {
       const desc = String(item.description || "").toLowerCase()
       const author = String(item.author || "").toLowerCase()
       const version = String(item.version || "").toLowerCase()
-      const source = String(item.source || "").toLowerCase()
-      const installSource = String(item.install_source || "").toLowerCase()
+      const sourceContract = resolveSkillSourceContract(item)
+      const source = sourceContract.source
+      const installSource = sourceContract.installSource
       return (
         name.includes(q) ||
         desc.includes(q) ||
         author.includes(q) ||
         version.includes(q) ||
         source.includes(q) ||
-        installSource.includes(q)
+        installSource.includes(q) ||
+        sourceContract.sourceLabel.includes(q) ||
+        sourceContract.installSourceLabel.includes(q)
       )
     })
   }, [searchQuery, skillCatalog])
@@ -454,14 +492,8 @@ export function Skills() {
     setMutatingKey(key)
     try {
       const payload: Record<string, string> = { name }
-      const installSource = String(item.install_source || "").trim().toLowerCase()
-      const rawSource = installSource || String(item.source || "").trim().toLowerCase()
-      const source =
-        rawSource === "clawhub"
-          ? "clawhub"
-          : rawSource === "local" || rawSource === "workspace" || rawSource === "builtin" || rawSource === "store"
-            ? "local"
-            : ""
+      const sourceContract = resolveSkillSourceContract(item)
+      const source = sourceContract.installPayloadSource
       const slug = String(item.slug || "").trim()
       const version = String(item.version || "").trim()
       if (source) payload.source = source
@@ -608,7 +640,7 @@ export function Skills() {
                       <CardTitle className="text-base">{skill.name}</CardTitle>
                     </div>
                     <Badge variant="secondary" className="text-[10px] uppercase">
-                      {String(skill.source || "-")}
+                      {normalizeSkillSource(skill.source)}
                     </Badge>
                   </div>
                 </CardHeader>
@@ -679,8 +711,9 @@ export function Skills() {
                     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
                       {shownItems.map((item) => {
                         const isInstalled = Boolean(item.installed)
-                        const sourceLabel = normalizeSkillSource(item.source)
-                        const installSourceLabel = normalizeSkillSource(item.install_source)
+                        const sourceContract = resolveSkillSourceContract(item)
+                        const sourceLabel = sourceContract.sourceLabel
+                        const installSourceLabel = sourceContract.installSourceLabel
                         const authorLabel = formatSkillField(item.author)
                         const versionLabel = formatSkillField(item.version)
                         const installKey = `skill:install:${item.name}`
@@ -893,7 +926,7 @@ export function Skills() {
         isOpen={selectedSkill !== null}
         onClose={() => setSelectedSkill(null)}
         title={selectedSkill?.name || "技能详情"}
-        description={`${selectedSkill?.source ? `来源: ${String(selectedSkill.source)}` : ""}${
+        description={`${selectedSkill?.source ? `来源: ${normalizeSkillSource(selectedSkill.source)}` : ""}${
           selectedSkill?.path ? ` | 路径: ${String(selectedSkill.path)}` : ""
         }`}
         footer={

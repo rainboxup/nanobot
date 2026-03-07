@@ -7,6 +7,7 @@ import pytest
 from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.services.workspace_skill_installs import WorkspaceSkillInstallService
 from nanobot.web.api import skills as skills_api
 
 
@@ -346,6 +347,55 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     assert target is not None
     assert target.get("source") == "store"
     assert bool(target.get("installed")) is False
+    assert target.get("store_metadata") is None
+
+    detail_before_install = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
+    assert detail_before_install.status_code == 200
+    detail_before_body = detail_before_install.json()
+    assert detail_before_body.get("source") == "store"
+    store_meta = detail_before_body.get("store_metadata")
+    assert isinstance(store_meta, dict)
+    assert int(store_meta.get("package_size_bytes") or 0) > 0
+    assert bool(store_meta.get("manifest_present")) is False
+    integrity = store_meta.get("integrity")
+    assert isinstance(integrity, dict)
+    assert integrity.get("algorithm") == "sha256"
+    assert integrity.get("status") == "unverified"
+    assert bool(integrity.get("manifest_present")) is False
+    assert isinstance(integrity.get("digest"), str)
+    assert len(str(integrity.get("digest") or "")) == 64
+
+    catalog_v2 = await http_client.get("/api/skills/catalog/v2", headers=auth_headers)
+    assert catalog_v2.status_code == 200
+    v2_items = list(catalog_v2.json().get("items") or [])
+    target_v2 = next((item for item in v2_items if item.get("name") == "store-only-skill"), None)
+    assert target_v2 is not None
+    assert target_v2.get("store_metadata") is None
+
+    catalog_with_meta = await http_client.get(
+        "/api/skills/catalog?include_store_metadata=true",
+        headers=auth_headers,
+    )
+    assert catalog_with_meta.status_code == 200
+    target_with_meta = next(
+        (item for item in catalog_with_meta.json() if item.get("name") == "store-only-skill"),
+        None,
+    )
+    assert target_with_meta is not None
+    assert isinstance(target_with_meta.get("store_metadata"), dict)
+
+    catalog_v2_with_meta = await http_client.get(
+        "/api/skills/catalog/v2?include_store_metadata=true",
+        headers=auth_headers,
+    )
+    assert catalog_v2_with_meta.status_code == 200
+    v2_with_meta_items = list(catalog_v2_with_meta.json().get("items") or [])
+    target_v2_with_meta = next(
+        (item for item in v2_with_meta_items if item.get("name") == "store-only-skill"),
+        None,
+    )
+    assert target_v2_with_meta is not None
+    assert isinstance(target_v2_with_meta.get("store_metadata"), dict)
 
     install = await http_client.post(
         "/api/skills/install",
@@ -358,9 +408,61 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     assert body.get("source") == "store"
     assert bool(body.get("installed")) is True
 
+    catalog_after = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert catalog_after.status_code == 200
+    installed_item = next(
+        (item for item in catalog_after.json() if item.get("name") == "store-only-skill"),
+        None,
+    )
+    assert installed_item is not None
+    assert installed_item.get("source") == "workspace"
+    assert installed_item.get("store_metadata") is None
+
     detail = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
     assert detail.status_code == 200
-    assert marker in str(detail.json().get("content") or "")
+    detail_body = detail.json()
+    assert marker in str(detail_body.get("content") or "")
+    assert detail_body.get("source") == "workspace"
+    assert detail_body.get("store_metadata") is None
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_catalog_skips_store_metadata_inspection_when_store_empty(
+    web_ctx, http_client, auth_headers, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_dir = web_ctx.workspace_dir.parent / "skill-store" / "skills"
+    web_ctx.app.state.skill_store_dir = store_dir
+    store_skill = store_dir / "store-only-skill"
+    store_skill.mkdir(parents=True, exist_ok=True)
+    (store_skill / "SKILL.md").write_text("# Store\n", encoding="utf-8")
+
+    calls: list[str] = []
+    original_describe = WorkspaceSkillInstallService.describe_local_source
+
+    def _spy_describe(self, *, name):  # type: ignore[no-untyped-def]
+        calls.append(name)
+        return original_describe(self, name=name)
+
+    monkeypatch.setattr(
+        "nanobot.web.api.skills.WorkspaceSkillInstallService.describe_local_source",
+        _spy_describe,
+    )
+
+    catalog = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert catalog.status_code == 200
+    assert calls == []
+
+    catalog_v2 = await http_client.get("/api/skills/catalog/v2", headers=auth_headers)
+    assert catalog_v2.status_code == 200
+    assert calls == []
+
+    catalog_with_meta = await http_client.get(
+        "/api/skills/catalog?include_store_metadata=true",
+        headers=auth_headers,
+    )
+    assert catalog_with_meta.status_code == 200
+    assert calls == ["store-only-skill"]
 
 
 @pytest.mark.integration

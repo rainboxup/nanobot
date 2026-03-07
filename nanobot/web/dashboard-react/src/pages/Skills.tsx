@@ -134,7 +134,7 @@ async function fetchCatalogV2Page(params: URLSearchParams): Promise<SkillCatalog
 }
 
 async function fetchSkillCatalogFromV2(): Promise<SkillCatalogItem[]> {
-  const localParams = new URLSearchParams({ source: "local", limit: "500" })
+  const localParams = new URLSearchParams({ source: "local", limit: "500", include_store_metadata: "false" })
   const localPayload = await fetchCatalogV2Page(localParams)
   const localItems = normalizeSkillCatalogResponse(localPayload)
 
@@ -161,10 +161,12 @@ async function fetchSkillCatalogWithFallback(): Promise<SkillCatalogItem[]> {
     return await fetchSkillCatalogFromV2()
   } catch {
     try {
-      const latest = await api.get<SkillCatalogResponse>("/api/skills/catalog?source=all&limit=200")
+      const latest = await api.get<SkillCatalogResponse>(
+        "/api/skills/catalog?source=all&limit=200&include_store_metadata=false",
+      )
       return normalizeSkillCatalogResponse(latest)
     } catch {
-      const legacy = await api.get<SkillCatalogResponse>("/api/skills/catalog")
+      const legacy = await api.get<SkillCatalogResponse>("/api/skills/catalog?include_store_metadata=false")
       return normalizeSkillCatalogResponse(legacy)
     }
   }

@@ -209,21 +209,32 @@ def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
 
 
 def _read_skill_description(skill_file: Path) -> str | None:
+    content = _read_skill_content(skill_file)
+    if content is None:
+        return None
+    metadata = _parse_skill_frontmatter(content)
+    desc = str(metadata.get("description") or "").strip()
+    return desc or None
+
+
+def _read_skill_content(skill_file: Path) -> str | None:
     try:
-        content = skill_file.read_text(encoding="utf-8")
+        return skill_file.read_text(encoding="utf-8")
     except Exception:
         return None
+
+
+def _parse_skill_frontmatter(content: str) -> dict[str, str]:
     match = re.match(r"^---\r?\n(.*?)\r?\n---(?:\r?\n|$)", content, re.DOTALL)
     if not match:
-        return None
+        return {}
+    metadata: dict[str, str] = {}
     for line in match.group(1).splitlines():
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
-        if key.strip() == "description":
-            desc = value.strip().strip("\"'")
-            return desc or None
-    return None
+        metadata[key.strip()] = value.strip().strip("\"'")
+    return metadata
 
 
 def _skill_path_label(source: Any, skill_name: str) -> str:
@@ -416,11 +427,45 @@ def _skill_payload(
     }
 
 
-def _build_skill_catalog(loader: SkillsLoader, skill_store_dir: Path) -> list[dict[str, Any]]:
+def _store_metadata_for_skill(
+    install_service: WorkspaceSkillInstallService,
+    *,
+    name: str,
+    source: str | None,
+) -> dict[str, Any] | None:
+    if str(source or "").strip().lower() != "store":
+        return None
+    details = install_service.describe_local_source(name=name)
+    if details is None or str(details.source or "").strip().lower() != "store":
+        return None
+    inspection = details.inspection
+    return {
+        "package_size_bytes": int(inspection.total_bytes),
+        "manifest_present": bool(inspection.manifest_present),
+        "integrity": {
+            "algorithm": "sha256",
+            "status": str(inspection.integrity_status or "unverified"),
+            "digest": inspection.sha256,
+            "manifest_present": bool(inspection.manifest_present),
+            "reason_code": inspection.reason_code,
+        },
+    }
+
+
+def _build_skill_catalog(
+    loader: SkillsLoader,
+    skill_store_dir: Path,
+    *,
+    include_store_metadata: bool,
+) -> list[dict[str, Any]]:
     workspace_skills = _list_skill_dirs(loader.workspace_skills)
     builtin_skills = _list_skill_dirs(loader.builtin_skills)
     store_skills = _list_skill_dirs(skill_store_dir)
     all_names = set(workspace_skills) | set(builtin_skills) | set(store_skills)
+    install_service = WorkspaceSkillInstallService(
+        skill_store_dir=skill_store_dir,
+        builtin_root=loader.builtin_skills,
+    )
 
     items: list[dict[str, Any]] = []
     for name in all_names:
@@ -443,6 +488,10 @@ def _build_skill_catalog(loader: SkillsLoader, skill_store_dir: Path) -> list[di
             )
         )
         items[-1]["install_source"] = "local"
+        if include_store_metadata:
+            store_metadata = _store_metadata_for_skill(install_service, name=name, source=source)
+            if store_metadata is not None:
+                items[-1]["store_metadata"] = store_metadata
 
     items.sort(key=lambda item: (0 if item["installed"] else 1, str(item["name"]).lower()))
     return items
@@ -504,6 +553,7 @@ async def _build_catalog_response(
     query: str | None,
     limit: int,
     cursor: str | None,
+    include_store_metadata: bool,
 ) -> dict[str, Any]:
     source_mode = _normalize_catalog_source(source)
     normalized_query = _normalize_query(query)
@@ -517,7 +567,11 @@ async def _build_catalog_response(
 
     local_items: list[dict[str, Any]] = []
     if source_mode in {"local", "all"}:
-        local_items = _build_skill_catalog(loader, _resolve_skill_store_dir(request))
+        local_items = _build_skill_catalog(
+            loader,
+            _resolve_skill_store_dir(request),
+            include_store_metadata=include_store_metadata,
+        )
         local_items = _apply_catalog_query(local_items, normalized_query)
 
     remote_items: list[dict[str, Any]] = []
@@ -606,6 +660,7 @@ async def list_installable_skills(
     q: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None),
+    include_store_metadata: bool = Query(default=False),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
@@ -616,6 +671,7 @@ async def list_installable_skills(
         query=q,
         limit=limit,
         cursor=cursor,
+        include_store_metadata=include_store_metadata,
     )
     return list(payload.get("items") or [])
 
@@ -627,6 +683,7 @@ async def list_installable_skills_v2(
     q: str | None = Query(default=None),
     limit: int = Query(default=200, ge=1, le=500),
     cursor: str | None = Query(default=None),
+    include_store_metadata: bool = Query(default=False),
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
@@ -637,6 +694,7 @@ async def list_installable_skills_v2(
         query=q,
         limit=limit,
         cursor=cursor,
+        include_store_metadata=include_store_metadata,
     )
 
 
@@ -835,23 +893,36 @@ async def get_skill(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
     skill_name = str(name or "").strip()
-    if not _SKILL_NAME_RE.fullmatch(skill_name):
+    install_service = WorkspaceSkillInstallService(
+        skill_store_dir=_resolve_skill_store_dir(request),
+    )
+    try:
+        skill_name = install_service.validate_skill_name(skill_name)
+    except WorkspaceSkillInstallError:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid skill name")
 
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
     content = loader.load_skill(skill_name)
+    source = None
+    meta = loader.get_skill_metadata(skill_name) or {}
+    if content is None:
+        local_source = install_service.resolve_local_source(name=skill_name)
+        if local_source is not None:
+            skill_file = local_source.path / "SKILL.md"
+            content = _read_skill_content(skill_file)
+            if content is not None:
+                source = local_source.source
+                meta = _parse_skill_frontmatter(content)
     if content is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found")
 
-    # Find source from list_skills output (authoritative for dashboard).
-    source = None
-    for s in loader.list_skills(filter_unavailable=False):
-        if s.get("name") == skill_name:
-            source = s.get("source")
-            break
+    if source is None:
+        for s in loader.list_skills(filter_unavailable=False):
+            if s.get("name") == skill_name:
+                source = s.get("source")
+                break
 
-    meta = loader.get_skill_metadata(skill_name) or {}
-    return {
+    payload = {
         "name": skill_name,
         "source": source,
         "path": _skill_path_label(source, skill_name),
@@ -859,4 +930,8 @@ async def get_skill(
         "content": content,
         "metadata": meta,
     }
+    store_metadata = _store_metadata_for_skill(install_service, name=skill_name, source=source)
+    if store_metadata is not None:
+        payload["store_metadata"] = store_metadata
+    return payload
 

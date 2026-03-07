@@ -19,6 +19,7 @@ async def test_list_help_docs_returns_curated_specs(http_client, auth_headers) -
     slugs = {row.get("slug") for row in body}
     assert "workspace-routing-and-binding" in slugs
     assert "effective-policy-and-soul" in slugs
+    assert "managed-skill-store-integrity" in slugs
     assert "config-ownership" in slugs
 
     assert all(isinstance(row.get("title"), str) and row.get("title") for row in body)
@@ -41,6 +42,22 @@ async def test_get_help_doc_returns_markdown_and_source(http_client, auth_header
     assert isinstance(source, dict)
     assert source.get("kind") == "repo_docs"
     assert source.get("path") == "docs/howto/workspace-routing-and-binding.md"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_managed_skill_store_help_doc_returns_markdown_and_source(
+    http_client, auth_headers
+) -> None:
+    resp = await http_client.get("/api/help/managed-skill-store-integrity", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+
+    assert body.get("slug") == "managed-skill-store-integrity"
+    assert isinstance(body.get("markdown"), str) and body["markdown"]
+    source = body.get("source")
+    assert isinstance(source, dict)
+    assert source.get("path") == "docs/howto/managed-skill-store-integrity.md"
 
 
 @pytest.mark.integration

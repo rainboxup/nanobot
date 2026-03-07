@@ -78,3 +78,12 @@ def test_default_registry_uses_bundled_help_docs_that_match_repo_docs() -> None:
     assert doc is not None
     assert doc.source.path == "docs/howto/workspace-routing-and-binding.md"
     assert doc.markdown == repo_workspace
+
+    bundled_store = (bundled_dir / "managed-skill-store-integrity.md").read_text(encoding="utf-8")
+    repo_store = (repo_root / "docs/howto/managed-skill-store-integrity.md").read_text(encoding="utf-8")
+    assert bundled_store == repo_store
+
+    store_doc = registry.get_doc("managed-skill-store-integrity")
+    assert store_doc is not None
+    assert store_doc.source.path == "docs/howto/managed-skill-store-integrity.md"
+    assert store_doc.markdown == repo_store

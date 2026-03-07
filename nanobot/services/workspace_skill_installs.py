@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
+import os
 import re
 import shutil
 import stat
 import tempfile
 import threading
+import time
 import zipfile
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -17,6 +21,7 @@ from typing import Any
 from nanobot.services.skill_management import (
     SkillInstallResult,
     SkillManagementService,
+    SkillSourceInspection,
     SkillUninstallResult,
 )
 
@@ -28,9 +33,18 @@ _ZIP_MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
 _ZIP_MAX_SINGLE_FILE = 8 * 1024 * 1024
 _ZIP_MAX_PATH_DEPTH = 12
 _ZIP_MAX_COMPRESSION_RATIO = 200.0
+_ENV_SOURCE_DETAILS_CACHE_TTL_SECONDS = "NANOBOT_SKILL_SOURCE_DETAILS_CACHE_TTL_S"
+_ENV_SOURCE_DETAILS_CACHE_MAX_ENTRIES = "NANOBOT_SKILL_SOURCE_DETAILS_CACHE_MAX_ENTRIES"
+_SOURCE_DETAILS_CACHE_TTL_SECONDS = 300.0
+_SOURCE_DETAILS_CACHE_MAX_ENTRIES = 2048
 _lock_registry_guard = threading.Lock()
-_skill_locks: dict[str, asyncio.Lock] = {}
-_tenant_locks: dict[str, asyncio.Lock] = {}
+_skill_locks: dict[str, threading.Lock] = {}
+_tenant_locks: dict[str, threading.Lock] = {}
+_source_details_cache_guard = threading.Lock()
+_source_details_cache: OrderedDict[
+    tuple[str, str, int],
+    tuple[float, str, LocalSkillSourceDetails],
+] = OrderedDict()
 
 
 @dataclass(frozen=True)
@@ -45,6 +59,14 @@ class SkillInstallPlan:
 class SkillInstallSource:
     source: str
     path: Path
+
+
+@dataclass(frozen=True)
+class LocalSkillSourceDetails:
+    name: str
+    source: str
+    path: Path
+    inspection: SkillSourceInspection
 
 
 class WorkspaceSkillInstallError(RuntimeError):
@@ -62,22 +84,42 @@ class WorkspaceSkillInstallError(RuntimeError):
         self.details = details or {}
 
 
-def _skill_lock(key: str) -> asyncio.Lock:
+def _skill_lock(key: str) -> threading.Lock:
     with _lock_registry_guard:
         lock = _skill_locks.get(key)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = threading.Lock()
             _skill_locks[key] = lock
         return lock
 
 
-def _tenant_lock(tenant_id: str) -> asyncio.Lock:
+def _tenant_lock(tenant_id: str) -> threading.Lock:
     with _lock_registry_guard:
         lock = _tenant_locks.get(tenant_id)
         if lock is None:
-            lock = asyncio.Lock()
+            lock = threading.Lock()
             _tenant_locks[tenant_id] = lock
         return lock
+
+
+def _parse_non_negative_float_env(name: str, default: float) -> float:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return float(default)
+    try:
+        return max(0.0, float(raw))
+    except Exception:
+        return float(default)
+
+
+def _parse_positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = str(os.getenv(name) or "").strip()
+    if not raw:
+        return max(minimum, int(default))
+    try:
+        return max(minimum, int(raw))
+    except Exception:
+        return max(minimum, int(default))
 
 
 class WorkspaceSkillInstallService:
@@ -89,17 +131,44 @@ class WorkspaceSkillInstallService:
         skill_store_dir: Path,
         builtin_root: Path | None = None,
         management_service: SkillManagementService | None = None,
+        source_details_cache_ttl_seconds: float | None = None,
+        source_details_cache_max_entries: int | None = None,
     ) -> None:
         self.skill_store_dir = Path(skill_store_dir).expanduser()
         self.builtin_root = Path(builtin_root).expanduser() if builtin_root is not None else None
         self._management_service = management_service or SkillManagementService(
             skill_store_dir=self.skill_store_dir
         )
+        self._source_details_cache_ttl_seconds = self._resolve_source_details_cache_ttl(
+            source_details_cache_ttl_seconds
+        )
+        self._source_details_cache_max_entries = self._resolve_source_details_cache_max_entries(
+            source_details_cache_max_entries
+        )
 
     @staticmethod
     def _normalize_query(value: str | None) -> str | None:
         normalized = str(value or "").strip()
         return normalized or None
+
+    @staticmethod
+    def _resolve_source_details_cache_ttl(value: float | None) -> float:
+        if value is None:
+            return _parse_non_negative_float_env(
+                _ENV_SOURCE_DETAILS_CACHE_TTL_SECONDS,
+                _SOURCE_DETAILS_CACHE_TTL_SECONDS,
+            )
+        return max(0.0, float(value))
+
+    @staticmethod
+    def _resolve_source_details_cache_max_entries(value: int | None) -> int:
+        if value is None:
+            return _parse_positive_int_env(
+                _ENV_SOURCE_DETAILS_CACHE_MAX_ENTRIES,
+                _SOURCE_DETAILS_CACHE_MAX_ENTRIES,
+                minimum=1,
+            )
+        return max(1, int(value))
 
     def validate_skill_name(self, value: str | None) -> str:
         name = self._normalize_query(value)
@@ -207,6 +276,195 @@ class WorkspaceSkillInstallService:
                 return SkillInstallSource(source="builtin", path=builtin_src_dir)
         return None
 
+    @staticmethod
+    def _source_details_cache_key(
+        *,
+        source_path: Path,
+        source_kind: str,
+        max_source_package_bytes: int,
+    ) -> tuple[str, str, int]:
+        return (
+            str(Path(source_path).expanduser()),
+            str(source_kind or "").strip().lower(),
+            max(0, int(max_source_package_bytes)),
+        )
+
+    @staticmethod
+    def _source_state_token(source_path: Path) -> str:
+        src = Path(source_path).expanduser()
+        hasher = hashlib.sha256()
+        try:
+            root_stat = src.lstat()
+        except OSError:
+            hasher.update(b"missing-root")
+            return hasher.hexdigest()
+
+        def _update_entry(prefix: bytes, rel_path: str, entry_stat: os.stat_result) -> None:
+            hasher.update(prefix)
+            hasher.update(rel_path.encode("utf-8", errors="surrogatepass"))
+            hasher.update(b"\0")
+            hasher.update(str(int(entry_stat.st_mode)).encode("ascii"))
+            hasher.update(b"\0")
+            hasher.update(str(max(0, int(entry_stat.st_size))).encode("ascii"))
+            hasher.update(b"\0")
+            hasher.update(str(max(0, int(getattr(entry_stat, "st_mtime_ns", 0)))).encode("ascii"))
+
+        _update_entry(b"R\0", ".", root_stat)
+        if stat.S_ISLNK(root_stat.st_mode) or not stat.S_ISDIR(root_stat.st_mode):
+            return hasher.hexdigest()
+
+        for current_root, dirnames, filenames in os.walk(src, topdown=True, followlinks=False):
+            current_path = Path(current_root)
+            dirnames.sort()
+            filenames.sort()
+
+            for dirname in dirnames:
+                dir_path = current_path / dirname
+                rel_path = dir_path.relative_to(src).as_posix()
+                try:
+                    entry_stat = dir_path.lstat()
+                except OSError:
+                    hasher.update(b"ED\0")
+                    hasher.update(rel_path.encode("utf-8", errors="surrogatepass"))
+                    continue
+                _update_entry(b"D\0", rel_path, entry_stat)
+
+            for filename in filenames:
+                file_path = current_path / filename
+                rel_path = file_path.relative_to(src).as_posix()
+                try:
+                    entry_stat = file_path.lstat()
+                except OSError:
+                    hasher.update(b"EF\0")
+                    hasher.update(rel_path.encode("utf-8", errors="surrogatepass"))
+                    continue
+                _update_entry(b"F\0", rel_path, entry_stat)
+
+        return hasher.hexdigest()
+
+    def describe_local_source(self, *, name: str) -> LocalSkillSourceDetails | None:
+        install_source = self.resolve_local_source(name=name)
+        if install_source is None:
+            return None
+        now = time.monotonic()
+        cache_key = self._source_details_cache_key(
+            source_path=install_source.path,
+            source_kind=install_source.source,
+            max_source_package_bytes=self._management_service.max_source_package_bytes,
+        )
+        state_token = self._source_state_token(install_source.path)
+        with _source_details_cache_guard:
+            expired_keys = [
+                key
+                for key, cached in _source_details_cache.items()
+                if float(cached[0]) <= now
+            ]
+            for key in expired_keys:
+                _source_details_cache.pop(key, None)
+
+            cached = _source_details_cache.get(cache_key)
+            if cached is not None and cached[1] == state_token:
+                _source_details_cache.move_to_end(cache_key)
+                return cached[2]
+        inspection = self._management_service.inspect_source_package(
+            source_dir=install_source.path,
+            source=install_source.source,
+        )
+        details = LocalSkillSourceDetails(
+            name=name,
+            source=install_source.source,
+            path=install_source.path,
+            inspection=inspection,
+        )
+        expires_at = time.monotonic() + self._source_details_cache_ttl_seconds
+        with _source_details_cache_guard:
+            _source_details_cache[cache_key] = (expires_at, state_token, details)
+            _source_details_cache.move_to_end(cache_key)
+            while len(_source_details_cache) > self._source_details_cache_max_entries:
+                _source_details_cache.popitem(last=False)
+        return details
+
+    def _install_from_source_locked(
+        self,
+        *,
+        tenant_id: str,
+        name: str,
+        source: str,
+        source_dir: Path,
+        workspace: Path,
+        workspace_quota_mib: int,
+    ) -> SkillInstallResult:
+        tenant_lock = _tenant_lock(tenant_id)
+        skill_lock = _skill_lock(f"{tenant_id}:{name}")
+        with tenant_lock:
+            with skill_lock:
+                return self._management_service.install_from_source(
+                    name=name,
+                    source=source,
+                    source_dir=source_dir,
+                    workspace=workspace,
+                    workspace_quota_mib=workspace_quota_mib,
+                )
+
+    @staticmethod
+    def _raise_for_install_result(*, name: str, result: SkillInstallResult) -> SkillInstallResult:
+        if result.installed:
+            return result
+        if result.reason_code == "workspace_quota_exceeded":
+            raise WorkspaceSkillInstallError(
+                "workspace_quota_exceeded",
+                "Installing this skill would exceed workspace quota",
+                status_code=422,
+                details={
+                    "name": name,
+                    "quota_current_bytes": result.quota_current_bytes,
+                    "quota_skill_bytes": result.quota_skill_bytes,
+                    "quota_projected_bytes": result.quota_projected_bytes,
+                    "quota_limit_bytes": result.quota_limit_bytes,
+                },
+            )
+        if result.reason_code == "source_package_too_large":
+            raise WorkspaceSkillInstallError(
+                "source_package_too_large",
+                "Skill package exceeds managed store size limit",
+                status_code=422,
+                details={
+                    "name": name,
+                    "package_bytes": result.source_package_bytes,
+                    "package_limit_bytes": result.source_package_limit_bytes,
+                },
+            )
+        if result.reason_code in {
+            "source_manifest_invalid",
+            "source_integrity_mismatch",
+            "source_package_symlink_unsupported",
+            "source_package_unreadable",
+        }:
+            raise WorkspaceSkillInstallError(
+                result.reason_code,
+                "Skill package failed integrity validation",
+                status_code=502,
+                details={
+                    "name": name,
+                    "package_bytes": result.source_package_bytes,
+                    "sha256": result.source_sha256,
+                    "integrity_status": result.source_integrity_status,
+                },
+            )
+        if result.reason_code == "not_found":
+            raise WorkspaceSkillInstallError(
+                "skill_package_unavailable",
+                "Skill package is unavailable",
+                status_code=502,
+                details={"name": name},
+            )
+        raise WorkspaceSkillInstallError(
+            "skill_install_failed",
+            "Skill package is unavailable",
+            status_code=502,
+            details={"name": name, "reason_code": result.reason_code},
+        )
+
     async def install_local(
         self,
         *,
@@ -231,6 +489,32 @@ class WorkspaceSkillInstallService:
             workspace=workspace,
             workspace_quota_mib=workspace_quota_mib,
         )
+
+    def install_local_sync(
+        self,
+        *,
+        plan: SkillInstallPlan,
+        tenant_id: str,
+        workspace: Path,
+        workspace_quota_mib: int,
+    ) -> SkillInstallResult:
+        install_source = self.resolve_local_source(name=plan.name)
+        if install_source is None:
+            raise WorkspaceSkillInstallError(
+                "skill_not_found",
+                "Skill not found in skill store or builtin skills",
+                status_code=404,
+                details={"name": plan.name},
+            )
+        result = self._install_from_source_locked(
+            tenant_id=tenant_id,
+            name=plan.name,
+            source=install_source.source,
+            source_dir=install_source.path,
+            workspace=workspace,
+            workspace_quota_mib=workspace_quota_mib,
+        )
+        return self._raise_for_install_result(name=plan.name, result=result)
 
     async def install_clawhub_zip(
         self,
@@ -282,40 +566,16 @@ class WorkspaceSkillInstallService:
         workspace: Path,
         workspace_quota_mib: int,
     ) -> SkillInstallResult:
-        tenant_lock = _tenant_lock(tenant_id)
-        skill_lock = _skill_lock(f"{tenant_id}:{name}")
-        async with tenant_lock:
-            async with skill_lock:
-                result = await asyncio.to_thread(
-                    self._management_service.install_from_source,
-                    name=name,
-                    source=source,
-                    source_dir=source_dir,
-                    workspace=workspace,
-                    workspace_quota_mib=workspace_quota_mib,
-                )
-        if result.installed:
-            return result
-        if result.reason_code == "workspace_quota_exceeded":
-            raise WorkspaceSkillInstallError(
-                "workspace_quota_exceeded",
-                "Installing this skill would exceed workspace quota",
-                status_code=422,
-                details={"name": name},
-            )
-        if result.reason_code == "not_found":
-            raise WorkspaceSkillInstallError(
-                "skill_package_unavailable",
-                "Skill package is unavailable",
-                status_code=502,
-                details={"name": name},
-            )
-        raise WorkspaceSkillInstallError(
-            "skill_install_failed",
-            "Skill package is unavailable",
-            status_code=502,
-            details={"name": name, "reason_code": result.reason_code},
+        result = await asyncio.to_thread(
+            self._install_from_source_locked,
+            tenant_id=tenant_id,
+            name=name,
+            source=source,
+            source_dir=source_dir,
+            workspace=workspace,
+            workspace_quota_mib=workspace_quota_mib,
         )
+        return self._raise_for_install_result(name=name, result=result)
 
     async def uninstall(
         self,
@@ -325,12 +585,27 @@ class WorkspaceSkillInstallService:
         workspace: Path,
     ) -> SkillUninstallResult:
         skill_name = self.validate_skill_name(name)
+        result = await asyncio.to_thread(
+            self.uninstall_sync,
+            tenant_id=tenant_id,
+            name=skill_name,
+            workspace=workspace,
+        )
+        return result
+
+    def uninstall_sync(
+        self,
+        *,
+        tenant_id: str,
+        name: str,
+        workspace: Path,
+    ) -> SkillUninstallResult:
+        skill_name = self.validate_skill_name(name)
         tenant_lock = _tenant_lock(tenant_id)
         skill_lock = _skill_lock(f"{tenant_id}:{skill_name}")
-        async with tenant_lock:
-            async with skill_lock:
-                result = await asyncio.to_thread(
-                    self._management_service.uninstall,
+        with tenant_lock:
+            with skill_lock:
+                result = self._management_service.uninstall(
                     name=skill_name,
                     workspace=workspace,
                 )

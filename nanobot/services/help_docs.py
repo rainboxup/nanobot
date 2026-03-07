@@ -80,6 +80,12 @@ def _default_specs() -> tuple[HelpDocSpec, ...]:
             HelpDocSource(kind="repo_docs", path="docs/howto/effective-policy-and-soul.md"),
         ),
         (
+            "managed-skill-store-integrity",
+            "Managed Skill Store Integrity",
+            Path("managed-skill-store-integrity.md"),
+            HelpDocSource(kind="repo_docs", path="docs/howto/managed-skill-store-integrity.md"),
+        ),
+        (
             "config-ownership",
             "Config Scopes & Ownership",
             Path("config-ownership.md"),

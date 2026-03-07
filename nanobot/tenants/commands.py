@@ -8,7 +8,6 @@ These commands let users self-serve:
 
 from __future__ import annotations
 
-import re
 import threading
 import time
 from collections import deque
@@ -20,10 +19,12 @@ from loguru import logger
 
 from nanobot.providers.registry import find_by_name
 from nanobot.services.skill_management import SkillManagementService
+from nanobot.services.workspace_skill_installs import (
+    WorkspaceSkillInstallError,
+    WorkspaceSkillInstallService,
+)
 from nanobot.tenants.store import TenantStore
 from nanobot.tenants.types import TenantContext
-
-_SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
 _LINK_BUSY_TEXT = "System busy, please try again later"
 _LINK_WINDOW_SECONDS = 60.0
@@ -137,6 +138,44 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key)
     return f"{key[:4]}...{key[-4:]}"
+
+
+def _skills_install_error_reply(*, name: str, exc: WorkspaceSkillInstallError) -> str:
+    reason = str(getattr(exc, "reason_code", "") or "").strip()
+    details = getattr(exc, "details", None) or {}
+
+    if reason == "workspace_quota_exceeded":
+        lines = ["❌ 无法安装：将超过 workspace 配额。"]
+        if details.get("quota_current_bytes") is not None:
+            lines.append(f"- current: {details['quota_current_bytes']} bytes")
+        if details.get("quota_skill_bytes") is not None:
+            lines.append(f"- skill_size: {details['quota_skill_bytes']} bytes")
+        if details.get("quota_projected_bytes") is not None:
+            lines.append(f"- predicted: {details['quota_projected_bytes']} bytes")
+        if details.get("quota_limit_bytes") is not None:
+            lines.append(f"- quota: {details['quota_limit_bytes']} bytes")
+        return "\n".join(lines)
+    if reason in {"skill_not_found", "skill_package_unavailable"}:
+        return f"❌ 商店不存在该技能：{name}"
+    if reason == "source_package_too_large":
+        lines = ["❌ 无法安装：技能包超过托管商店大小限制。"]
+        package_bytes = details.get("package_bytes")
+        package_limit_bytes = details.get("package_limit_bytes")
+        if package_bytes is not None:
+            lines.append(f"- package_size: {package_bytes} bytes")
+        if package_limit_bytes is not None:
+            lines.append(f"- package_limit: {package_limit_bytes} bytes")
+        return "\n".join(lines)
+    if reason == "source_manifest_invalid":
+        return f"❌ 安装技能失败：{name}（技能包清单无效，请联系管理员修复商店包）"
+    if reason == "source_integrity_mismatch":
+        return f"❌ 安装技能失败：{name}（技能包完整性校验失败，请联系管理员检查商店包）"
+    if reason == "source_package_symlink_unsupported":
+        return f"❌ 安装技能失败：{name}（技能包包含不支持的符号链接）"
+    if reason == "source_package_unreadable":
+        return f"❌ 安装技能失败：{name}（技能包无法读取，请稍后重试）"
+
+    return f"❌ 安装技能失败：{name}（{reason or 'unknown'}）"
 
 
 def _link_guard_key(channel: str, sender_id: str) -> str:
@@ -361,6 +400,7 @@ def try_handle(
 
     if cmd == "skills":
         skill_service = SkillManagementService(skill_store_dir=skill_store_dir)
+        install_service = WorkspaceSkillInstallService(skill_store_dir=skill_store_dir)
         if not args:
             return CommandResult(handled=True, reply="用法：!skills list | !skills install <name>")
 
@@ -383,18 +423,32 @@ def try_handle(
         if sub == "install":
             if len(args) < 2:
                 return CommandResult(handled=True, reply="用法：!skills install <name>")
-            name = args[1].strip()
-            if not _SKILL_NAME_RE.match(name):
+            raw_name = " ".join(args[1:]).strip()
+            try:
+                name = install_service.validate_skill_name(raw_name)
+            except WorkspaceSkillInstallError:
                 return CommandResult(
                     handled=True,
                     reply="❌ skill 名称非法。仅允许字母/数字/下划线/短横线。",
                 )
 
             try:
-                result = skill_service.install_from_store(
+                plan = install_service.prepare_install(
                     name=name,
+                    source="store",
+                    slug=None,
+                    version=None,
+                )
+                result = install_service.install_local_sync(
+                    plan=plan,
+                    tenant_id=tenant.tenant_id,
                     workspace=tenant.workspace,
                     workspace_quota_mib=workspace_quota_mib,
+                )
+            except WorkspaceSkillInstallError as exc:
+                return CommandResult(
+                    handled=True,
+                    reply=_skills_install_error_reply(name=name, exc=exc),
                 )
             except Exception:
                 logger.exception("skills install failed tenant_id={} name={}", tenant.tenant_id, name)
@@ -412,23 +466,6 @@ def try_handle(
                     )
                 return CommandResult(handled=True, reply=f"✅ 已安装技能：{name}")
 
-            if result.reason_code == "workspace_quota_exceeded":
-                lines = ["❌ 无法安装：将超过 workspace 配额。"]
-                if result.quota_current_bytes is not None:
-                    lines.append(f"- current: {result.quota_current_bytes} bytes")
-                if result.quota_skill_bytes is not None:
-                    lines.append(f"- skill_size: {result.quota_skill_bytes} bytes")
-                if result.quota_projected_bytes is not None:
-                    lines.append(f"- predicted: {result.quota_projected_bytes} bytes")
-                if result.quota_limit_bytes is not None:
-                    lines.append(f"- quota: {result.quota_limit_bytes} bytes")
-                lines.append("提示：请删除不需要的文件/技能，或提高配额。")
-                return CommandResult(
-                    handled=True,
-                    reply="\n".join(lines),
-                )
-            if result.reason_code == "not_found":
-                return CommandResult(handled=True, reply=f"❌ 商店不存在该技能：{name}")
             reason = str(result.reason_code or "").strip() or "unknown"
             return CommandResult(handled=True, reply=f"❌ 安装技能失败：{name}（{reason}）")
 

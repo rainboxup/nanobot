@@ -30,11 +30,13 @@ type HelpDocPayload = HelpDocSummary & {
 const HELP_DESCRIPTIONS: Record<string, string> = {
   "workspace-routing-and-binding": "Routing rules, binding flow, and common troubleshooting steps.",
   "effective-policy-and-soul": "How 'effective' previews work and what they do (and do not) mean.",
+  "managed-skill-store-integrity": "How local managed-store skills are validated before install, including manifest and integrity status.",
 }
 
 const REPO_DOC_TO_SLUG: Record<string, string> = {
   "docs/howto/workspace-routing-and-binding.md": "workspace-routing-and-binding",
   "docs/howto/effective-policy-and-soul.md": "effective-policy-and-soul",
+  "docs/howto/managed-skill-store-integrity.md": "managed-skill-store-integrity",
 }
 
 export function helpDocPath(slug: HelpDocSlug): string {

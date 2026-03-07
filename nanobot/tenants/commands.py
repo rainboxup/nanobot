@@ -9,7 +9,6 @@ These commands let users self-serve:
 from __future__ import annotations
 
 import re
-import shutil
 import threading
 import time
 from collections import deque
@@ -17,10 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from loguru import logger
+
 from nanobot.providers.registry import find_by_name
+from nanobot.services.skill_management import SkillManagementService
 from nanobot.tenants.store import TenantStore
 from nanobot.tenants.types import TenantContext
-from nanobot.utils.fs import dir_size_bytes
 
 _SKILL_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
 
@@ -136,16 +137,6 @@ def _mask_key(key: str) -> str:
     if len(key) <= 8:
         return "*" * len(key)
     return f"{key[:4]}...{key[-4:]}"
-
-
-def _list_skill_dirs(root: Path) -> list[str]:
-    if not root.exists():
-        return []
-    result: list[str] = []
-    for p in root.iterdir():
-        if p.is_dir() and (p / "SKILL.md").exists():
-            result.append(p.name)
-    return sorted(result)
 
 
 def _link_guard_key(channel: str, sender_id: str) -> str:
@@ -369,13 +360,18 @@ def try_handle(
         return CommandResult(handled=True, reply="用法：!model set <model>")
 
     if cmd == "skills":
+        skill_service = SkillManagementService(skill_store_dir=skill_store_dir)
         if not args:
             return CommandResult(handled=True, reply="用法：!skills list | !skills install <name>")
 
         sub = args[0].lower()
         if sub == "list":
-            store_skills = _list_skill_dirs(skill_store_dir)
-            installed = _list_skill_dirs(tenant.workspace / "skills")
+            try:
+                store_skills = skill_service.list_installable()
+                installed = skill_service.list_installed(workspace=tenant.workspace)
+            except Exception:
+                logger.exception("skills list failed tenant_id={}", tenant.tenant_id)
+                return CommandResult(handled=True, reply="❌ 获取技能列表失败，请稍后重试。")
             lines = []
             lines.append("商店技能：")
             lines.extend([f"- {n}" for n in store_skills] or ["(empty)"])
@@ -390,41 +386,51 @@ def try_handle(
             name = args[1].strip()
             if not _SKILL_NAME_RE.match(name):
                 return CommandResult(
-                    handled=True, reply="❌ skill 名称非法。仅允许字母/数字/下划线/短横线。"
+                    handled=True,
+                    reply="❌ skill 名称非法。仅允许字母/数字/下划线/短横线。",
                 )
 
-            src = skill_store_dir / name
-            if not (src / "SKILL.md").exists():
-                return CommandResult(handled=True, reply=f"❌ 商店不存在该技能：{name}")
-
-            dst_root = tenant.workspace / "skills"
-            dst_root.mkdir(parents=True, exist_ok=True)
-            dst = dst_root / name
-            if dst.exists():
-                return CommandResult(
-                    handled=True, reply=f"⚠️ 已安装：{name}（如需覆盖请先删除目录 {dst}）"
+            try:
+                result = skill_service.install_from_store(
+                    name=name,
+                    workspace=tenant.workspace,
+                    workspace_quota_mib=workspace_quota_mib,
                 )
-
-            quota_bytes = max(0, int(workspace_quota_mib)) * 1024 * 1024
-            if quota_bytes > 0:
-                current = dir_size_bytes(tenant.workspace)
-                skill_size = dir_size_bytes(src)
-                predicted = current + skill_size
-                if predicted > quota_bytes:
+            except Exception:
+                logger.exception("skills install failed tenant_id={} name={}", tenant.tenant_id, name)
+                return CommandResult(handled=True, reply="❌ 安装失败：系统繁忙或磁盘错误，请稍后重试。")
+            if result.installed:
+                if result.already_installed:
                     return CommandResult(
                         handled=True,
-                        reply=(
-                            "❌ 无法安装：将超过 workspace 配额。\n"
-                            f"- current: {current} bytes\n"
-                            f"- skill_size: {skill_size} bytes\n"
-                            f"- predicted: {predicted} bytes\n"
-                            f"- quota: {quota_bytes} bytes\n"
-                            "提示：请删除不需要的文件/技能，或提高配额。"
-                        ),
+                        reply=f"⚠️ 已安装：{name}（如需覆盖请先卸载后重试）",
                     )
+                if result.repaired:
+                    return CommandResult(
+                        handled=True,
+                        reply=f"✅ 已修复并重新安装技能：{name}",
+                    )
+                return CommandResult(handled=True, reply=f"✅ 已安装技能：{name}")
 
-            shutil.copytree(src, dst)
-            return CommandResult(handled=True, reply=f"✅ 已安装技能：{name}")
+            if result.reason_code == "workspace_quota_exceeded":
+                lines = ["❌ 无法安装：将超过 workspace 配额。"]
+                if result.quota_current_bytes is not None:
+                    lines.append(f"- current: {result.quota_current_bytes} bytes")
+                if result.quota_skill_bytes is not None:
+                    lines.append(f"- skill_size: {result.quota_skill_bytes} bytes")
+                if result.quota_projected_bytes is not None:
+                    lines.append(f"- predicted: {result.quota_projected_bytes} bytes")
+                if result.quota_limit_bytes is not None:
+                    lines.append(f"- quota: {result.quota_limit_bytes} bytes")
+                lines.append("提示：请删除不需要的文件/技能，或提高配额。")
+                return CommandResult(
+                    handled=True,
+                    reply="\n".join(lines),
+                )
+            if result.reason_code == "not_found":
+                return CommandResult(handled=True, reply=f"❌ 商店不存在该技能：{name}")
+            reason = str(result.reason_code or "").strip() or "unknown"
+            return CommandResult(handled=True, reply=f"❌ 安装技能失败：{name}（{reason}）")
 
         return CommandResult(handled=True, reply="用法：!skills list | !skills install <name>")
 

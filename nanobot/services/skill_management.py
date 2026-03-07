@@ -19,11 +19,26 @@ _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 @dataclass(frozen=True)
 class SkillInstallResult:
+    """Result of installing a workspace skill.
+
+    When ``installed`` is False and ``reason_code == "workspace_quota_exceeded"``,
+    the ``quota_*_bytes`` fields provide explainability details (all values are in bytes):
+
+    - ``quota_current_bytes``: current workspace size before installing
+    - ``quota_skill_bytes``: size of the skill source directory
+    - ``quota_projected_bytes``: projected workspace size after installing
+    - ``quota_limit_bytes``: workspace quota limit
+    """
+
     installed: bool
     already_installed: bool = False
     repaired: bool = False
     reason_code: str | None = None
     source: str = "store"
+    quota_current_bytes: int | None = None
+    quota_skill_bytes: int | None = None
+    quota_projected_bytes: int | None = None
+    quota_limit_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +107,10 @@ class SkillManagementService:
                     installed=False,
                     reason_code="workspace_quota_exceeded",
                     source=source_name,
+                    quota_current_bytes=current_size,
+                    quota_skill_bytes=skill_size,
+                    quota_projected_bytes=projected_size,
+                    quota_limit_bytes=quota_bytes,
                 )
 
         tmp_dst = dst_root / f".{skill_name}.tmp-{uuid.uuid4().hex}"

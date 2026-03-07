@@ -36,6 +36,16 @@ _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CATALOG_SOURCES = {"local", "clawhub", "all"}
 _CATALOG_CURSOR_PREFIX = "nbc1:"
 
+
+def _normalize_runtime_skill_source(source: Any) -> str | None:
+    value = str(source or "").strip().lower()
+    if not value:
+        return None
+    if value == "store":
+        return "managed"
+    return value
+
+
 class SkillInstallRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -64,7 +74,16 @@ def _tenant_skills_loader(
 ) -> tuple[SkillsLoader, str, Any, Any, Path]:
     tenant_id, store, cfg = load_tenant_config(request, user)
     workspace = store.ensure_tenant_files(tenant_id).workspace
-    return SkillsLoader(workspace=workspace), tenant_id, store, cfg, workspace
+    return (
+        SkillsLoader(
+            workspace=workspace,
+            managed_skills_dir=_resolve_skill_store_dir(request),
+        ),
+        tenant_id,
+        store,
+        cfg,
+        workspace,
+    )
 
 
 def _runtime_mode(request: Request) -> str:
@@ -238,10 +257,12 @@ def _parse_skill_frontmatter(content: str) -> dict[str, str]:
 
 
 def _skill_path_label(source: Any, skill_name: str) -> str:
-    src = str(source or "").strip().lower()
+    src = _normalize_runtime_skill_source(source) or ""
     name = str(skill_name or "").strip()
     if src == "workspace":
         return f"workspace://skills/{name}"
+    if src == "managed":
+        return f"managed://{name}"
     if src == "store":
         return f"store://{name}"
     if src == "builtin":
@@ -433,7 +454,7 @@ def _store_metadata_for_skill(
     name: str,
     source: str | None,
 ) -> dict[str, Any] | None:
-    if str(source or "").strip().lower() != "store":
+    if str(source or "").strip().lower() not in {"store", "managed"}:
         return None
     details = install_service.describe_local_source(name=name)
     if details is None or str(details.source or "").strip().lower() != "store":
@@ -474,7 +495,7 @@ def _build_skill_catalog(
             source = "workspace"
             source_file = workspace_skills[name] / "SKILL.md"
         elif name in store_skills:
-            source = "store"
+            source = "managed"
             source_file = store_skills[name] / "SKILL.md"
         else:
             source = "builtin"
@@ -752,12 +773,15 @@ async def install_skill(
     except WorkspaceSkillInstallError as exc:
         raise _service_http_exception(exc) from exc
 
+    runtime_source = _normalize_runtime_skill_source(result.source)
     return {
         "name": plan.name,
         "installed": bool(result.installed),
         "already_installed": bool(result.already_installed),
         "repaired": bool(result.repaired),
-        "source": result.source,
+        "source": runtime_source,
+        "origin_source": result.source,
+        "install_source": "clawhub" if str(result.source or "").strip().lower() == "clawhub" else "local",
     }
 
 
@@ -922,15 +946,17 @@ async def get_skill(
                 source = s.get("source")
                 break
 
+    runtime_source = _normalize_runtime_skill_source(source)
     payload = {
         "name": skill_name,
-        "source": source,
-        "path": _skill_path_label(source, skill_name),
+        "source": runtime_source,
+        "path": _skill_path_label(runtime_source, skill_name),
         "description": meta.get("description"),
         "content": content,
         "metadata": meta,
+        "install_source": "clawhub" if str(source or "").strip().lower() == "clawhub" else "local",
     }
-    store_metadata = _store_metadata_for_skill(install_service, name=skill_name, source=source)
+    store_metadata = _store_metadata_for_skill(install_service, name=skill_name, source=runtime_source)
     if store_metadata is not None:
         payload["store_metadata"] = store_metadata
     return payload

@@ -230,12 +230,12 @@ class WorkspaceSkillInstallService:
         value = str(source).strip().lower()
         if not value:
             return None
-        if value in {"builtin", "store", "workspace"}:
+        if value in {"builtin", "store", "managed", "workspace"}:
             return "local"
         if value not in {"local", "clawhub"}:
             raise WorkspaceSkillInstallError(
                 "invalid_skill_source",
-                "source must be one of: local, clawhub",
+                "source must be one of: local, clawhub (aliases: managed, store, builtin, workspace)",
                 status_code=422,
             )
         return value

@@ -75,6 +75,7 @@ class AgentLoop:
         channels_config: ChannelsConfig | None = None,
         enable_spawn: bool = True,
         enable_exec: bool = True,
+        managed_skills_dir: Path | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, WebToolsConfig
         self.bus = bus
@@ -95,11 +96,18 @@ class AgentLoop:
         self.restrict_to_workspace = restrict_to_workspace
         self.enable_spawn = enable_spawn
         self.enable_exec = enable_exec
+        self.managed_skills_dir = (
+            Path(managed_skills_dir).expanduser() if managed_skills_dir is not None else None
+        )
         self._default_fs_allowed_dir = self.workspace if self.restrict_to_workspace else None
         self._filesystem_tools: list[ReadFileTool | WriteFileTool | EditFileTool | ListDirTool] = []
         self._exec_tool: ExecTool | None = None
 
-        self.context = ContextBuilder(workspace, platform_base_soul_path=platform_base_soul_path)
+        self.context = ContextBuilder(
+            workspace,
+            platform_base_soul_path=platform_base_soul_path,
+            managed_skills_dir=self.managed_skills_dir,
+        )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
         self.subagents = (
@@ -115,6 +123,7 @@ class AgentLoop:
                 exec_config=self.exec_config,
                 restrict_to_workspace=restrict_to_workspace,
                 enable_exec=enable_exec,
+                managed_skills_dir=self.managed_skills_dir,
             )
             if enable_spawn
             else None
@@ -135,6 +144,9 @@ class AgentLoop:
     def _register_default_tools(self) -> None:
         """Register the default set of tools."""
         allowed_dir = self._default_fs_allowed_dir
+        read_extra_allowed_dirs: list[Path] = []
+        if self.restrict_to_workspace and self.managed_skills_dir is not None:
+            read_extra_allowed_dirs.append(self.managed_skills_dir)
         fs = self.filesystem_config
         max_read = fs.max_read_bytes
         max_write = fs.max_write_bytes
@@ -145,6 +157,7 @@ class AgentLoop:
         read_tool = ReadFileTool(
             workspace=self.workspace,
             allowed_dir=allowed_dir,
+            additional_allowed_dirs=read_extra_allowed_dirs or None,
             max_read_bytes=max_read,
         )
         write_tool = WriteFileTool(

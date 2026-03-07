@@ -18,10 +18,53 @@ class SkillsLoader:
     specific tools or perform certain tasks.
     """
 
-    def __init__(self, workspace: Path, builtin_skills_dir: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        builtin_skills_dir: Path | None = None,
+        managed_skills_dir: Path | None = None,
+    ):
         self.workspace = workspace
         self.workspace_skills = workspace / "skills"
         self.builtin_skills = builtin_skills_dir or BUILTIN_SKILLS_DIR
+        managed_value = str(managed_skills_dir or "").strip()
+        self.managed_skills = Path(managed_value).expanduser() if managed_value else None
+
+    @staticmethod
+    def _iter_skill_dirs(root: Path | None) -> list[Path]:
+        if root is None or not root.is_dir():
+            return []
+        try:
+            return [item for item in root.iterdir() if item.is_dir()]
+        except OSError:
+            return []
+
+    @staticmethod
+    def _is_safe_skill_name(name: str) -> bool:
+        normalized = str(name or "").strip()
+        if not normalized:
+            return False
+        if normalized in {".", ".."}:
+            return False
+        if "/" in normalized or "\\" in normalized:
+            return False
+        return "\x00" not in normalized
+
+    @staticmethod
+    def _safe_skill_file(root: Path | None, name: str) -> Path | None:
+        if root is None or not root.is_dir() or not SkillsLoader._is_safe_skill_name(name):
+            return None
+        candidate = root / name / "SKILL.md"
+        if not candidate.exists() or not candidate.is_file():
+            return None
+        try:
+            resolved_root = root.resolve()
+            resolved_candidate = candidate.resolve()
+        except OSError:
+            return None
+        if resolved_candidate == resolved_root or resolved_candidate.is_relative_to(resolved_root):
+            return resolved_candidate
+        return None
 
     def list_skills(self, filter_unavailable: bool = True) -> list[dict[str, str]]:
         """
@@ -34,27 +77,40 @@ class SkillsLoader:
             List of skill info dicts with 'name', 'path', 'source'.
         """
         skills = []
+        existing_names: set[str] = set()
 
         # Workspace skills (highest priority)
-        if self.workspace_skills.exists():
-            for skill_dir in self.workspace_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists():
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+        for skill_dir in self._iter_skill_dirs(self.workspace_skills):
+            skill_file = self._safe_skill_file(self.workspace_skills, skill_dir.name)
+            if skill_file is not None:
+                skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
+                existing_names.add(skill_dir.name)
+
+        # Managed cache skills
+        for skill_dir in self._iter_skill_dirs(self.managed_skills):
+            skill_file = self._safe_skill_file(self.managed_skills, skill_dir.name)
+            if skill_file is not None and skill_dir.name not in existing_names:
+                skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "managed"})
+                existing_names.add(skill_dir.name)
 
         # Built-in skills
-        if self.builtin_skills and self.builtin_skills.exists():
-            for skill_dir in self.builtin_skills.iterdir():
-                if skill_dir.is_dir():
-                    skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
-                        skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+        for skill_dir in self._iter_skill_dirs(self.builtin_skills):
+            skill_file = self._safe_skill_file(self.builtin_skills, skill_dir.name)
+            if skill_file is not None and skill_dir.name not in existing_names:
+                skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "builtin"})
+                existing_names.add(skill_dir.name)
 
         # Filter by requirements
         if filter_unavailable:
             return [s for s in skills if self._check_requirements(self._get_skill_meta(s["name"]))]
         return skills
+
+    @staticmethod
+    def _read_skill_text(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            return None
 
     def load_skill(self, name: str) -> str | None:
         """
@@ -67,15 +123,25 @@ class SkillsLoader:
             Skill content or None if not found.
         """
         # Check workspace first
-        workspace_skill = self.workspace_skills / name / "SKILL.md"
-        if workspace_skill.exists():
-            return workspace_skill.read_text(encoding="utf-8")
+        workspace_skill = self._safe_skill_file(self.workspace_skills, name)
+        if workspace_skill is not None:
+            content = self._read_skill_text(workspace_skill)
+            if content is not None:
+                return content
+
+        # Check managed cache second
+        managed_skill = self._safe_skill_file(self.managed_skills, name)
+        if managed_skill is not None:
+            content = self._read_skill_text(managed_skill)
+            if content is not None:
+                return content
 
         # Check built-in
-        if self.builtin_skills:
-            builtin_skill = self.builtin_skills / name / "SKILL.md"
-            if builtin_skill.exists():
-                return builtin_skill.read_text(encoding="utf-8")
+        builtin_skill = self._safe_skill_file(self.builtin_skills, name)
+        if builtin_skill is not None:
+            content = self._read_skill_text(builtin_skill)
+            if content is not None:
+                return content
 
         return None
 

@@ -20,11 +20,17 @@ class ContextBuilder:
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
 
-    def __init__(self, workspace: Path, *, platform_base_soul_path: Path | None = None):
+    def __init__(
+        self,
+        workspace: Path,
+        *,
+        platform_base_soul_path: Path | None = None,
+        managed_skills_dir: Path | None = None,
+    ):
         self.workspace = workspace
         self.platform_base_soul_path = platform_base_soul_path
         self.memory = MemoryStore(workspace)
-        self.skills = SkillsLoader(workspace)
+        self.skills = SkillsLoader(workspace, managed_skills_dir=managed_skills_dir)
 
     def _memory_store_for(self, channel: str | None, chat_id: str | None) -> MemoryStore:
         if str(channel or "").strip() != "web":

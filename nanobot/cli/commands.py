@@ -322,6 +322,7 @@ def gateway(
             bus=bus,
             system_config=config,
             store=store,
+            skill_store_dir=get_data_dir() / "store" / "skills",
             store_lock=store_lock,
             ingress=ingress,
             web_tenant_claim_secret=web_tenant_claim_secret,
@@ -448,6 +449,7 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
+        managed_skills_dir=get_data_dir() / "store" / "skills",
     )
 
     # Set cron callback (needs agent)
@@ -676,7 +678,7 @@ def agent(
     """Interact with the agent directly."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.loader import load_config
+    from nanobot.config.loader import get_data_dir, load_config
 
     config = load_config()
 
@@ -696,6 +698,7 @@ def agent(
         filesystem_config=config.tools.filesystem,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
+        managed_skills_dir=get_data_dir() / "store" / "skills",
     )
 
     if message:

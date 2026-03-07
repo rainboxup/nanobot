@@ -495,6 +495,7 @@ class MultiTenantAgentLoop:
             mcp_servers=tenant_cfg.tools.mcp_servers,
             enable_spawn=False,
             enable_exec=enable_exec,
+            managed_skills_dir=self.skill_store_dir,
         )
 
         now = time.monotonic()

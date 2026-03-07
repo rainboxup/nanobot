@@ -39,6 +39,43 @@ async def test_get_skill_detail(http_client, auth_headers) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_managed_skill_layer_is_visible_in_list_and_detail(
+    web_ctx,
+    http_client,
+    auth_headers,
+) -> None:
+    store_dir = web_ctx.workspace_dir.parent / "skill-store" / "skills"
+    web_ctx.app.state.skill_store_dir = store_dir
+    managed_skill_dir = store_dir / "managed-layer-skill"
+    managed_skill_dir.mkdir(parents=True, exist_ok=True)
+    marker = "managed-layer-content"
+    (managed_skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "description: Managed layer skill\n"
+        "---\n"
+        "\n"
+        f"{marker}\n",
+        encoding="utf-8",
+    )
+
+    list_resp = await http_client.get("/api/skills", headers=auth_headers)
+    assert list_resp.status_code == 200
+    list_items = list_resp.json()
+    managed_item = next((item for item in list_items if item.get("name") == "managed-layer-skill"), None)
+    assert managed_item is not None
+    assert managed_item.get("source") == "managed"
+    assert managed_item.get("path") == "managed://managed-layer-skill"
+
+    detail_resp = await http_client.get("/api/skills/managed-layer-skill", headers=auth_headers)
+    assert detail_resp.status_code == 200
+    detail = detail_resp.json()
+    assert detail.get("name") == "managed-layer-skill"
+    assert detail.get("source") == "managed"
+    assert marker in str(detail.get("content") or "")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_missing_skill_returns_404(http_client, auth_headers) -> None:
     r = await http_client.get("/api/skills/does-not-exist", headers=auth_headers)
     assert r.status_code == 404
@@ -210,6 +247,8 @@ async def test_skill_install_from_clawhub_zip_and_read_detail(
     install_body = install.json()
     assert install_body.get("name") == "remote-zip-skill"
     assert install_body.get("source") == "clawhub"
+    assert install_body.get("origin_source") == "clawhub"
+    assert install_body.get("install_source") == "clawhub"
     assert bool(install_body.get("installed")) is True
 
     tenant_ctx = web_ctx.tenant_store.ensure_tenant_files("admin")
@@ -345,14 +384,15 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     items = catalog.json()
     target = next((item for item in items if item.get("name") == "store-only-skill"), None)
     assert target is not None
-    assert target.get("source") == "store"
+    assert target.get("source") == "managed"
     assert bool(target.get("installed")) is False
     assert target.get("store_metadata") is None
 
     detail_before_install = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
     assert detail_before_install.status_code == 200
     detail_before_body = detail_before_install.json()
-    assert detail_before_body.get("source") == "store"
+    assert detail_before_body.get("source") == "managed"
+    assert detail_before_body.get("install_source") == "local"
     store_meta = detail_before_body.get("store_metadata")
     assert isinstance(store_meta, dict)
     assert int(store_meta.get("package_size_bytes") or 0) > 0
@@ -400,12 +440,14 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     install = await http_client.post(
         "/api/skills/install",
         headers=auth_headers,
-        json={"name": "store-only-skill"},
+        json={"name": "store-only-skill", "source": "managed"},
     )
     assert install.status_code == 201
     body = install.json()
     assert body.get("name") == "store-only-skill"
-    assert body.get("source") == "store"
+    assert body.get("source") == "managed"
+    assert body.get("origin_source") == "store"
+    assert body.get("install_source") == "local"
     assert bool(body.get("installed")) is True
 
     catalog_after = await http_client.get("/api/skills/catalog", headers=auth_headers)
@@ -1046,7 +1088,7 @@ async def test_skills_api_paths_are_sanitized(web_ctx, http_client, auth_headers
     assert isinstance(rows, list)
     assert rows
 
-    allowed_prefixes = ("workspace://", "builtin://", "store://")
+    allowed_prefixes = ("workspace://", "builtin://", "store://", "managed://")
     workspace_path_text = str(web_ctx.workspace_dir).lower()
 
     first_name = str(rows[0].get("name") or "")

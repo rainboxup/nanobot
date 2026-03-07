@@ -35,6 +35,7 @@ class SubagentManager:
         exec_config: "ExecToolConfig | None" = None,
         restrict_to_workspace: bool = False,
         enable_exec: bool = True,
+        managed_skills_dir: Path | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig
         self.provider = provider
@@ -48,6 +49,9 @@ class SubagentManager:
         self.exec_config = exec_config or ExecToolConfig()
         self.restrict_to_workspace = restrict_to_workspace
         self.enable_exec = bool(enable_exec)
+        self.managed_skills_dir = (
+            Path(managed_skills_dir).expanduser() if managed_skills_dir is not None else None
+        )
         self._running_tasks: dict[str, asyncio.Task[None]] = {}
         self._session_tasks: dict[str, set[str]] = {}  # session_key -> {task_id, ...}
 
@@ -246,7 +250,10 @@ Stay focused on the assigned task. Your final response will be reported back to 
 ## Workspace
 {workspace}"""]
 
-        skills_summary = SkillsLoader(workspace).build_skills_summary()
+        skills_summary = SkillsLoader(
+            workspace,
+            managed_skills_dir=self.managed_skills_dir,
+        ).build_skills_summary()
         if skills_summary:
             parts.append(f"## Skills\n\nRead SKILL.md with read_file to use a skill.\n\n{skills_summary}")
 

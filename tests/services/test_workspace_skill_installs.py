@@ -68,6 +68,34 @@ async def test_install_local_prefers_store_over_builtin(tmp_path: Path) -> None:
     assert content == "store-marker"
 
 
+@pytest.mark.parametrize("source_alias", ["managed", "store", "builtin", "workspace"])
+def test_prepare_install_accepts_local_source_aliases(tmp_path: Path, source_alias: str) -> None:
+    service = WorkspaceSkillInstallService(skill_store_dir=tmp_path / "store")
+
+    plan = service.prepare_install(
+        name="demo-skill",
+        source=source_alias,
+        slug=None,
+        version=None,
+    )
+
+    assert plan.source == "local"
+
+
+def test_prepare_install_managed_source_disallows_slug_or_version(tmp_path: Path) -> None:
+    service = WorkspaceSkillInstallService(skill_store_dir=tmp_path / "store")
+
+    with pytest.raises(WorkspaceSkillInstallError) as exc:
+        service.prepare_install(
+            name="demo-skill",
+            source="managed",
+            slug="demo-skill",
+            version=None,
+        )
+
+    assert exc.value.reason_code == "local_source_disallows_slug_or_version"
+
+
 @pytest.mark.asyncio
 async def test_install_clawhub_zip_rejects_malicious_paths(tmp_path: Path) -> None:
     service = WorkspaceSkillInstallService(skill_store_dir=tmp_path / "store")

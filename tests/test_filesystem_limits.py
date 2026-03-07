@@ -36,6 +36,27 @@ def test_read_file_truncates_large_files(tmp_path: Path) -> None:
     assert "truncated" in out
 
 
+def test_read_file_allows_additional_allowed_dirs(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    managed = tmp_path / "managed"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    managed.mkdir()
+    outside.mkdir()
+
+    managed_file = managed / "SKILL.md"
+    managed_file.write_text("managed-content", encoding="utf-8")
+    outside_file = outside / "x.txt"
+    outside_file.write_text("outside", encoding="utf-8")
+
+    tool = ReadFileTool(allowed_dir=workspace, additional_allowed_dirs=[managed])
+    allowed = _run(tool.execute(path=str(managed_file)))
+    denied = _run(tool.execute(path=str(outside_file)))
+
+    assert allowed == "managed-content"
+    assert "outside allowed directories" in denied
+
+
 def test_list_dir_limits_output(tmp_path: Path) -> None:
     allowed = tmp_path / "ws"
     allowed.mkdir()

@@ -8,20 +8,34 @@ from nanobot.agent.tools.base import Tool
 from nanobot.utils.fs import dir_size_bytes
 
 
-def _resolve_path(path: str, workspace: Path | None = None, allowed_dir: Path | None = None) -> Path:
+def _resolve_path(
+    path: str,
+    workspace: Path | None = None,
+    allowed_dir: Path | None = None,
+    extra_allowed_dirs: list[Path] | None = None,
+) -> Path:
     """Resolve path against workspace (if relative) and enforce directory restriction."""
     p = Path(path).expanduser()
     if not p.is_absolute() and workspace:
         p = workspace / p
     resolved = p.resolve()
+    allowed_roots: list[Path] = []
     if allowed_dir:
-        allowed = allowed_dir.expanduser().resolve()
+        allowed_roots.append(allowed_dir.expanduser().resolve())
+    if extra_allowed_dirs:
+        for extra_dir in extra_allowed_dirs:
+            if extra_dir is None:
+                continue
+            allowed_roots.append(extra_dir.expanduser().resolve())
+    if allowed_roots:
         try:
-            ok = resolved == allowed or resolved.is_relative_to(allowed)
+            ok = any(resolved == root or resolved.is_relative_to(root) for root in allowed_roots)
         except Exception:
             ok = False
         if not ok:
-            raise PermissionError(f"Path {path} is outside allowed directory {allowed_dir}")
+            if len(allowed_roots) == 1:
+                raise PermissionError(f"Path {path} is outside allowed directory {allowed_roots[0]}")
+            raise PermissionError("Path {path} is outside allowed directories".format(path=path))
     return resolved
 
 
@@ -32,10 +46,12 @@ class ReadFileTool(Tool):
         self,
         workspace: Path | None = None,
         allowed_dir: Path | None = None,
+        additional_allowed_dirs: list[Path] | None = None,
         max_read_bytes: int = 200_000,
     ):
         self._workspace = workspace
         self._allowed_dir = allowed_dir
+        self._additional_allowed_dirs = list(additional_allowed_dirs or [])
         self._max_read_bytes = max(1, int(max_read_bytes))
 
     def set_allowed_dir(self, allowed_dir: Path | None, *, workspace: Path | None = None) -> None:
@@ -61,7 +77,12 @@ class ReadFileTool(Tool):
 
     async def execute(self, path: str, **kwargs: Any) -> str:
         try:
-            file_path = _resolve_path(path, self._workspace, self._allowed_dir)
+            file_path = _resolve_path(
+                path,
+                self._workspace,
+                self._allowed_dir,
+                self._additional_allowed_dirs,
+            )
             if not file_path.exists():
                 return f"Error: File not found: {path}"
             if not file_path.is_file():

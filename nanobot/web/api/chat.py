@@ -27,6 +27,7 @@ _OWNER_USER_KEY = "owner_user_id"
 _OWNER_TENANT_KEY = "owner_tenant_id"
 _REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,96}$")
 _WS_CLOSE_CODE_SESSION_REPLACED = 4009
+_MAX_RUNTIME_OVERLAY_CHARS = 8_000
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -144,6 +145,18 @@ def _normalize_optional_request_id(value: str | None) -> str:
     return ""
 
 
+def _normalize_session_overlay(payload: dict[str, Any]) -> str | None:
+    for key in ("overlay", "session_overlay"):
+        if payload.get(key) is None:
+            continue
+        text = str(payload.get(key) or "").strip()
+        if len(text) > _MAX_RUNTIME_OVERLAY_CHARS:
+            continue
+        if text:
+            return text
+    return None
+
+
 def _parse_ws_inbound_payload(raw_text: str) -> tuple[str, str, dict[str, str]]:
     text = str(raw_text or "").strip()
     request_id = uuid.uuid4().hex
@@ -177,6 +190,10 @@ def _parse_ws_inbound_payload(raw_text: str) -> tuple[str, str, dict[str, str]]:
             text = ""
 
     metadata = {"web_request_id": request_id}
+    if isinstance(payload, dict):
+        session_overlay = _normalize_session_overlay(payload)
+        if session_overlay:
+            metadata["session_overlay"] = session_overlay
     if stop_target_request_id:
         metadata["web_stop_target_request_id"] = stop_target_request_id
     return inbound_type, text, metadata

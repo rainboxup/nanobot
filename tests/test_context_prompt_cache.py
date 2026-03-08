@@ -5,10 +5,15 @@ from __future__ import annotations
 import datetime as datetime_module
 from datetime import datetime as real_datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.context import ContextBuilder
+from nanobot.bus.events import InboundMessage
+from nanobot.bus.queue import MessageBus
+from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
 class _FakeDatetime(real_datetime):
@@ -136,3 +141,84 @@ def test_invalid_web_tenant_id_is_rejected_for_web_memory_context(tmp_path) -> N
             channel="web",
             chat_id="web:a.b:deadbeef",
         )
+
+
+def test_system_prompt_includes_session_overlay_when_provided(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+
+    without_overlay = builder.build_system_prompt(channel="cli", chat_id="direct")
+    with_overlay = builder.build_system_prompt(
+        channel="cli",
+        chat_id="direct",
+        session_overlay="Overlay instructions",
+    )
+
+    assert "Overlay instructions" not in without_overlay
+    assert "Overlay instructions" in with_overlay
+    assert with_overlay != without_overlay
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_applies_session_overlay_from_metadata(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat = AsyncMock(return_value=LLMResponse(content="done", tool_calls=[]))
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, model="test-model")
+
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="user1",
+        chat_id="direct",
+        content="hello",
+        metadata={"session_overlay": "Ephemeral overlay"},
+    )
+
+    response = await loop._process_message(msg)
+
+    assert response is not None
+    assert "overlay" not in response.metadata
+    assert "session_overlay" not in response.metadata
+    provider.chat.assert_awaited_once()
+    sent_messages = provider.chat.await_args.kwargs["messages"]
+    assert "Ephemeral overlay" in str(sent_messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_progress_metadata_does_not_echo_session_overlay(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    bus.publish_outbound = AsyncMock(return_value=True)
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.chat = AsyncMock(
+        side_effect=[
+            LLMResponse(
+                content="Working",
+                tool_calls=[ToolCallRequest(id="call1", name="missing-tool", arguments={})],
+            ),
+            LLMResponse(content="done", tool_calls=[]),
+        ]
+    )
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, model="test-model")
+
+    msg = InboundMessage(
+        channel="cli",
+        sender_id="user1",
+        chat_id="direct",
+        content="hello",
+        metadata={"session_overlay": "Ephemeral overlay", "overlay": "also-hidden"},
+    )
+
+    response = await loop._process_message(msg)
+
+    assert response is not None
+    assert bus.publish_outbound.await_count >= 1
+    for call in bus.publish_outbound.await_args_list:
+        metadata = call.args[0].metadata
+        assert "overlay" not in metadata
+        assert "session_overlay" not in metadata

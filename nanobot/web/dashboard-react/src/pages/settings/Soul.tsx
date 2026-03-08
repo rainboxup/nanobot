@@ -1,13 +1,14 @@
 import { useEffect, useMemo, useState } from "react"
 import { AlertTriangle, ExternalLink } from "lucide-react"
 
-import { api, ApiError } from "@/src/lib/api"
+import { api, ApiError, formatTime } from "@/src/lib/api"
 import { cn } from "@/src/lib/utils"
 import { helpDocHref } from "@/src/pages/HelpDoc"
 import { useStore } from "@/src/store/useStore"
 import { Badge } from "@/src/components/ui/badge"
 import { Button } from "@/src/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/src/components/ui/card"
+import { Input } from "@/src/components/ui/input"
 
 interface SoulLayer {
   title: string
@@ -37,11 +38,28 @@ interface SoulPayload {
   subject?: { tenant_id?: string }
   workspace?: SoulWorkspacePayload
   effective?: EffectiveSoul
+  baseline?: BaselineMeta
 }
 
 interface SoulPreviewPayload {
   overlay?: string | null
   effective?: EffectiveSoul
+}
+
+interface BaselineMeta {
+  selected_version_id?: string | null
+  effective_version_id?: string | null
+  strategy?: string | null
+  canary_percent?: number | null
+  control_version_id?: string | null
+  is_canary?: boolean | null
+}
+
+interface BaselineVersionItem {
+  version_id: string
+  label?: string | null
+  created_at?: string | null
+  created_by?: string | null
 }
 
 function getErrorMessage(err: unknown, fallback = "加载失败"): string {
@@ -74,6 +92,57 @@ function normalizeEffective(raw: unknown): EffectiveSoul | null {
   }
 }
 
+function normalizePercent(raw: unknown): number | null {
+  const n = Number(raw)
+  if (!Number.isFinite(n)) return null
+  return Math.min(100, Math.max(0, n))
+}
+
+function normalizeBaselineMeta(raw: unknown): BaselineMeta | null {
+  if (!raw || typeof raw !== "object") return null
+  const selectedVersionId = String((raw as any).selected_version_id || "").trim()
+  const effectiveVersionId = String((raw as any).effective_version_id || "").trim()
+  const strategy = String((raw as any).strategy || "").trim()
+  const controlVersionId = String((raw as any).control_version_id || "").trim()
+  return {
+    selected_version_id: selectedVersionId || null,
+    effective_version_id: effectiveVersionId || null,
+    strategy: strategy || null,
+    canary_percent: normalizePercent((raw as any).canary_percent),
+    control_version_id: controlVersionId || null,
+    is_canary: typeof (raw as any).is_canary === "boolean" ? Boolean((raw as any).is_canary) : null,
+  }
+}
+
+function normalizeBaselineVersionItem(raw: unknown): BaselineVersionItem | null {
+  if (!raw || typeof raw !== "object") return null
+  const versionId = String((raw as any).version_id || (raw as any).id || "").trim()
+  if (!versionId) return null
+  const label = String((raw as any).label || "").trim()
+  const createdBy = String((raw as any).created_by || "").trim()
+  const createdAt = String((raw as any).created_at || "").trim()
+  return {
+    version_id: versionId,
+    label: label || null,
+    created_by: createdBy || null,
+    created_at: createdAt || null,
+  }
+}
+
+function normalizeBaselineVersionList(raw: unknown): BaselineVersionItem[] {
+  const candidates: unknown[] =
+    Array.isArray(raw)
+      ? raw
+      : Array.isArray((raw as any)?.versions)
+        ? (raw as any).versions
+        : Array.isArray((raw as any)?.items)
+          ? (raw as any).items
+          : []
+  return candidates
+    .map((item) => normalizeBaselineVersionItem(item))
+    .filter((item): item is BaselineVersionItem => Boolean(item))
+}
+
 const INPUT_TEXTAREA_CLASS = cn(
   "flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background",
   "font-mono leading-5",
@@ -90,6 +159,7 @@ const READONLY_TEXTAREA_CLASS = cn(
 export function Soul() {
   const { user, addToast } = useStore()
   const role = String(user?.role || "").toLowerCase()
+  const isOwner = role === "owner"
   const canEdit = role === "owner" || role === "admin"
 
   const [payload, setPayload] = useState<SoulPayload | null>(null)
@@ -103,12 +173,25 @@ export function Soul() {
   const [previewing, setPreviewing] = useState(false)
   const [error, setError] = useState("")
   const [previewError, setPreviewError] = useState("")
+  const [baselineError, setBaselineError] = useState("")
+  const [baselineVersionsLoading, setBaselineVersionsLoading] = useState(false)
+  const [baselineVersions, setBaselineVersions] = useState<BaselineVersionItem[]>([])
+  const [creatingBaselineVersion, setCreatingBaselineVersion] = useState(false)
+  const [publishingBaseline, setPublishingBaseline] = useState(false)
+  const [rollingBackBaseline, setRollingBackBaseline] = useState(false)
+  const [newVersionNote, setNewVersionNote] = useState("")
+  const [publishVersionId, setPublishVersionId] = useState("")
+  const [publishStrategy, setPublishStrategy] = useState<"all" | "canary">("all")
+  const [canaryPercent, setCanaryPercent] = useState("10")
+  const [controlVersionId, setControlVersionId] = useState("")
+  const [rollbackVersionId, setRollbackVersionId] = useState("")
 
   const writable = Boolean(payload?.writable)
   const writeBlocked = payload !== null && !writable
   const writeBlockedReason = String(payload?.write_block_reason || payload?.runtime_warning || "").trim()
 
   const isDirty = useMemo(() => content !== baseContent, [content, baseContent])
+  const baselineMeta = useMemo(() => normalizeBaselineMeta(payload?.baseline), [payload])
 
   const effective = useMemo(() => {
     return preview || normalizeEffective(payload?.effective) || { merged_content: "", layers: [] }
@@ -129,6 +212,120 @@ export function Soul() {
       setError(getErrorMessage(err))
     } finally {
       setLoading(false)
+    }
+  }
+
+  async function loadBaselineVersions() {
+    if (!isOwner) {
+      setBaselineVersions([])
+      return
+    }
+    setBaselineVersionsLoading(true)
+    setBaselineError("")
+    try {
+      const data = await api.get<unknown>("/api/admin/baseline/versions")
+      const versions = normalizeBaselineVersionList(data)
+      setBaselineVersions(versions)
+      const preferredVersionId = String(
+        baselineMeta?.selected_version_id || versions[0]?.version_id || ""
+      )
+      setPublishVersionId((prev) => {
+        if (prev && versions.some((item) => item.version_id === prev)) return prev
+        return preferredVersionId
+      })
+      setRollbackVersionId((prev) => {
+        if (prev && versions.some((item) => item.version_id === prev)) return prev
+        return preferredVersionId
+      })
+      setControlVersionId((prev) => {
+        if (prev && versions.some((item) => item.version_id === prev)) return prev
+        return ""
+      })
+    } catch (err) {
+      const msg = getErrorMessage(err, "加载 baseline 版本失败")
+      setBaselineError(msg)
+    } finally {
+      setBaselineVersionsLoading(false)
+    }
+  }
+
+  async function createBaselineVersion() {
+    if (!isOwner || creatingBaselineVersion) return
+    setCreatingBaselineVersion(true)
+    setBaselineError("")
+    const label = String(newVersionNote || "").trim()
+    try {
+      await api.post("/api/admin/baseline/versions", label ? { label } : {})
+      setNewVersionNote("")
+      addToast({ type: "success", message: "Baseline 版本已创建" })
+      await Promise.all([loadSoul(), loadBaselineVersions()])
+    } catch (err) {
+      const msg = getErrorMessage(err, "创建版本失败")
+      setBaselineError(msg)
+      addToast({ type: "error", message: msg })
+    } finally {
+      setCreatingBaselineVersion(false)
+    }
+  }
+
+  async function publishBaselineRollout() {
+    if (!isOwner || publishingBaseline) return
+    const targetVersionId = String(publishVersionId || "").trim()
+    if (!targetVersionId) {
+      addToast({ type: "error", message: "请选择目标版本" })
+      return
+    }
+    const nextPercent = Math.floor(Number(canaryPercent))
+    if (publishStrategy === "canary" && (!Number.isFinite(nextPercent) || nextPercent < 0 || nextPercent > 100)) {
+      addToast({ type: "error", message: "灰度百分比必须在 0-100 之间" })
+      return
+    }
+
+    const payload: Record<string, unknown> = {
+      strategy: publishStrategy,
+      candidate_version_id: targetVersionId,
+    }
+    if (publishStrategy === "canary") {
+      payload.canary_percent = nextPercent
+      if (String(controlVersionId || "").trim()) {
+        payload.control_version_id = String(controlVersionId).trim()
+      }
+    }
+
+    setPublishingBaseline(true)
+    setBaselineError("")
+    try {
+      await api.post("/api/admin/baseline/rollout", payload)
+      addToast({ type: "success", message: "Baseline 发布策略已更新" })
+      await Promise.all([loadSoul(), loadBaselineVersions()])
+    } catch (err) {
+      const msg = getErrorMessage(err, "发布失败")
+      setBaselineError(msg)
+      addToast({ type: "error", message: msg })
+    } finally {
+      setPublishingBaseline(false)
+    }
+  }
+
+  async function rollbackBaseline() {
+    if (!isOwner || rollingBackBaseline) return
+    const targetVersionId = String(rollbackVersionId || "").trim()
+    if (!targetVersionId) {
+      addToast({ type: "error", message: "请选择回滚版本" })
+      return
+    }
+    setRollingBackBaseline(true)
+    setBaselineError("")
+    try {
+      await api.post("/api/admin/baseline/rollback", { version_id: targetVersionId })
+      addToast({ type: "success", message: "Baseline 已回滚" })
+      await Promise.all([loadSoul(), loadBaselineVersions()])
+    } catch (err) {
+      const msg = getErrorMessage(err, "回滚失败")
+      setBaselineError(msg)
+      addToast({ type: "error", message: msg })
+    } finally {
+      setRollingBackBaseline(false)
     }
   }
 
@@ -178,6 +375,11 @@ export function Soul() {
     void loadSoul()
   }, [])
 
+  useEffect(() => {
+    if (!isOwner) return
+    void loadBaselineVersions()
+  }, [isOwner, baselineMeta?.selected_version_id])
+
   const tenantId = String(payload?.subject?.tenant_id || "-")
   const workspaceFilename = String(payload?.workspace?.filename || "-")
   const workspaceExists = Boolean(payload?.workspace?.exists)
@@ -201,7 +403,15 @@ export function Soul() {
             了解 Effective Policy/Soul（解释性预览，不等于能力授权） <ExternalLink className="h-3 w-3" />
           </a>
         </div>
-        <Button variant="outline" onClick={() => loadSoul().catch(() => {})} disabled={loading || saving || previewing}>
+        <Button
+          variant="outline"
+          onClick={() =>
+            Promise.all([loadSoul(), isOwner ? loadBaselineVersions() : Promise.resolve()]).catch(
+              () => {}
+            )
+          }
+          disabled={loading || saving || previewing || baselineVersionsLoading}
+        >
           刷新
         </Button>
       </div>
@@ -240,6 +450,171 @@ export function Soul() {
                   </div>
                 </div>
               )}
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-3">
+              <CardTitle className="text-base">Baseline Rollout</CardTitle>
+              <CardDescription>
+                平台基线版本用于控制平台 Base Soul 与系统策略上限。Owner 可创建、灰度发布与回滚。
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="flex flex-wrap items-center gap-2 text-sm">
+                <Badge variant="secondary">
+                  selected: {String(baselineMeta?.selected_version_id || "-")}
+                </Badge>
+                <Badge variant="secondary">
+                  strategy: {String(baselineMeta?.strategy || "all")}
+                </Badge>
+                <Badge variant="secondary">
+                  canary:{" "}
+                  {baselineMeta?.canary_percent == null ? "-" : `${baselineMeta.canary_percent}%`}
+                </Badge>
+                {baselineMeta?.is_canary != null && (
+                  <Badge variant={baselineMeta.is_canary ? "success" : "outline"}>
+                    {baselineMeta.is_canary ? "canary hit" : "control hit"}
+                  </Badge>
+                )}
+              </div>
+              {baselineError && (
+                <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                  {baselineError}
+                </div>
+              )}
+
+              {isOwner ? (
+                <div className="space-y-4">
+                  <div className="grid gap-2 md:grid-cols-[1fr_auto]">
+                    <Input
+                      value={newVersionNote}
+                      onChange={(e) => setNewVersionNote(e.target.value)}
+                      placeholder="版本标签（可选）"
+                      disabled={creatingBaselineVersion}
+                    />
+                    <Button
+                      onClick={() => createBaselineVersion().catch(() => {})}
+                      disabled={creatingBaselineVersion}
+                    >
+                      {creatingBaselineVersion ? "创建中..." : "创建版本"}
+                    </Button>
+                  </div>
+
+                  <div className="grid gap-2 md:grid-cols-2">
+                    <label className="space-y-1 text-sm">
+                      <span className="text-xs text-muted-foreground">目标版本</span>
+                      <select
+                        className="w-full rounded-md border bg-background px-3 py-2"
+                        value={publishVersionId}
+                        onChange={(e) => setPublishVersionId(e.target.value)}
+                        disabled={publishingBaseline || baselineVersionsLoading}
+                      >
+                        <option value="">请选择</option>
+                        {baselineVersions.map((item) => (
+                          <option key={item.version_id} value={item.version_id}>
+                            {item.version_id}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="space-y-1 text-sm">
+                      <span className="text-xs text-muted-foreground">发布策略</span>
+                      <select
+                        className="w-full rounded-md border bg-background px-3 py-2"
+                        value={publishStrategy}
+                        onChange={(e) => setPublishStrategy(e.target.value as "all" | "canary")}
+                        disabled={publishingBaseline}
+                      >
+                        <option value="all">all（全量）</option>
+                        <option value="canary">canary（灰度）</option>
+                      </select>
+                    </label>
+                  </div>
+
+                  {publishStrategy === "canary" && (
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <Input
+                        type="number"
+                        min={0}
+                        max={100}
+                        value={canaryPercent}
+                        onChange={(e) => setCanaryPercent(e.target.value)}
+                        placeholder="灰度比例 0-100"
+                        disabled={publishingBaseline}
+                      />
+                      <select
+                        className="w-full rounded-md border bg-background px-3 py-2"
+                        value={controlVersionId}
+                        onChange={(e) => setControlVersionId(e.target.value)}
+                        disabled={publishingBaseline || baselineVersionsLoading}
+                      >
+                        <option value="">control 版本（可选）</option>
+                        {baselineVersions.map((item) => (
+                          <option key={`control:${item.version_id}`} value={item.version_id}>
+                            {item.version_id}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      onClick={() => publishBaselineRollout().catch(() => {})}
+                      disabled={publishingBaseline || baselineVersionsLoading}
+                    >
+                      {publishingBaseline ? "发布中..." : "更新发布策略"}
+                    </Button>
+                    <select
+                      className="min-w-[220px] rounded-md border bg-background px-3 py-2 text-sm"
+                      value={rollbackVersionId}
+                      onChange={(e) => setRollbackVersionId(e.target.value)}
+                      disabled={rollingBackBaseline || baselineVersionsLoading}
+                    >
+                      <option value="">选择回滚版本</option>
+                      {baselineVersions.map((item) => (
+                        <option key={`rollback:${item.version_id}`} value={item.version_id}>
+                          {item.version_id}
+                        </option>
+                      ))}
+                    </select>
+                    <Button
+                      variant="outline"
+                      onClick={() => rollbackBaseline().catch(() => {})}
+                      disabled={rollingBackBaseline || !rollbackVersionId}
+                    >
+                      {rollingBackBaseline ? "回滚中..." : "回滚"}
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-sm text-muted-foreground">当前角色只读；仅 Owner 可以调整 rollout。</div>
+              )}
+
+              <div className="space-y-2">
+                <div className="text-sm font-medium">版本列表</div>
+                {baselineVersionsLoading ? (
+                  <div className="text-sm text-muted-foreground">加载中...</div>
+                ) : baselineVersions.length === 0 ? (
+                  <div className="text-sm text-muted-foreground">暂无版本</div>
+                ) : (
+                  <div className="space-y-1 rounded-md border p-2 text-xs">
+                    {baselineVersions.slice(0, 8).map((item) => (
+                      <div key={`ver:${item.version_id}`} className="flex flex-wrap items-center gap-2">
+                        <Badge variant="outline">{item.version_id}</Badge>
+                        {item.label && <span className="text-muted-foreground">{item.label}</span>}
+                        <span className="text-muted-foreground">
+                          {formatTime(item.created_at || "")}
+                        </span>
+                        {item.created_by && (
+                          <span className="text-muted-foreground">by {item.created_by}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </CardContent>
           </Card>
 

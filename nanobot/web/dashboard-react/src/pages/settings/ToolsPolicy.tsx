@@ -14,6 +14,15 @@ interface ToolPolicyState {
   reason_codes?: string[]
 }
 
+interface BaselineMeta {
+  selected_version_id?: string | null
+  effective_version_id?: string | null
+  strategy?: string | null
+  canary_percent?: number | null
+  control_version_id?: string | null
+  is_canary?: boolean | null
+}
+
 interface ToolsPolicyPayload {
   runtime_mode?: string
   runtime_scope?: string
@@ -35,6 +44,7 @@ interface ToolsPolicyPayload {
   user_setting?: Record<ToolKey, { enabled?: boolean }>
   effective?: Record<ToolKey, ToolPolicyState>
   warnings?: string[]
+  baseline?: BaselineMeta
 }
 
 const REASON_TEXT: Record<string, string> = {
@@ -231,6 +241,25 @@ export function ToolsPolicy() {
               </div>
               <div className="text-xs text-muted-foreground">
                 tenant: {String(policy?.subject?.tenant_id || "-")}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <Badge variant="outline">
+                  baseline: {String(policy?.baseline?.selected_version_id || "-")}
+                </Badge>
+                <Badge variant="outline">
+                  strategy: {String(policy?.baseline?.strategy || "all")}
+                </Badge>
+                <Badge variant="outline">
+                  canary:{" "}
+                  {policy?.baseline?.canary_percent == null
+                    ? "-"
+                    : `${Number(policy.baseline.canary_percent)}%`}
+                </Badge>
+                {policy?.baseline?.is_canary != null && (
+                  <Badge variant={policy.baseline.is_canary ? "success" : "secondary"}>
+                    {policy.baseline.is_canary ? "canary hit" : "control hit"}
+                  </Badge>
+                )}
               </div>
               <div className="rounded-md border border-muted/60 bg-muted/20 p-3 text-xs text-muted-foreground">
                 <div className="font-medium text-foreground mb-1">Web 会话缓存（运行时）</div>

@@ -25,10 +25,12 @@ class ContextBuilder:
         workspace: Path,
         *,
         platform_base_soul_path: Path | None = None,
+        platform_base_soul_content: str | None = None,
         managed_skills_dir: Path | None = None,
     ):
         self.workspace = workspace
         self.platform_base_soul_path = platform_base_soul_path
+        self.platform_base_soul_content = platform_base_soul_content
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, managed_skills_dir=managed_skills_dir)
 
@@ -145,7 +147,11 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def _load_layered_soul(self) -> str:
         svc = SoulLayeringService(platform_base_soul_path=self.platform_base_soul_path)
-        effective = svc.generate_effective_preview(workspace=self.workspace, session_overlay=None)
+        effective = svc.generate_effective_preview(
+            workspace=self.workspace,
+            session_overlay=None,
+            platform_base_override=self.platform_base_soul_content,
+        )
         return str(effective.merged_content or "").strip()
 
     def build_messages(

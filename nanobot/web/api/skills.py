@@ -19,6 +19,10 @@ from nanobot.services.workspace_skill_installs import (
 )
 from nanobot.services.workspace_tool_policy import WorkspaceToolPolicyService
 from nanobot.utils.helpers import get_data_path
+from nanobot.web.api.baseline_rollout import (
+    baseline_metadata_from_resolution,
+    resolve_baseline_for_tenant,
+)
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.services.clawhub_client import ClawHubClient, ClawHubClientError
 from nanobot.web.session_cache import web_session_cache_metrics
@@ -243,7 +247,8 @@ def _tool_policy_payload(
     cfg: Any,
 ) -> dict[str, Any]:
     runtime_mode = _runtime_mode(request)
-    return _TOOL_POLICY_SERVICE.build_payload(
+    baseline_resolution = resolve_baseline_for_tenant(request, tenant_id)
+    payload = _TOOL_POLICY_SERVICE.build_payload(
         system_cfg=getattr(request.app.state, "config", None),
         tenant_cfg=cfg,
         tenant_id=tenant_id,
@@ -252,9 +257,16 @@ def _tool_policy_payload(
         runtime_mode=runtime_mode,
         write_status=_write_status(runtime_mode),
         runtime_cache=web_session_cache_metrics(request.app),
+        system_policy_override=(
+            baseline_resolution.get("policy")
+            if isinstance(baseline_resolution.get("policy"), dict)
+            else None
+        ),
         runtime_warning=_runtime_warning(runtime_mode),
         owner_role=ROLE_OWNER,
     )
+    payload["baseline"] = baseline_metadata_from_resolution(baseline_resolution)
+    return payload
 
 
 def _list_skill_dirs(root: Path | None) -> dict[str, Path]:
@@ -719,7 +731,9 @@ async def _build_catalog_response(
                 {
                     "source": "clawhub",
                     "status_code": int(exc.status_code),
-                    "upstream_status": int(exc.upstream_status) if exc.upstream_status is not None else None,
+                    "upstream_status": int(exc.upstream_status)
+                    if exc.upstream_status is not None
+                    else None,
                     "detail": str(exc.detail),
                 }
             )
@@ -739,7 +753,9 @@ async def _build_catalog_response(
                 merged[key] = item
         items = [item for item in merged.values() if item.get("name")]
 
-    items.sort(key=lambda item: (0 if item.get("installed") else 1, str(item.get("name") or "").lower()))
+    items.sort(
+        key=lambda item: (0 if item.get("installed") else 1, str(item.get("name") or "").lower())
+    )
     if len(items) > normalized_limit:
         items = items[:normalized_limit]
     if source_mode != "clawhub":
@@ -868,7 +884,9 @@ async def install_skill(
             version=validated.version,
         )
         quota_mib = int(
-            getattr(getattr(getattr(cfg, "tools", None), "filesystem", None), "workspace_quota_mib", 0)
+            getattr(
+                getattr(getattr(cfg, "tools", None), "filesystem", None), "workspace_quota_mib", 0
+            )
         )
         if plan.source == "clawhub":
             try:
@@ -896,7 +914,9 @@ async def install_skill(
         raise _service_http_exception(exc) from exc
 
     origin_source = _normalize_origin_skill_source(result.source)
-    runtime_source = "workspace" if bool(result.installed) else _normalize_runtime_skill_source(origin_source)
+    runtime_source = (
+        "workspace" if bool(result.installed) else _normalize_runtime_skill_source(origin_source)
+    )
     return {
         "name": plan.name,
         "installed": bool(result.installed),
@@ -1050,7 +1070,9 @@ async def get_skill(
     try:
         skill_name = install_service.validate_skill_name(skill_name)
     except WorkspaceSkillInstallError:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid skill name")
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid skill name"
+        )
 
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
     content = loader.load_skill(skill_name)
@@ -1085,8 +1107,9 @@ async def get_skill(
         "metadata": meta,
         "install_source": "clawhub" if origin_source == "clawhub" else "local",
     }
-    store_metadata = _store_metadata_for_skill(install_service, name=skill_name, source=runtime_source)
+    store_metadata = _store_metadata_for_skill(
+        install_service, name=skill_name, source=runtime_source
+    )
     if store_metadata is not None:
         payload["store_metadata"] = store_metadata
     return payload
-

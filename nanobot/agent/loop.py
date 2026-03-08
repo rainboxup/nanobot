@@ -58,6 +58,7 @@ class AgentLoop:
         provider: LLMProvider,
         workspace: Path,
         platform_base_soul_path: Path | None = None,
+        platform_base_soul_content: str | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -106,6 +107,7 @@ class AgentLoop:
         self.context = ContextBuilder(
             workspace,
             platform_base_soul_path=platform_base_soul_path,
+            platform_base_soul_content=platform_base_soul_content,
             managed_skills_dir=self.managed_skills_dir,
         )
         self.sessions = session_manager or SessionManager(workspace)

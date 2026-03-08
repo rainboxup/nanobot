@@ -40,13 +40,13 @@ class ConfigOwnershipService:
 
     @staticmethod
     def check_channel_credentials_ownership(
-        *, runtime_mode: str, is_admin: bool
+        *, runtime_mode: str, is_owner: bool
     ) -> OwnershipDecision:
         mode = str(runtime_mode or "").strip().lower()
         if mode != "multi":
             return OwnershipDecision(allowed=True, scope=ConfigScope.SYSTEM)
 
-        if not bool(is_admin):
+        if not bool(is_owner):
             return OwnershipDecision(
                 allowed=False,
                 scope=ConfigScope.SYSTEM,
@@ -105,7 +105,7 @@ class ConfigOwnershipService:
         config_key: str,
         new_value: object,
         runtime_mode: str,
-        is_admin: bool,
+        is_owner: bool,
     ) -> OwnershipDecision:
         del new_value  # Reserved for future validation (type/shape enforcement).
         mode = str(runtime_mode or "").strip().lower()
@@ -115,7 +115,7 @@ class ConfigOwnershipService:
             return OwnershipDecision(allowed=True, scope=ConfigScope.SESSION)
 
         if scope == ConfigScope.SYSTEM:
-            if mode == "multi" and not bool(is_admin):
+            if mode == "multi" and not bool(is_owner):
                 return OwnershipDecision(
                     allowed=False,
                     scope=ConfigScope.SYSTEM,

@@ -374,6 +374,8 @@ def _channel_validation_error(
 
 def _workspace_routing_ownership_error(decision) -> tuple[int, str, str]:
     reason_code = str(decision.reason_code or "workspace_routing_unavailable")
+    # Role gating is enforced by the route dependency. This helper only maps
+    # scope/runtime ownership conflicts returned by ConfigOwnershipService.
     if reason_code == "single_tenant_runtime_mode":
         return status.HTTP_409_CONFLICT, reason_code, _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
     if reason_code == "system_scope":
@@ -387,12 +389,6 @@ def _workspace_routing_ownership_error(decision) -> tuple[int, str, str]:
             status.HTTP_409_CONFLICT,
             reason_code,
             "Workspace channel routing is session-scoped and cannot be persisted here.",
-        )
-    if reason_code == "insufficient_permissions":
-        return (
-            status.HTTP_403_FORBIDDEN,
-            reason_code,
-            "Only workspace admins can modify channel routing.",
         )
     return status.HTTP_409_CONFLICT, reason_code, "Workspace channel routing is unavailable."
 

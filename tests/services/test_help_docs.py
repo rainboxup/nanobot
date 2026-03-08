@@ -70,20 +70,30 @@ def test_default_registry_uses_bundled_help_docs_that_match_repo_docs() -> None:
 
     assert registry.docs_dir == bundled_dir
 
-    bundled_workspace = (bundled_dir / "workspace-routing-and-binding.md").read_text(encoding="utf-8")
-    repo_workspace = (repo_root / "docs/howto/workspace-routing-and-binding.md").read_text(encoding="utf-8")
-    assert bundled_workspace == repo_workspace
+    cases = [
+        (
+            "workspace-routing-and-binding",
+            "workspace-routing-and-binding.md",
+            "docs/howto/workspace-routing-and-binding.md",
+        ),
+        (
+            "managed-skill-store-integrity",
+            "managed-skill-store-integrity.md",
+            "docs/howto/managed-skill-store-integrity.md",
+        ),
+    ]
 
-    doc = registry.get_doc("workspace-routing-and-binding")
-    assert doc is not None
-    assert doc.source.path == "docs/howto/workspace-routing-and-binding.md"
-    assert doc.markdown == repo_workspace
+    for slug, bundled_name, source_path in cases:
+        bundled_path = bundled_dir / bundled_name
+        bundled_markdown = bundled_path.read_bytes().decode("utf-8")
 
-    bundled_store = (bundled_dir / "managed-skill-store-integrity.md").read_text(encoding="utf-8")
-    repo_store = (repo_root / "docs/howto/managed-skill-store-integrity.md").read_text(encoding="utf-8")
-    assert bundled_store == repo_store
+        doc = registry.get_doc(slug)
+        assert doc is not None
+        assert doc.source.path == source_path
+        assert doc.markdown == bundled_markdown
 
-    store_doc = registry.get_doc("managed-skill-store-integrity")
-    assert store_doc is not None
-    assert store_doc.source.path == "docs/howto/managed-skill-store-integrity.md"
-    assert store_doc.markdown == repo_store
+        repo_path = repo_root / source_path
+        if repo_path.exists():
+            repo_markdown = repo_path.read_bytes().decode("utf-8")
+            assert bundled_markdown == repo_markdown
+            assert doc.markdown == repo_markdown

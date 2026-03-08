@@ -9,6 +9,13 @@ import { Badge } from "@/src/components/ui/badge"
 import { Button } from "@/src/components/ui/button"
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/src/components/ui/card"
 import { Input } from "@/src/components/ui/input"
+import {
+  BaselineBadges,
+  hasBaselineVersionId,
+  normalizeBaselineMeta,
+  resolveBaselineSelectionDefaults,
+  type BaselineMeta,
+} from "./baselineMeta"
 
 interface SoulLayer {
   title: string
@@ -46,15 +53,6 @@ interface SoulPreviewPayload {
   effective?: EffectiveSoul
 }
 
-interface BaselineMeta {
-  selected_version_id?: string | null
-  effective_version_id?: string | null
-  strategy?: string | null
-  canary_percent?: number | null
-  control_version_id?: string | null
-  is_canary?: boolean | null
-}
-
 interface BaselineVersionItem {
   version_id: string
   label?: string | null
@@ -89,28 +87,6 @@ function normalizeEffective(raw: unknown): EffectiveSoul | null {
   return {
     merged_content: String((raw as any).merged_content || ""),
     layers: normalizeLayers((raw as any).layers),
-  }
-}
-
-function normalizePercent(raw: unknown): number | null {
-  const n = Number(raw)
-  if (!Number.isFinite(n)) return null
-  return Math.min(100, Math.max(0, n))
-}
-
-function normalizeBaselineMeta(raw: unknown): BaselineMeta | null {
-  if (!raw || typeof raw !== "object") return null
-  const selectedVersionId = String((raw as any).selected_version_id || "").trim()
-  const effectiveVersionId = String((raw as any).effective_version_id || "").trim()
-  const strategy = String((raw as any).strategy || "").trim()
-  const controlVersionId = String((raw as any).control_version_id || "").trim()
-  return {
-    selected_version_id: selectedVersionId || null,
-    effective_version_id: effectiveVersionId || null,
-    strategy: strategy || null,
-    canary_percent: normalizePercent((raw as any).canary_percent),
-    control_version_id: controlVersionId || null,
-    is_canary: typeof (raw as any).is_canary === "boolean" ? Boolean((raw as any).is_canary) : null,
   }
 }
 
@@ -185,10 +161,20 @@ export function Soul() {
   const [canaryPercent, setCanaryPercent] = useState("10")
   const [controlVersionId, setControlVersionId] = useState("")
   const [rollbackVersionId, setRollbackVersionId] = useState("")
+  const [publishVersionTouched, setPublishVersionTouched] = useState(false)
+  const [controlVersionTouched, setControlVersionTouched] = useState(false)
+  const [rollbackVersionTouched, setRollbackVersionTouched] = useState(false)
+  const [effectiveBaselineTenantId, setEffectiveBaselineTenantId] = useState("")
+  const [effectiveBaseline, setEffectiveBaseline] = useState<BaselineMeta | null>(null)
+  const [effectiveBaselineResolvedTenantId, setEffectiveBaselineResolvedTenantId] = useState("")
+  const [effectiveBaselineLoading, setEffectiveBaselineLoading] = useState(false)
+  const [effectiveBaselineError, setEffectiveBaselineError] = useState("")
 
+  const hasSoulState = payload !== null
   const writable = Boolean(payload?.writable)
-  const writeBlocked = payload !== null && !writable
+  const writeBlocked = hasSoulState && !writable
   const writeBlockedReason = String(payload?.write_block_reason || payload?.runtime_warning || "").trim()
+  const soulInteractionBlocked = !hasSoulState
 
   const isDirty = useMemo(() => content !== baseContent, [content, baseContent])
   const baselineMeta = useMemo(() => normalizeBaselineMeta(payload?.baseline), [payload])
@@ -224,23 +210,7 @@ export function Soul() {
     setBaselineError("")
     try {
       const data = await api.get<unknown>("/api/admin/baseline/versions")
-      const versions = normalizeBaselineVersionList(data)
-      setBaselineVersions(versions)
-      const preferredVersionId = String(
-        baselineMeta?.selected_version_id || versions[0]?.version_id || ""
-      )
-      setPublishVersionId((prev) => {
-        if (prev && versions.some((item) => item.version_id === prev)) return prev
-        return preferredVersionId
-      })
-      setRollbackVersionId((prev) => {
-        if (prev && versions.some((item) => item.version_id === prev)) return prev
-        return preferredVersionId
-      })
-      setControlVersionId((prev) => {
-        if (prev && versions.some((item) => item.version_id === prev)) return prev
-        return ""
-      })
+      setBaselineVersions(normalizeBaselineVersionList(data))
     } catch (err) {
       const msg = getErrorMessage(err, "加载 baseline 版本失败")
       setBaselineError(msg)
@@ -250,7 +220,7 @@ export function Soul() {
   }
 
   async function createBaselineVersion() {
-    if (!isOwner || creatingBaselineVersion) return
+    if (!isOwner || !hasSoulState || creatingBaselineVersion) return
     setCreatingBaselineVersion(true)
     setBaselineError("")
     const label = String(newVersionNote || "").trim()
@@ -269,7 +239,7 @@ export function Soul() {
   }
 
   async function publishBaselineRollout() {
-    if (!isOwner || publishingBaseline) return
+    if (!isOwner || !hasSoulState || publishingBaseline) return
     const targetVersionId = String(publishVersionId || "").trim()
     if (!targetVersionId) {
       addToast({ type: "error", message: "请选择目标版本" })
@@ -308,7 +278,7 @@ export function Soul() {
   }
 
   async function rollbackBaseline() {
-    if (!isOwner || rollingBackBaseline) return
+    if (!isOwner || !hasSoulState || rollingBackBaseline) return
     const targetVersionId = String(rollbackVersionId || "").trim()
     if (!targetVersionId) {
       addToast({ type: "error", message: "请选择回滚版本" })
@@ -352,7 +322,7 @@ export function Soul() {
   }
 
   async function previewOverlay() {
-    if (previewing) return
+    if (!hasSoulState || previewing) return
     setPreviewing(true)
     setPreviewError("")
     try {
@@ -371,6 +341,33 @@ export function Soul() {
     }
   }
 
+  async function loadEffectiveBaseline() {
+    if (!isOwner || !hasSoulState || effectiveBaselineLoading) return
+    const targetTenantId = String(effectiveBaselineTenantId || "").trim()
+    if (!targetTenantId) {
+      const msg = "请输入 tenant_id"
+      setEffectiveBaselineError(msg)
+      addToast({ type: "error", message: msg })
+      return
+    }
+    setEffectiveBaselineLoading(true)
+    setEffectiveBaselineError("")
+    try {
+      const data = await api.get<unknown>(
+        `/api/admin/baseline/effective?tenant_id=${encodeURIComponent(targetTenantId)}`
+      )
+      setEffectiveBaseline(normalizeBaselineMeta(data))
+      setEffectiveBaselineResolvedTenantId(targetTenantId)
+    } catch (err) {
+      const msg = getErrorMessage(err, "加载 tenant baseline 失败")
+      setEffectiveBaseline(null)
+      setEffectiveBaselineError(msg)
+      addToast({ type: "error", message: msg })
+    } finally {
+      setEffectiveBaselineLoading(false)
+    }
+  }
+
   useEffect(() => {
     void loadSoul()
   }, [])
@@ -378,7 +375,42 @@ export function Soul() {
   useEffect(() => {
     if (!isOwner) return
     void loadBaselineVersions()
-  }, [isOwner, baselineMeta?.selected_version_id])
+  }, [isOwner])
+
+  useEffect(() => {
+    if (!isOwner) return
+    const defaults = resolveBaselineSelectionDefaults(baselineMeta, baselineVersions)
+
+    setPublishVersionId((prev) => {
+      if (publishVersionTouched && hasBaselineVersionId(baselineVersions, prev)) return prev
+      return defaults.publishVersionId
+    })
+    setRollbackVersionId((prev) => {
+      if (rollbackVersionTouched && hasBaselineVersionId(baselineVersions, prev)) return prev
+      return defaults.rollbackVersionId
+    })
+    setControlVersionId((prev) => {
+      if (controlVersionTouched && hasBaselineVersionId(baselineVersions, prev)) return prev
+      return defaults.controlVersionId
+    })
+  }, [
+    isOwner,
+    baselineMeta?.candidate_version_id,
+    baselineMeta?.selected_version_id,
+    baselineMeta?.effective_version_id,
+    baselineMeta?.control_version_id,
+    baselineVersions,
+    publishVersionTouched,
+    rollbackVersionTouched,
+    controlVersionTouched,
+  ])
+
+  useEffect(() => {
+    if (!isOwner) return
+    const nextTenantId = String(payload?.subject?.tenant_id || "").trim()
+    if (!nextTenantId) return
+    setEffectiveBaselineTenantId((prev) => prev || nextTenantId)
+  }, [isOwner, payload?.subject?.tenant_id])
 
   const tenantId = String(payload?.subject?.tenant_id || "-")
   const workspaceFilename = String(payload?.workspace?.filename || "-")
@@ -461,26 +493,60 @@ export function Soul() {
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="flex flex-wrap items-center gap-2 text-sm">
-                <Badge variant="secondary">
-                  selected: {String(baselineMeta?.selected_version_id || "-")}
-                </Badge>
-                <Badge variant="secondary">
-                  strategy: {String(baselineMeta?.strategy || "all")}
-                </Badge>
-                <Badge variant="secondary">
-                  canary:{" "}
-                  {baselineMeta?.canary_percent == null ? "-" : `${baselineMeta.canary_percent}%`}
-                </Badge>
-                {baselineMeta?.is_canary != null && (
-                  <Badge variant={baselineMeta.is_canary ? "success" : "outline"}>
-                    {baselineMeta.is_canary ? "canary hit" : "control hit"}
-                  </Badge>
-                )}
-              </div>
+              <BaselineBadges meta={baselineMeta} variant="secondary" />
               {baselineError && (
                 <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
                   {baselineError}
+                </div>
+              )}
+
+              {isOwner && (
+                <div className="space-y-3 rounded-md border border-muted/60 bg-muted/20 p-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Tenant Effective Baseline</div>
+                    <div className="text-xs text-muted-foreground">
+                      默认填充当前 tenant；可改成任意 tenant_id 查看 bucket / canary 命中结果。
+                    </div>
+                  </div>
+                  <div className="grid gap-2 md:grid-cols-[1fr_auto]">
+                    <Input
+                      value={effectiveBaselineTenantId}
+                      onChange={(e) => setEffectiveBaselineTenantId(e.target.value)}
+                      placeholder="输入 tenant_id 查看 effective baseline"
+                      disabled={soulInteractionBlocked || effectiveBaselineLoading}
+                    />
+                    <Button
+                      variant="outline"
+                      onClick={() => loadEffectiveBaseline().catch(() => {})}
+                      disabled={
+                        soulInteractionBlocked ||
+                        effectiveBaselineLoading ||
+                        !String(effectiveBaselineTenantId || "").trim()
+                      }
+                    >
+                      {effectiveBaselineLoading ? "查询中..." : "查看 effective baseline"}
+                    </Button>
+                  </div>
+                  {effectiveBaselineError && (
+                    <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                      {effectiveBaselineError}
+                    </div>
+                  )}
+                  {effectiveBaseline ? (
+                    <div className="space-y-2 rounded-md border bg-background p-3">
+                      <div className="text-xs text-muted-foreground">
+                        tenant: {effectiveBaselineResolvedTenantId || "-"}
+                      </div>
+                      <BaselineBadges meta={effectiveBaseline} variant="outline" />
+                      <div className="text-xs text-muted-foreground">
+                        该查询复用 `/api/admin/baseline/effective`，用于模拟指定 tenant 的 baseline 命中。
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-xs text-muted-foreground">
+                      输入 tenant_id 后可查看 effective / candidate / control / bucket 等 rollout 状态。
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -491,11 +557,11 @@ export function Soul() {
                       value={newVersionNote}
                       onChange={(e) => setNewVersionNote(e.target.value)}
                       placeholder="版本标签（可选）"
-                      disabled={creatingBaselineVersion}
+                      disabled={soulInteractionBlocked || creatingBaselineVersion}
                     />
                     <Button
                       onClick={() => createBaselineVersion().catch(() => {})}
-                      disabled={creatingBaselineVersion}
+                      disabled={soulInteractionBlocked || creatingBaselineVersion}
                     >
                       {creatingBaselineVersion ? "创建中..." : "创建版本"}
                     </Button>
@@ -507,8 +573,11 @@ export function Soul() {
                       <select
                         className="w-full rounded-md border bg-background px-3 py-2"
                         value={publishVersionId}
-                        onChange={(e) => setPublishVersionId(e.target.value)}
-                        disabled={publishingBaseline || baselineVersionsLoading}
+                        onChange={(e) => {
+                          setPublishVersionTouched(true)
+                          setPublishVersionId(e.target.value)
+                        }}
+                        disabled={soulInteractionBlocked || publishingBaseline || baselineVersionsLoading}
                       >
                         <option value="">请选择</option>
                         {baselineVersions.map((item) => (
@@ -524,7 +593,7 @@ export function Soul() {
                         className="w-full rounded-md border bg-background px-3 py-2"
                         value={publishStrategy}
                         onChange={(e) => setPublishStrategy(e.target.value as "all" | "canary")}
-                        disabled={publishingBaseline}
+                        disabled={soulInteractionBlocked || publishingBaseline}
                       >
                         <option value="all">all（全量）</option>
                         <option value="canary">canary（灰度）</option>
@@ -541,13 +610,16 @@ export function Soul() {
                         value={canaryPercent}
                         onChange={(e) => setCanaryPercent(e.target.value)}
                         placeholder="灰度比例 0-100"
-                        disabled={publishingBaseline}
+                        disabled={soulInteractionBlocked || publishingBaseline}
                       />
                       <select
                         className="w-full rounded-md border bg-background px-3 py-2"
                         value={controlVersionId}
-                        onChange={(e) => setControlVersionId(e.target.value)}
-                        disabled={publishingBaseline || baselineVersionsLoading}
+                        onChange={(e) => {
+                          setControlVersionTouched(true)
+                          setControlVersionId(e.target.value)
+                        }}
+                        disabled={soulInteractionBlocked || publishingBaseline || baselineVersionsLoading}
                       >
                         <option value="">control 版本（可选）</option>
                         {baselineVersions.map((item) => (
@@ -562,15 +634,18 @@ export function Soul() {
                   <div className="flex flex-wrap gap-2">
                     <Button
                       onClick={() => publishBaselineRollout().catch(() => {})}
-                      disabled={publishingBaseline || baselineVersionsLoading}
+                      disabled={soulInteractionBlocked || publishingBaseline || baselineVersionsLoading}
                     >
                       {publishingBaseline ? "发布中..." : "更新发布策略"}
                     </Button>
                     <select
                       className="min-w-[220px] rounded-md border bg-background px-3 py-2 text-sm"
                       value={rollbackVersionId}
-                      onChange={(e) => setRollbackVersionId(e.target.value)}
-                      disabled={rollingBackBaseline || baselineVersionsLoading}
+                      onChange={(e) => {
+                        setRollbackVersionTouched(true)
+                        setRollbackVersionId(e.target.value)
+                      }}
+                      disabled={soulInteractionBlocked || rollingBackBaseline || baselineVersionsLoading}
                     >
                       <option value="">选择回滚版本</option>
                       {baselineVersions.map((item) => (
@@ -582,7 +657,7 @@ export function Soul() {
                     <Button
                       variant="outline"
                       onClick={() => rollbackBaseline().catch(() => {})}
-                      disabled={rollingBackBaseline || !rollbackVersionId}
+                      disabled={soulInteractionBlocked || rollingBackBaseline || !rollbackVersionId}
                     >
                       {rollingBackBaseline ? "回滚中..." : "回滚"}
                     </Button>
@@ -630,7 +705,7 @@ export function Soul() {
                   value={content}
                   onChange={(e) => setContent(e.target.value)}
                   placeholder="在这里编辑 SOUL.md 内容..."
-                  disabled={!canEdit || writeBlocked || saving}
+                  disabled={soulInteractionBlocked || !canEdit || writeBlocked || saving}
                 />
                 {!canEdit && <div className="text-sm text-muted-foreground">仅 Admin/Owner 可以修改。</div>}
                 {canEdit && writeBlocked && (
@@ -638,7 +713,10 @@ export function Soul() {
                 )}
               </CardContent>
               <CardFooter className="flex justify-end gap-2 pt-4 border-t">
-                <Button onClick={() => saveSoul().catch(() => {})} disabled={!canEdit || writeBlocked || saving || !isDirty}>
+                <Button
+                  onClick={() => saveSoul().catch(() => {})}
+                  disabled={soulInteractionBlocked || !canEdit || writeBlocked || saving || !isDirty}
+                >
                   {saving ? "保存中..." : "保存"}
                 </Button>
               </CardFooter>
@@ -661,7 +739,7 @@ export function Soul() {
                     value={overlay}
                     onChange={(e) => setOverlay(e.target.value)}
                     placeholder="输入 overlay 内容后点击预览..."
-                    disabled={previewing}
+                    disabled={soulInteractionBlocked || previewing}
                   />
                   {previewError && (
                     <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
@@ -670,11 +748,18 @@ export function Soul() {
                   )}
                   <div className="flex justify-end gap-2">
                     {overlayActive && (
-                      <Button variant="outline" onClick={() => setPreview(null)} disabled={previewing || saving}>
+                      <Button
+                        variant="outline"
+                        onClick={() => setPreview(null)}
+                        disabled={soulInteractionBlocked || previewing || saving}
+                      >
                         清除预览
                       </Button>
                     )}
-                    <Button onClick={() => previewOverlay().catch(() => {})} disabled={previewing || saving}>
+                    <Button
+                      onClick={() => previewOverlay().catch(() => {})}
+                      disabled={soulInteractionBlocked || previewing || saving}
+                    >
                       {previewing ? "生成中..." : "预览"}
                     </Button>
                   </div>

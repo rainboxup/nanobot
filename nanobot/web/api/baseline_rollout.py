@@ -6,15 +6,39 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from nanobot.services.baseline_rollout import BaselineRolloutService
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
+from nanobot.tenants.validation import validate_tenant_id
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.tenant import tenant_id_from_claims
 
 router = APIRouter()
+
+
+class BaselineMetadataModel(BaseModel):
+    selected_version_id: str | None = None
+    effective_version_id: str | None = None
+    strategy: str = "all"
+    canary_percent: int = 0
+    candidate_version_id: str | None = None
+    control_version_id: str | None = None
+    bucket: int | None = None
+    is_canary: bool = False
+
+
+class BaselineEffectiveResponseModel(BaselineMetadataModel):
+    baseline: BaselineMetadataModel
+    rollout: dict[str, Any] = Field(default_factory=dict)
+    policy: dict[str, Any] = Field(default_factory=dict)
+
+
+class BaselineErrorResponseModel(BaseModel):
+    detail: str
+    reason_code: str | None = None
 
 
 def _read_platform_base_soul(path: Path | None) -> str:
@@ -80,25 +104,52 @@ def resolve_baseline_for_tenant(request: Request, tenant_id: str) -> dict[str, A
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Runtime config unavailable",
         )
+    try:
+        normalized_tenant_id = validate_tenant_id(str(tenant_id or "").strip())
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="invalid tenant_id",
+        ) from exc
     service = get_baseline_rollout_service(request)
     return service.resolve_for_tenant(
-        tenant_id=str(tenant_id or "").strip(),
+        tenant_id=normalized_tenant_id,
         system_config=cfg,
         fallback_platform_base_soul_path=resolve_platform_base_soul_path(config=cfg),
     )
 
 
 def baseline_metadata_from_resolution(resolution: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "selected_version_id": str(resolution.get("version_id") or "").strip() or None,
-        "effective_version_id": str(resolution.get("version_id") or "").strip() or None,
-        "strategy": str(resolution.get("strategy") or "all"),
-        "canary_percent": int(resolution.get("canary_percent") or 0),
-        "candidate_version_id": str(resolution.get("candidate_version_id") or "").strip() or None,
-        "control_version_id": str(resolution.get("control_version_id") or "").strip() or None,
-        "bucket": resolution.get("bucket"),
-        "is_canary": bool(resolution.get("is_canary", False)),
-    }
+    return BaselineMetadataModel(
+        selected_version_id=str(resolution.get("version_id") or "").strip() or None,
+        effective_version_id=str(resolution.get("version_id") or "").strip() or None,
+        strategy=str(resolution.get("strategy") or "all"),
+        canary_percent=int(resolution.get("canary_percent") or 0),
+        candidate_version_id=str(resolution.get("candidate_version_id") or "").strip() or None,
+        control_version_id=str(resolution.get("control_version_id") or "").strip() or None,
+        bucket=resolution.get("bucket"),
+        is_canary=bool(resolution.get("is_canary", False)),
+    ).model_dump()
+
+
+def _baseline_error_response(
+    *, status_code: int, detail: str, reason_code: str | None = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"detail": str(detail or ""), "reason_code": reason_code},
+    )
+
+
+def _baseline_reason_code(detail: str) -> str | None:
+    message = str(detail or "").strip()
+    if message == "invalid tenant_id":
+        return "invalid_tenant_id"
+    if message.endswith("not found"):
+        return "baseline_version_not_found"
+    if message:
+        return "baseline_rollout_invalid"
+    return None
 
 
 def baseline_metadata_for_tenant(request: Request, tenant_id: str) -> dict[str, Any]:
@@ -196,7 +247,10 @@ async def create_baseline_version(
     }
 
 
-@router.post("/api/admin/baseline/rollout")
+@router.post(
+    "/api/admin/baseline/rollout",
+    responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": BaselineErrorResponseModel}},
+)
 async def apply_baseline_rollout(
     payload: BaselineRolloutRequest,
     request: Request,
@@ -231,10 +285,11 @@ async def apply_baseline_rollout(
             actor=_normalize_actor(user),
         )
     except ValueError as exc:
-        raise HTTPException(
+        return _baseline_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
-        ) from exc
+            reason_code=_baseline_reason_code(str(exc)),
+        )
 
     _audit(
         request,
@@ -253,7 +308,10 @@ async def apply_baseline_rollout(
     }
 
 
-@router.post("/api/admin/baseline/rollback")
+@router.post(
+    "/api/admin/baseline/rollback",
+    responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": BaselineErrorResponseModel}},
+)
 async def rollback_baseline_rollout(
     payload: BaselineRollbackRequest,
     request: Request,
@@ -265,10 +323,11 @@ async def rollback_baseline_rollout(
     try:
         rollout = service.rollback_to(version_id, actor=_normalize_actor(user))
     except ValueError as exc:
-        raise HTTPException(
+        return _baseline_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=str(exc),
-        ) from exc
+            reason_code=_baseline_reason_code(str(exc)),
+        )
 
     _audit(
         request,
@@ -282,7 +341,11 @@ async def rollback_baseline_rollout(
     }
 
 
-@router.get("/api/admin/baseline/effective")
+@router.get(
+    "/api/admin/baseline/effective",
+    response_model=BaselineEffectiveResponseModel,
+    responses={status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": BaselineErrorResponseModel}},
+)
 async def get_effective_baseline(
     request: Request,
     tenant_id: str = Query(..., min_length=1),
@@ -291,13 +354,19 @@ async def get_effective_baseline(
     require_min_role(user, "owner")
     try:
         resolution = resolve_baseline_for_tenant(request, tenant_id)
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            detail=str(exc),
-        ) from exc
+    except HTTPException as exc:
+        detail = str(getattr(exc, "detail", "") or "")
+        if exc.status_code == status.HTTP_422_UNPROCESSABLE_CONTENT:
+            return _baseline_error_response(
+                status_code=exc.status_code,
+                detail=detail,
+                reason_code=_baseline_reason_code(detail),
+            )
+        raise
+    baseline = baseline_metadata_from_resolution(resolution)
     return {
-        **baseline_metadata_from_resolution(resolution),
+        **baseline,
+        "baseline": dict(baseline),
         "rollout": resolution.get("rollout") or {},
         "policy": resolution.get("policy") or {},
     }

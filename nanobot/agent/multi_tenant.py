@@ -10,6 +10,7 @@ ensuring each user has isolated:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -41,6 +42,7 @@ class _TenantRuntime:
     tenant_id: str
     config_mtime_ns: int
     baseline_version_id: str
+    baseline_fingerprint: str
     enable_exec: bool
     enable_web: bool
     agent: AgentLoop
@@ -74,6 +76,16 @@ def _parse_bool(value: Any) -> bool | None:
         if text in {"0", "false", "no", "off"}:
             return False
     return None
+
+
+def _baseline_fingerprint(
+    baseline_version_id: str,
+    platform_base_soul_content: str | None,
+) -> str:
+    version_id = str(baseline_version_id or "").strip()
+    content = str(platform_base_soul_content or "")
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"{version_id}:{content_hash}" if version_id else content_hash
 
 
 class MultiTenantAgentLoop:
@@ -511,11 +523,16 @@ class MultiTenantAgentLoop:
         except Exception:
             config_mtime_ns = 0
 
+        baseline_fingerprint = _baseline_fingerprint(
+            baseline_version_id=baseline_version_id,
+            platform_base_soul_content=platform_base_soul_content,
+        )
+
         existing = self._runtimes.get(tenant.tenant_id)
         if (
             existing
             and existing.config_mtime_ns == config_mtime_ns
-            and existing.baseline_version_id == baseline_version_id
+            and existing.baseline_fingerprint == baseline_fingerprint
             and existing.enable_exec == enable_exec
             and existing.enable_web == enable_web
         ):
@@ -579,6 +596,7 @@ class MultiTenantAgentLoop:
             tenant_id=tenant.tenant_id,
             config_mtime_ns=config_mtime_ns,
             baseline_version_id=baseline_version_id,
+            baseline_fingerprint=baseline_fingerprint,
             enable_exec=enable_exec,
             enable_web=enable_web,
             agent=agent,

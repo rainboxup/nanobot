@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import pytest
 
-
 _BASELINE_METADATA_KEYS = {
     "selected_version_id",
     "effective_version_id",
@@ -17,6 +16,28 @@ _BASELINE_METADATA_KEYS = {
 
 def _assert_baseline_metadata_contract(payload: dict[str, object]) -> None:
     assert _BASELINE_METADATA_KEYS.issubset(payload.keys())
+
+
+def _openapi_response_schema(
+    openapi: dict[str, object], path: str, method: str, status_code: str
+) -> dict[str, object]:
+    return (
+        (((((openapi.get("paths") or {}).get(path) or {}).get(method) or {}).get("responses") or {})
+         .get(status_code)
+         or {})
+        .get("content")
+        or {}
+    ).get("application/json", {}).get("schema") or {}
+
+
+def _resolve_openapi_schema(
+    openapi: dict[str, object], schema: dict[str, object]
+) -> dict[str, object]:
+    ref = str(schema.get("$ref") or "")
+    if not ref:
+        return schema
+    ref_name = ref.rsplit("/", 1)[-1]
+    return dict((((openapi.get("components") or {}).get("schemas") or {}).get(ref_name) or {}))
 
 
 @pytest.mark.integration
@@ -215,9 +236,97 @@ async def test_soul_and_tools_policy_include_baseline_metadata(
     assert tools_baseline == effective_baseline
 
 
+@pytest.mark.parametrize("initial_percent", [0, 35, 100])
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_baseline_effective_openapi_contract(http_client, auth_headers_for) -> None:
+async def test_baseline_rollout_defaults_control_and_percent(
+    http_client, auth_headers_for, initial_percent: int
+) -> None:
+    owner_headers = await auth_headers_for(
+        "baseline-owner-defaults", role="owner", tenant_id="baseline-owner-defaults"
+    )
+
+    versions_resp = await http_client.get("/api/admin/baseline/versions", headers=owner_headers)
+    assert versions_resp.status_code == 200
+    versions = list(versions_resp.json().get("versions") or [])
+    initial_version_id = str(versions[0].get("id") or "")
+    assert initial_version_id
+
+    created_v2 = await http_client.post(
+        "/api/admin/baseline/versions",
+        headers=owner_headers,
+        json={"label": "defaults-v2"},
+    )
+    assert created_v2.status_code == 201
+    version_v2 = str((created_v2.json().get("version") or {}).get("id") or "")
+    assert version_v2 and version_v2 != initial_version_id
+
+    initial_canary = await http_client.post(
+        "/api/admin/baseline/rollout",
+        headers=owner_headers,
+        json={
+            "strategy": "canary",
+            "candidate_version_id": version_v2,
+            "control_version_id": initial_version_id,
+            "canary_percent": initial_percent,
+        },
+    )
+    assert initial_canary.status_code == 200
+
+    created_v3 = await http_client.post(
+        "/api/admin/baseline/versions",
+        headers=owner_headers,
+        json={"label": "defaults-v3"},
+    )
+    assert created_v3.status_code == 201
+    version_v3 = str((created_v3.json().get("version") or {}).get("id") or "")
+    assert version_v3 and version_v3 not in {initial_version_id, version_v2}
+
+    inherited_canary = await http_client.post(
+        "/api/admin/baseline/rollout",
+        headers=owner_headers,
+        json={
+            "strategy": "canary",
+            "candidate_version_id": version_v3,
+        },
+    )
+    assert inherited_canary.status_code == 200
+    inherited_body = inherited_canary.json()
+    assert (inherited_body.get("rollout") or {}).get("control_version_id") == initial_version_id
+    assert (inherited_body.get("rollout") or {}).get("canary_percent") == initial_percent
+
+    all_rollout = await http_client.post(
+        "/api/admin/baseline/rollout",
+        headers=owner_headers,
+        json={
+            "strategy": "all",
+            "candidate_version_id": version_v3,
+            "control_version_id": initial_version_id,
+            "canary_percent": 1,
+        },
+    )
+    assert all_rollout.status_code == 200
+    all_body = all_rollout.json()
+    assert (all_body.get("rollout") or {}).get("control_version_id") == version_v3
+    assert (all_body.get("rollout") or {}).get("canary_percent") == 100
+
+    effective_after_all = await http_client.get(
+        "/api/admin/baseline/effective",
+        headers=owner_headers,
+        params={"tenant_id": "tenant-alpha"},
+    )
+    assert effective_after_all.status_code == 200
+    effective_all_body = effective_after_all.json()
+    assert effective_all_body.get("bucket") is None
+    assert effective_all_body.get("is_canary") is False
+    assert effective_all_body.get("selected_version_id") == version_v3
+    assert effective_all_body.get("candidate_version_id") == version_v3
+    assert effective_all_body.get("control_version_id") == version_v3
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_baseline_admin_openapi_contract(http_client, auth_headers_for) -> None:
     owner_headers = await auth_headers_for(
         "baseline-owner-openapi", role="owner", tenant_id="baseline-owner-openapi"
     )
@@ -226,15 +335,50 @@ async def test_baseline_effective_openapi_contract(http_client, auth_headers_for
     assert response.status_code == 200
     openapi = response.json()
 
-    operation = (
-        (((openapi.get("paths") or {}).get("/api/admin/baseline/effective") or {}).get("get")) or {}
+    schemas = dict((openapi.get("components") or {}).get("schemas") or {})
+    assert "BaselineVersionsResponseModel" in schemas
+    assert "BaselineVersionCreateResponseModel" in schemas
+    assert "BaselineRolloutMutationResponseModel" in schemas
+    assert "BaselineEffectiveResponseModel" in schemas
+    assert "BaselineErrorResponseModel" in schemas
+    assert "Baseline422ResponseModel" in schemas
+    assert "BaselineHTTPValidationError" in schemas
+
+    versions_schema = _openapi_response_schema(openapi, "/api/admin/baseline/versions", "get", "200")
+    assert str(versions_schema.get("$ref") or "").endswith("/BaselineVersionsResponseModel")
+
+    create_schema = _openapi_response_schema(openapi, "/api/admin/baseline/versions", "post", "201")
+    assert str(create_schema.get("$ref") or "").endswith("/BaselineVersionCreateResponseModel")
+
+    rollout_schema = _openapi_response_schema(openapi, "/api/admin/baseline/rollout", "post", "200")
+    assert str(rollout_schema.get("$ref") or "").endswith("/BaselineRolloutMutationResponseModel")
+
+    rollback_schema = _openapi_response_schema(openapi, "/api/admin/baseline/rollback", "post", "200")
+    assert str(rollback_schema.get("$ref") or "").endswith("/BaselineRolloutMutationResponseModel")
+
+    rollout_error_schema = _resolve_openapi_schema(
+        openapi,
+        _openapi_response_schema(openapi, "/api/admin/baseline/rollout", "post", "422"),
     )
-    schema = (
-        ((((operation.get("responses") or {}).get("200") or {}).get("content") or {})
-         .get("application/json") or {})
-        .get("schema")
-        or {}
+    rollout_error_refs = {
+        str(item.get("$ref") or "") for item in list(rollout_error_schema.get("oneOf") or [])
+    }
+    assert "#/components/schemas/BaselineErrorResponseModel" in rollout_error_refs
+    assert "#/components/schemas/BaselineHTTPValidationError" in rollout_error_refs
+    validation_schema = dict(schemas.get("BaselineHTTPValidationError") or {})
+    assert "detail" in list(validation_schema.get("required") or [])
+
+    rollback_error_schema = _resolve_openapi_schema(
+        openapi,
+        _openapi_response_schema(openapi, "/api/admin/baseline/rollback", "post", "422"),
     )
+    rollback_error_refs = {
+        str(item.get("$ref") or "") for item in list(rollback_error_schema.get("oneOf") or [])
+    }
+    assert "#/components/schemas/BaselineErrorResponseModel" in rollback_error_refs
+    assert "#/components/schemas/BaselineHTTPValidationError" in rollback_error_refs
+
+    schema = _openapi_response_schema(openapi, "/api/admin/baseline/effective", "get", "200")
     if "$ref" in schema:
         ref_name = str(schema["$ref"]).rsplit("/", 1)[-1]
         schema = (((openapi.get("components") or {}).get("schemas") or {}).get(ref_name) or {})
@@ -258,7 +402,7 @@ async def test_baseline_rollout_invalid_requests(http_client, auth_headers_for) 
         params={"tenant_id": "bad tenant"},
     )
     assert invalid_tenant.status_code == 422
-    assert invalid_tenant.json().get("detail") == "invalid tenant_id"
+    assert "invalid tenant_id" in str(invalid_tenant.json().get("detail") or "")
     assert invalid_tenant.json().get("reason_code") == "invalid_tenant_id"
 
     invalid_strategy = await http_client.post(
@@ -289,6 +433,20 @@ async def test_baseline_rollout_invalid_requests(http_client, auth_headers_for) 
     canary_detail = list(invalid_canary.json().get("detail") or [])
     assert any((err.get("loc") or [])[-1] == "canary_percent" for err in canary_detail)
 
+    missing_required = await http_client.post(
+        "/api/admin/baseline/rollout",
+        headers=owner_headers,
+        json={
+            "strategy": "canary",
+            "candidate_version_id": " ",
+            "control_version_id": " ",
+        },
+    )
+    assert missing_required.status_code == 422
+    assert "required" in str(missing_required.json().get("detail") or "")
+    assert "candidate_version_id" in str(missing_required.json().get("detail") or "")
+    assert missing_required.json().get("reason_code") == "baseline_rollout_required"
+
     versions_resp = await http_client.get("/api/admin/baseline/versions", headers=owner_headers)
     assert versions_resp.status_code == 200
     versions = list(versions_resp.json().get("versions") or [])
@@ -306,7 +464,8 @@ async def test_baseline_rollout_invalid_requests(http_client, auth_headers_for) 
         },
     )
     assert missing_candidate.status_code == 422
-    assert missing_candidate.json().get("detail") == "candidate_version_id not found"
+    assert "not found" in str(missing_candidate.json().get("detail") or "")
+    assert "candidate_version_id" in str(missing_candidate.json().get("detail") or "")
     assert missing_candidate.json().get("reason_code") == "baseline_version_not_found"
 
     missing_control = await http_client.post(
@@ -320,7 +479,8 @@ async def test_baseline_rollout_invalid_requests(http_client, auth_headers_for) 
         },
     )
     assert missing_control.status_code == 422
-    assert missing_control.json().get("detail") == "control_version_id not found"
+    assert "not found" in str(missing_control.json().get("detail") or "")
+    assert "control_version_id" in str(missing_control.json().get("detail") or "")
     assert missing_control.json().get("reason_code") == "baseline_version_not_found"
 
     missing_version = await http_client.post(
@@ -329,5 +489,16 @@ async def test_baseline_rollout_invalid_requests(http_client, auth_headers_for) 
         json={"version_id": "v-missing"},
     )
     assert missing_version.status_code == 422
-    assert missing_version.json().get("detail") == "version_id not found"
+    assert "not found" in str(missing_version.json().get("detail") or "")
+    assert "version_id" in str(missing_version.json().get("detail") or "")
     assert missing_version.json().get("reason_code") == "baseline_version_not_found"
+
+    required_version = await http_client.post(
+        "/api/admin/baseline/rollback",
+        headers=owner_headers,
+        json={"version_id": " "},
+    )
+    assert required_version.status_code == 422
+    assert "required" in str(required_version.json().get("detail") or "")
+    assert "version_id" in str(required_version.json().get("detail") or "")
+    assert required_version.json().get("reason_code") == "baseline_rollout_required"

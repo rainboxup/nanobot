@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from nanobot.services.soul_layering import SoulLayeringService
@@ -39,6 +40,11 @@ class SoulUpdateRequest(BaseModel):
 class SoulPreviewRequest(BaseModel):
     overlay: str | None = Field(default=None)
     workspace_content: str | None = Field(default=None)
+
+
+class SoulReadErrorResponseModel(BaseModel):
+    detail: str
+    reason_code: str | None = None
 
 
 def _runtime_mode(request: Request) -> str:
@@ -83,6 +89,46 @@ def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL
         )
+
+
+def _read_error_response(*, status_code: int, detail: str, reason_code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": str(detail or ""),
+            "reason_code": str(reason_code or "").strip() or None,
+        },
+    )
+
+
+def _read_error_response_schema(
+    *,
+    include_validation_error: bool = False,
+    description: str = "Business-rule error",
+) -> dict[str, Any]:
+    if include_validation_error:
+        # Keep 422 schema explicit without combining with `model`, to avoid
+        # ambiguous OpenAPI branches.
+        return {
+            "description": description,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/SoulReadErrorResponseModel"},
+                            {"$ref": "#/components/schemas/HTTPValidationError"},
+                        ]
+                    }
+                }
+            },
+        }
+    return {
+        "description": description,
+        "model": SoulReadErrorResponseModel,
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/SoulReadErrorResponseModel"}}
+        },
+    }
 
 
 def _platform_base_soul_path(request: Request) -> Path | None:
@@ -242,7 +288,16 @@ async def get_soul(
     return _attach_runtime_meta(request, payload)
 
 
-@router.put("/api/soul")
+@router.put(
+    "/api/soul",
+    responses={
+        status.HTTP_400_BAD_REQUEST: _read_error_response_schema(),
+        status.HTTP_422_UNPROCESSABLE_CONTENT: _read_error_response_schema(
+            include_validation_error=True,
+            description="Validation or business-rule error",
+        ),
+    },
+)
 async def update_soul(
     payload: SoulUpdateRequest,
     request: Request,
@@ -256,18 +311,20 @@ async def update_soul(
     workspace_file = _workspace_soul_file(workspace)
     content = str(payload.content or "")
     if len(content) > _MAX_SOUL_CHARS:
-        raise HTTPException(
+        return _read_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Soul content too large",
+            reason_code="soul_content_too_large",
         )
     try:
         _write_text(workspace_file, content)
     except ValueError as e:
         if str(e) == "soul_file_symlink":
-            raise HTTPException(
+            return _read_error_response(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Soul file must not be a symlink",
-            ) from e
+                reason_code="soul_file_symlink",
+            )
         raise
     _audit(
         request,
@@ -279,7 +336,16 @@ async def update_soul(
     return await get_soul(request, user)
 
 
-@router.post("/api/soul/preview")
+@router.post(
+    "/api/soul/preview",
+    responses={
+        status.HTTP_400_BAD_REQUEST: _read_error_response_schema(),
+        status.HTTP_422_UNPROCESSABLE_CONTENT: _read_error_response_schema(
+            include_validation_error=True,
+            description="Validation or business-rule error",
+        ),
+    },
+)
 async def preview_soul(
     payload: SoulPreviewRequest,
     request: Request,
@@ -291,24 +357,27 @@ async def preview_soul(
     baseline_resolution = resolve_baseline_for_tenant(request, tenant_id)
     overlay = str(payload.overlay) if payload.overlay is not None else None
     if overlay is not None and len(overlay) > _MAX_SOUL_CHARS:
-        raise HTTPException(
+        return _read_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Soul overlay too large",
+            reason_code="soul_overlay_too_large",
         )
     draft_workspace = (
         str(payload.workspace_content) if payload.workspace_content is not None else None
     )
     if draft_workspace is not None and len(draft_workspace) > _MAX_SOUL_CHARS:
-        raise HTTPException(
+        return _read_error_response(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Soul workspace content too large",
+            reason_code="soul_workspace_content_too_large",
         )
     if draft_workspace is None:
         workspace_file = _workspace_soul_file(workspace)
         if workspace_file.is_symlink():
-            raise HTTPException(
+            return _read_error_response(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Soul file must not be a symlink",
+                reason_code="soul_file_symlink",
             )
     preview = _effective_payload(
         request=request,

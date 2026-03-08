@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nanobot.agent.skills import SkillsLoader
@@ -166,6 +167,11 @@ class SkillInstallResponseModel(BaseModel):
     install_source: str | None = None
 
 
+class ReadErrorResponseModel(BaseModel):
+    detail: str
+    reason_code: str | None = None
+
+
 def _tenant_skills_loader(
     request: Request, user: dict[str, Any]
 ) -> tuple[SkillsLoader, str, Any, Any, Path]:
@@ -226,6 +232,104 @@ def _api_error_detail(
     if details:
         payload["details"] = details
     return payload
+
+
+def _read_error_response(*, status_code: int, detail: str, reason_code: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": str(detail or ""),
+            "reason_code": str(reason_code or "").strip() or None,
+        },
+    )
+
+
+def _read_error_response_schema(
+    *,
+    include_validation_error: bool = False,
+    description: str = "Business-rule error",
+) -> dict[str, Any]:
+    if include_validation_error:
+        # Avoid mixing `model` with explicit `oneOf` schemas on 422 responses,
+        # which can lead to ambiguous OpenAPI generation.
+        return {
+            "description": description,
+            "content": {
+                "application/json": {
+                    "schema": {
+                        "oneOf": [
+                            {"$ref": "#/components/schemas/ReadErrorResponseModel"},
+                            {"$ref": "#/components/schemas/HTTPValidationError"},
+                        ]
+                    }
+                }
+            },
+        }
+    return {
+        "description": description,
+        "model": ReadErrorResponseModel,
+        "content": {
+            "application/json": {"schema": {"$ref": "#/components/schemas/ReadErrorResponseModel"}}
+        },
+    }
+
+
+def _read_business_http_exception(*, status_code: int, detail: str, reason_code: str) -> HTTPException:
+    normalized_reason_code = str(reason_code or "").strip()
+    payload: dict[str, Any] = {"detail": str(detail or "")}
+    if normalized_reason_code:
+        payload["reason_code"] = normalized_reason_code
+    return HTTPException(
+        status_code=status_code,
+        detail=payload,
+    )
+
+
+def _read_error_reason_code(status_code: int, detail: Any) -> str | None:
+    message = str(detail or "").strip()
+    if not message:
+        return None
+    if (
+        status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+        and message == "source must be one of: local, clawhub, all"
+    ):
+        return "invalid_catalog_source"
+    if (
+        status_code == status.HTTP_422_UNPROCESSABLE_CONTENT
+        and message == "cursor is only supported when source=clawhub"
+    ):
+        return "catalog_cursor_requires_clawhub_source"
+    if status_code == status.HTTP_422_UNPROCESSABLE_CONTENT and message == "Invalid cursor":
+        return "invalid_catalog_cursor"
+    if status_code == status.HTTP_422_UNPROCESSABLE_CONTENT and message == "Invalid skill name":
+        return "invalid_skill_name"
+    if status_code == status.HTTP_404_NOT_FOUND and message == "Skill not found":
+        return "skill_not_found"
+    return None
+
+
+def _compat_read_error_response(exc: HTTPException) -> JSONResponse | None:
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict):
+        reason_code = str(detail.get("reason_code") or "").strip()
+        if not reason_code:
+            return None
+        detail_text = str(detail.get("detail") or detail.get("message") or "")
+        return _read_error_response(
+            status_code=int(exc.status_code),
+            detail=detail_text,
+            reason_code=reason_code,
+        )
+    reason_code = ""
+    if not reason_code:
+        reason_code = _read_error_reason_code(int(exc.status_code), detail)
+    if reason_code is None:
+        return None
+    return _read_error_response(
+        status_code=int(exc.status_code),
+        detail=str(detail or ""),
+        reason_code=reason_code,
+    )
 
 
 def _service_http_exception(exc: Any) -> HTTPException:
@@ -401,9 +505,10 @@ def get_clawhub_client(request: Request) -> ClawHubClient:
 def _normalize_catalog_source(source: str | None) -> str:
     value = str(source or "all").strip().lower()
     if value not in _CATALOG_SOURCES:
-        raise HTTPException(
+        raise _read_business_http_exception(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="source must be one of: local, clawhub, all",
+            reason_code="invalid_catalog_source",
         )
     return value
 
@@ -451,27 +556,30 @@ def _decode_catalog_cursor(cursor: str | None) -> tuple[str | None, int]:
 
     encoded = token[len(_CATALOG_CURSOR_PREFIX) :]
     if not encoded:
-        raise HTTPException(
+        raise _read_business_http_exception(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid cursor",
+            reason_code="invalid_catalog_cursor",
         )
     padding = "=" * ((4 - len(encoded) % 4) % 4)
     try:
         decoded = base64.urlsafe_b64decode(encoded + padding).decode("utf-8")
         payload = json.loads(decoded)
     except Exception as exc:
-        raise HTTPException(
+        raise _read_business_http_exception(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid cursor",
+            reason_code="invalid_catalog_cursor",
         ) from exc
 
     remote_cursor = str(payload.get("remote_cursor") or "").strip() or None
     try:
         offset = max(0, int(payload.get("offset") or 0))
     except Exception as exc:
-        raise HTTPException(
+        raise _read_business_http_exception(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Invalid cursor",
+            reason_code="invalid_catalog_cursor",
         ) from exc
     return remote_cursor, offset
 
@@ -696,9 +804,10 @@ async def _build_catalog_response(
     normalized_limit = max(1, min(int(limit), 500))
     normalized_cursor = str(cursor or "").strip() or None
     if source_mode == "all" and normalized_cursor:
-        raise HTTPException(
+        raise _read_business_http_exception(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="cursor is only supported when source=clawhub",
+            reason_code="catalog_cursor_requires_clawhub_source",
         )
 
     local_items: list[dict[str, Any]] = []
@@ -803,6 +912,12 @@ async def list_skills(
     "/api/skills/catalog",
     response_model=list[SkillCatalogItemModel],
     response_model_exclude_none=True,
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: _read_error_response_schema(
+            include_validation_error=True,
+            description="Validation or business-rule error",
+        )
+    },
 )
 async def list_installable_skills(
     request: Request,
@@ -814,15 +929,21 @@ async def list_installable_skills(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> list[dict[str, Any]]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
-    payload = await _build_catalog_response(
-        request=request,
-        loader=loader,
-        source=source,
-        query=q,
-        limit=limit,
-        cursor=cursor,
-        include_store_metadata=include_store_metadata,
-    )
+    try:
+        payload = await _build_catalog_response(
+            request=request,
+            loader=loader,
+            source=source,
+            query=q,
+            limit=limit,
+            cursor=cursor,
+            include_store_metadata=include_store_metadata,
+        )
+    except HTTPException as exc:
+        compat = _compat_read_error_response(exc)
+        if compat is not None:
+            return compat
+        raise
     return list(payload.get("items") or [])
 
 
@@ -830,6 +951,12 @@ async def list_installable_skills(
     "/api/skills/catalog/v2",
     response_model=SkillCatalogV2ResponseModel,
     response_model_exclude_none=True,
+    responses={
+        status.HTTP_422_UNPROCESSABLE_CONTENT: _read_error_response_schema(
+            include_validation_error=True,
+            description="Validation or business-rule error",
+        )
+    },
 )
 async def list_installable_skills_v2(
     request: Request,
@@ -841,15 +968,21 @@ async def list_installable_skills_v2(
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
     loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
-    return await _build_catalog_response(
-        request=request,
-        loader=loader,
-        source=source,
-        query=q,
-        limit=limit,
-        cursor=cursor,
-        include_store_metadata=include_store_metadata,
-    )
+    try:
+        return await _build_catalog_response(
+            request=request,
+            loader=loader,
+            source=source,
+            query=q,
+            limit=limit,
+            cursor=cursor,
+            include_store_metadata=include_store_metadata,
+        )
+    except HTTPException as exc:
+        compat = _compat_read_error_response(exc)
+        if compat is not None:
+            return compat
+        raise
 
 
 @router.post(
@@ -1059,57 +1192,75 @@ async def uninstall_mcp_server(
     "/api/skills/{name}",
     response_model=SkillDetailModel,
     response_model_exclude_none=True,
+    responses={
+        status.HTTP_404_NOT_FOUND: _read_error_response_schema(),
+        status.HTTP_422_UNPROCESSABLE_CONTENT: _read_error_response_schema(
+            description="Business-rule error",
+        ),
+    },
 )
 async def get_skill(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
-    skill_name = str(name or "").strip()
-    install_service = WorkspaceSkillInstallService(
-        skill_store_dir=_resolve_skill_store_dir(request),
-    )
     try:
-        skill_name = install_service.validate_skill_name(skill_name)
-    except WorkspaceSkillInstallError:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail="Invalid skill name"
+        skill_name = str(name or "").strip()
+        install_service = WorkspaceSkillInstallService(
+            skill_store_dir=_resolve_skill_store_dir(request),
         )
+        try:
+            skill_name = install_service.validate_skill_name(skill_name)
+        except WorkspaceSkillInstallError:
+            raise _read_business_http_exception(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Invalid skill name",
+                reason_code="invalid_skill_name",
+            )
 
-    loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
-    content = loader.load_skill(skill_name)
-    source = None
-    meta = loader.get_skill_metadata(skill_name) or {}
-    if content is None:
-        local_source = install_service.resolve_local_source(name=skill_name)
-        if local_source is not None:
-            skill_file = local_source.path / "SKILL.md"
-            content = _read_skill_content(skill_file)
-            if content is not None:
-                source = local_source.source
-                meta = _parse_skill_frontmatter(content)
-    if content is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Skill not found")
+        loader, _tenant_id, _store, _cfg, _workspace = _tenant_skills_loader(request, user)
+        content = loader.load_skill(skill_name)
+        source = None
+        meta = loader.get_skill_metadata(skill_name) or {}
+        if content is None:
+            local_source = install_service.resolve_local_source(name=skill_name)
+            if local_source is not None:
+                skill_file = local_source.path / "SKILL.md"
+                content = _read_skill_content(skill_file)
+                if content is not None:
+                    source = local_source.source
+                    meta = _parse_skill_frontmatter(content)
+        if content is None:
+            raise _read_business_http_exception(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Skill not found",
+                reason_code="skill_not_found",
+            )
 
-    if source is None:
-        for s in loader.list_skills(filter_unavailable=False):
-            if s.get("name") == skill_name:
-                source = s.get("source")
-                break
+        if source is None:
+            for s in loader.list_skills(filter_unavailable=False):
+                if s.get("name") == skill_name:
+                    source = s.get("source")
+                    break
 
-    origin_source = _normalize_origin_skill_source(source)
-    runtime_source = _normalize_runtime_skill_source(origin_source)
-    payload = {
-        "name": skill_name,
-        "source": runtime_source,
-        "origin_source": origin_source,
-        "path": _skill_path_label(runtime_source, skill_name),
-        "description": meta.get("description"),
-        "content": content,
-        "metadata": meta,
-        "install_source": "clawhub" if origin_source == "clawhub" else "local",
-    }
-    store_metadata = _store_metadata_for_skill(
-        install_service, name=skill_name, source=runtime_source
-    )
-    if store_metadata is not None:
-        payload["store_metadata"] = store_metadata
-    return payload
+        origin_source = _normalize_origin_skill_source(source)
+        runtime_source = _normalize_runtime_skill_source(origin_source)
+        payload = {
+            "name": skill_name,
+            "source": runtime_source,
+            "origin_source": origin_source,
+            "path": _skill_path_label(runtime_source, skill_name),
+            "description": meta.get("description"),
+            "content": content,
+            "metadata": meta,
+            "install_source": "clawhub" if origin_source == "clawhub" else "local",
+        }
+        store_metadata = _store_metadata_for_skill(
+            install_service, name=skill_name, source=runtime_source
+        )
+        if store_metadata is not None:
+            payload["store_metadata"] = store_metadata
+        return payload
+    except HTTPException as exc:
+        compat = _compat_read_error_response(exc)
+        if compat is not None:
+            return compat
+        raise

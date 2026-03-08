@@ -10,7 +10,6 @@ ensuring each user has isolated:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import time
 from dataclasses import dataclass
@@ -25,7 +24,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
-from nanobot.services.baseline_rollout import BaselineRolloutService
+from nanobot.services.baseline_rollout import BaselineRolloutService, compute_baseline_fingerprint
 from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
 from nanobot.session.manager import SessionManager
@@ -41,8 +40,7 @@ from nanobot.utils.whitelist import parse_str_list, to_set
 class _TenantRuntime:
     tenant_id: str
     config_mtime_ns: int
-    baseline_version_id: str
-    baseline_fingerprint: str
+    baseline_signature: str
     enable_exec: bool
     enable_web: bool
     agent: AgentLoop
@@ -78,14 +76,21 @@ def _parse_bool(value: Any) -> bool | None:
     return None
 
 
-def _baseline_fingerprint(
-    baseline_version_id: str,
-    platform_base_soul_content: str | None,
+def _resolve_baseline_signature(
+    baseline_signature: str | None,
+    *,
+    baseline_version_id: str | None = None,
+    baseline_policy: dict[str, Any] | None = None,
+    platform_base_soul_content: str | None = None,
 ) -> str:
-    version_id = str(baseline_version_id or "").strip()
-    content = str(platform_base_soul_content or "")
-    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    return f"{version_id}:{content_hash}" if version_id else content_hash
+    local_fingerprint = compute_baseline_fingerprint(
+        version_id=baseline_version_id,
+        platform_base_soul=platform_base_soul_content,
+        policy=baseline_policy,
+    )
+    if local_fingerprint:
+        return local_fingerprint
+    return str(baseline_signature or "").strip()
 
 
 class MultiTenantAgentLoop:
@@ -385,7 +390,9 @@ class MultiTenantAgentLoop:
         runtime = self._get_or_create_runtime(
             tenant,
             tenant_cfg,
+            baseline_signature=str(baseline_resolution.get("baseline_signature") or ""),
             baseline_version_id=str(baseline_resolution.get("version_id") or ""),
+            baseline_policy=baseline_resolution.get("policy") if isinstance(baseline_resolution.get("policy"), dict) else None,
             platform_base_soul_content=str(baseline_resolution.get("platform_base_soul") or ""),
             system_exec_enabled=system_exec_enabled,
             enable_exec=enable_exec,
@@ -511,7 +518,9 @@ class MultiTenantAgentLoop:
         tenant: TenantContext,
         tenant_cfg: Config,
         *,
+        baseline_signature: str = "",
         baseline_version_id: str = "",
+        baseline_policy: dict[str, Any] | None = None,
         platform_base_soul_content: str | None = None,
         system_exec_enabled: bool | None = None,
         enable_exec: bool,
@@ -523,8 +532,10 @@ class MultiTenantAgentLoop:
         except Exception:
             config_mtime_ns = 0
 
-        baseline_fingerprint = _baseline_fingerprint(
+        resolved_baseline_signature = _resolve_baseline_signature(
+            baseline_signature,
             baseline_version_id=baseline_version_id,
+            baseline_policy=baseline_policy,
             platform_base_soul_content=platform_base_soul_content,
         )
 
@@ -532,7 +543,7 @@ class MultiTenantAgentLoop:
         if (
             existing
             and existing.config_mtime_ns == config_mtime_ns
-            and existing.baseline_fingerprint == baseline_fingerprint
+            and existing.baseline_signature == resolved_baseline_signature
             and existing.enable_exec == enable_exec
             and existing.enable_web == enable_web
         ):
@@ -595,8 +606,7 @@ class MultiTenantAgentLoop:
         rt = _TenantRuntime(
             tenant_id=tenant.tenant_id,
             config_mtime_ns=config_mtime_ns,
-            baseline_version_id=baseline_version_id,
-            baseline_fingerprint=baseline_fingerprint,
+            baseline_signature=resolved_baseline_signature,
             enable_exec=enable_exec,
             enable_web=enable_web,
             agent=agent,

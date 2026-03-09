@@ -710,6 +710,62 @@ class TenantStore:
 
             return {"code": code, **raw}
 
+    def get_active_binding_challenge(
+        self,
+        account_id: str,
+        tenant_id: str,
+        channel: str,
+    ) -> dict[str, Any] | None:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return None
+        tenant_id = validate_tenant_id(tenant_id)
+        normalized_channel = str(channel or "").strip().lower()
+        if not normalized_channel:
+            return None
+
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            now = _utc_now()
+            active: dict[str, Any] | None = None
+            dirty = False
+
+            for code, raw in list(challenges.items()):
+                if not isinstance(raw, dict):
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                try:
+                    expires_at = _dt_from_iso(str(raw.get("expires_at") or ""))
+                except Exception:
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                status = str(raw.get("status") or "")
+                if now >= expires_at or status == "consumed":
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                if (
+                    str(raw.get("account_id") or "") == normalized_account
+                    and str(raw.get("tenant_id") or "") == tenant_id
+                    and str(raw.get("channel") or "") == normalized_channel
+                ):
+                    candidate = {"code": code, **raw}
+                    if active is None or str(candidate.get("created_at") or "") > str(
+                        active.get("created_at") or ""
+                    ):
+                        active = candidate
+
+            if dirty:
+                self._save(data)
+
+            return active
+
     def verify_binding_challenge(
         self,
         code: str,

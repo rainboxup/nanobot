@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 import pytest
 
@@ -526,6 +527,209 @@ async def test_account_binding_attach_and_detach_identities_for_current_account(
     detach_body = detach.json()
     assert detach_body["identities"] == []
     assert web_ctx.tenant_store.resolve_tenant("feishu", "feishu-user-1") == "tenant-account"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_roundtrip_requires_verification_before_confirm(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof",
+        role="member",
+        tenant_id="tenant-proof",
+    )
+    web_ctx.tenant_store.link_identity("tenant-proof", "feishu", "user-1")
+
+    binding_before = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_before.status_code == 200
+    assert binding_before.json()["account_id"] == "alice-proof"
+    assert binding_before.json()["active_challenge"] is None
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    created_body = created.json()
+    assert created_body["proof_of_possession_supported"] is True
+    assert created_body["active_challenge"]["status"] == "pending"
+    code = created_body["active_challenge"]["code"]
+
+    confirm_before = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm_before.status_code == 409
+    assert confirm_before.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_verified"
+
+    web_ctx.tenant_store.verify_binding_challenge(code, "feishu", "user-1")
+
+    binding_verified = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_verified.status_code == 200
+    assert binding_verified.json()["active_challenge"]["status"] == "verified"
+    assert binding_verified.json()["active_challenge"]["verified_identity"] == "feishu:user-1"
+
+    confirm_after = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm_after.status_code == 200
+    assert confirm_after.json()["identities"] == ["feishu:user-1"]
+    assert confirm_after.json()["active_challenge"] is None
+
+    detach = await http_client.post(
+        "/api/channels/feishu/binding/detach",
+        headers=member_headers,
+        json={"sender_id": "user-1"},
+    )
+    assert detach.status_code == 200
+    assert detach.json()["identities"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_confirm_rejects_mismatch_and_missing_cases(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    alice_headers = await auth_headers_for(
+        "alice-proof-mismatch",
+        role="member",
+        tenant_id="tenant-proof-mismatch",
+    )
+    bob_headers = await auth_headers_for(
+        "bob-proof-mismatch",
+        role="member",
+        tenant_id="tenant-proof-mismatch",
+    )
+
+    web_ctx.tenant_store.link_identity("tenant-proof-mismatch", "feishu", "user-1")
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=alice_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    code = created.json()["active_challenge"]["code"]
+
+    wrong_account = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=bob_headers,
+        json={"code": code},
+    )
+    assert wrong_account.status_code == 409
+    assert wrong_account.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_mismatch"
+
+    wrong_channel = await http_client.post(
+        "/api/channels/dingtalk/binding/confirm",
+        headers=alice_headers,
+        json={"code": code},
+    )
+    assert wrong_channel.status_code == 409
+    assert wrong_channel.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_channel_mismatch"
+
+    missing = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=alice_headers,
+        json={"code": "BADCODE"},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_found"
+
+    expired = web_ctx.tenant_store.create_binding_challenge(
+        account_id="alice-proof-mismatch",
+        tenant_id="tenant-proof-mismatch",
+        channel="feishu",
+        ttl_s=0,
+    )
+    expired_confirm = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=alice_headers,
+        json={"code": expired["code"]},
+    )
+    assert expired_confirm.status_code == 404
+    assert expired_confirm.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_found"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_confirm_conflict_preserves_verified_challenge(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof-conflict",
+        role="member",
+        tenant_id="tenant-proof-conflict",
+    )
+    web_ctx.tenant_store.link_identity("tenant-proof-conflict", "feishu", "user-1")
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    code = created.json()["active_challenge"]["code"]
+
+    web_ctx.tenant_store.verify_binding_challenge(code, "feishu", "user-1")
+    web_ctx.tenant_store.attach_account_identity(
+        "other-account",
+        "tenant-proof-conflict",
+        "feishu",
+        "user-1",
+    )
+
+    confirm = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm.status_code == 409
+    assert confirm.json()["detail"]["reason_code"] == "identity_bound_to_other_account"
+
+    binding_after = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_after.status_code == 200
+    assert binding_after.json()["active_challenge"]["status"] == "verified"
+    assert binding_after.json()["active_challenge"]["verified_identity"] == "feishu:user-1"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_creation_clamps_ttl(http_client, auth_headers_for, web_ctx) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof-ttl",
+        role="member",
+        tenant_id="tenant-proof-ttl",
+    )
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={"ttl_s": 999999},
+    )
+    assert created.status_code == 201
+
+    challenge = web_ctx.tenant_store.get_active_binding_challenge(
+        "alice-proof-ttl",
+        "tenant-proof-ttl",
+        "feishu",
+    )
+    assert challenge is not None
+    created_at = datetime.fromisoformat(challenge["created_at"])
+    expires_at = datetime.fromisoformat(challenge["expires_at"])
+    assert (expires_at - created_at).total_seconds() == 300
 
 
 @pytest.mark.integration

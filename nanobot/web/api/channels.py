@@ -110,6 +110,18 @@ class AccountBindingUpdate(BaseModel):
     sender_id: str
 
 
+class AccountBindingChallengeCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_s: int | None = None
+
+
+class AccountBindingChallengeConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+
+
 def _api_error_detail(
     reason_code: str,
     message: str,
@@ -397,6 +409,41 @@ def _current_account_id(user: dict[str, Any]) -> str:
     return str(user.get("sub") or user.get("username") or "").strip().lower()
 
 
+def _workspace_binding_challenge_payload(challenge: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(challenge, dict):
+        return None
+    code = str(challenge.get("code") or "").strip().upper()
+    status_value = str(challenge.get("status") or "pending")
+    payload = {
+        "code": code,
+        "status": status_value,
+        "expires_at": challenge.get("expires_at"),
+        "verified_identity": challenge.get("verified_identity"),
+        "verification_command": f"!prove {code}" if code else None,
+    }
+    return payload
+
+
+def _workspace_account_binding_conflict(reason_code: str) -> HTTPException:
+    message = (
+        "This identity is already bound to another workspace."
+        if reason_code == "identity_bound_to_other_tenant"
+        else (
+            "This identity is not linked to the current workspace yet. Use the compatibility binding flow first."
+            if reason_code == "identity_not_linked_to_workspace"
+            else (
+                "This identity is already claimed by another account in the workspace."
+                if reason_code == "identity_bound_to_other_account"
+                else "This account is already bound to another workspace."
+            )
+        )
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=_api_error_detail(reason_code, message),
+    )
+
+
 def _workspace_account_binding_payload(
     request: Request,
     *,
@@ -407,6 +454,7 @@ def _workspace_account_binding_payload(
     store = getattr(request.app.state, "tenant_store", None)
     account_id = _current_account_id(user)
     identities: list[str] = []
+    active_challenge: dict[str, Any] | None = None
     if store is not None and account_id:
         list_identities = getattr(store, "list_account_identities", None)
         if callable(list_identities):
@@ -414,6 +462,14 @@ def _workspace_account_binding_payload(
                 identities = list_identities(account_id, channel=channel_name)
             except Exception:
                 identities = []
+        get_active_challenge = getattr(store, "get_active_binding_challenge", None)
+        if callable(get_active_challenge):
+            try:
+                active_challenge = _workspace_binding_challenge_payload(
+                    get_active_challenge(account_id, tenant_id, channel_name)
+                )
+            except Exception:
+                active_challenge = None
     payload = {
         "name": channel_name,
         "channel": channel_name,
@@ -422,6 +478,8 @@ def _workspace_account_binding_payload(
         "identities": identities,
         "binding_supported": True,
         "legacy_link_supported": True,
+        "proof_of_possession_supported": True,
+        "active_challenge": active_challenge,
     }
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
@@ -973,9 +1031,150 @@ async def get_channel_binding_instructions(
 async def get_channel_account_binding(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "member")
     channel_name = _ensure_workspace_channel(name)
     tenant_id, _store, _tenant_cfg = load_tenant_config(request, user)
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/challenges", status_code=status.HTTP_201_CREATED)
+async def create_channel_account_binding_challenge(
+    name: str,
+    payload: AccountBindingChallengeCreateRequest | None,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    ttl_s = 300 if payload is None or payload.ttl_s is None else min(300, max(1, int(payload.ttl_s)))
+    store.create_binding_challenge(
+        account_id=account_id,
+        tenant_id=tenant_id,
+        channel=channel_name,
+        ttl_s=ttl_s,
+    )
+    _audit(
+        request,
+        event="config.channel.binding.challenge.create",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/confirm")
+async def confirm_channel_account_binding(
+    name: str,
+    payload: AccountBindingChallengeConfirmRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    code = str(payload.code or "").strip().upper()
+    if not code:
+        raise _unprocessable_entity(
+            "workspace_account_binding_challenge_invalid",
+            "code is required",
+        )
+
+    challenge = store.get_binding_challenge(code)
+    if challenge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_not_found",
+                "The specified binding challenge was not found or has expired.",
+            ),
+        )
+    if str(challenge.get("account_id") or "") != account_id or str(challenge.get("tenant_id") or "") != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_mismatch",
+                "This binding challenge does not belong to the current account.",
+            ),
+        )
+    if str(challenge.get("channel") or "") != channel_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_channel_mismatch",
+                "This binding challenge belongs to a different channel.",
+            ),
+        )
+    if str(challenge.get("status") or "") != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_not_verified",
+                "This binding challenge has not been verified yet.",
+            ),
+        )
+
+    verified_identity = str(challenge.get("verified_identity") or "")
+    verified_channel, _, sender_id = verified_identity.partition(":")
+    if not sender_id or verified_channel != channel_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_invalid_identity",
+                "The verified identity for this challenge is invalid.",
+            ),
+        )
+
+    try:
+        store.attach_account_identity(account_id, tenant_id, channel_name, sender_id)
+        store.consume_binding_challenge(code, account_id=account_id, tenant_id=tenant_id)
+    except ValueError as exc:
+        reason_code = str(exc) or "workspace_account_binding_invalid"
+        if reason_code in {
+            "identity_bound_to_other_tenant",
+            "identity_not_linked_to_workspace",
+            "identity_bound_to_other_account",
+            "account_bound_to_other_tenant",
+        }:
+            raise _workspace_account_binding_conflict(reason_code) from exc
+        if reason_code in {
+            "binding_challenge_not_found",
+            "binding_challenge_expired",
+            "binding_challenge_not_verified",
+            "binding_challenge_owned_by_other_account",
+            "binding_challenge_bound_to_other_tenant",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_api_error_detail(
+                    "workspace_account_binding_challenge_invalid",
+                    "The binding challenge can no longer be confirmed.",
+                ),
+            ) from exc
+        raise _unprocessable_entity(reason_code, "Account binding update is invalid.") from exc
+
+    _audit(
+        request,
+        event="config.channel.binding.confirm",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
     return _workspace_account_binding_payload(
         request,
         user=user,
@@ -1012,26 +1211,7 @@ async def attach_channel_account_binding(
             "identity_bound_to_other_account",
             "account_bound_to_other_tenant",
         }:
-            message = (
-                "This identity is already bound to another workspace."
-                if reason_code == "identity_bound_to_other_tenant"
-                else (
-                    "This identity is not linked to the current workspace yet. Use the compatibility binding flow first."
-                    if reason_code == "identity_not_linked_to_workspace"
-                    else (
-                        "This identity is already claimed by another account in the workspace."
-                        if reason_code == "identity_bound_to_other_account"
-                        else "This account is already bound to another workspace."
-                    )
-                )
-            )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=_api_error_detail(
-                    reason_code,
-                    message,
-                ),
-            ) from exc
+            raise _workspace_account_binding_conflict(reason_code) from exc
         raise _unprocessable_entity(reason_code, "Account binding update is invalid.") from exc
 
     _audit(
@@ -1057,7 +1237,7 @@ async def detach_channel_account_binding(
     request: Request,
     user: dict[str, Any] = Depends(get_current_user),
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "member")
     channel_name = _ensure_workspace_channel(name)
     tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
     account_id = _current_account_id(user)

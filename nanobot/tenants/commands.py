@@ -178,6 +178,20 @@ def _skills_install_error_reply(*, name: str, exc: WorkspaceSkillInstallError) -
     return f"❌ 安装技能失败：{name}（{reason or 'unknown'}）"
 
 
+def _binding_challenge_error_reply(reason: str) -> str:
+    if reason in {"binding_challenge_not_found", "binding_challenge_expired"}:
+        return "❌ 验证码无效或已过期。请返回 Dashboard 重新发起验证。"
+    if reason == "binding_challenge_channel_mismatch":
+        return "⚠️ 这个验证码需要在对应渠道里验证，请回到发起验证的渠道重试。"
+    if reason == "identity_not_linked_to_workspace":
+        return "⚠️ 当前身份尚未进入该 workspace，请先在该渠道私聊机器人一次后再重试。"
+    if reason == "identity_bound_to_other_tenant":
+        return "⚠️ 当前身份已属于其他 workspace，无法为当前账号完成验证。"
+    if reason == "binding_challenge_not_pending":
+        return "⚠️ 这个验证码已经处理过，请返回 Dashboard 刷新状态。"
+    return "❌ 验证失败，请返回 Dashboard 刷新后重试。"
+
+
 def _link_guard_key(channel: str, sender_id: str) -> str:
     return f"{channel}:{sender_id}"
 
@@ -331,6 +345,29 @@ def try_handle(
                 f"当前身份已绑定到 tenant_id: {target.tenant_id}\n"
                 "提示：绑定后会共享记忆与技能（会话历史按身份隔离）。"
             ),
+        )
+
+    if cmd == "prove":
+        if _is_group(metadata):
+            return CommandResult(
+                handled=True,
+                reply="⚠️ 为了安全，请在私聊/DM 中使用 !prove（避免在群里泄露验证码）。",
+            )
+        if not args:
+            return CommandResult(handled=True, reply="用法：!prove <CODE>")
+
+        code = args[0].strip().upper()
+        try:
+            store.verify_binding_challenge(code, channel, sender_id)
+        except ValueError as exc:
+            return CommandResult(
+                handled=True,
+                reply=_binding_challenge_error_reply(str(exc)),
+            )
+
+        return CommandResult(
+            handled=True,
+            reply="✅ 验证已完成，请返回 Dashboard 确认绑定。",
         )
 
     if cmd == "apikey":

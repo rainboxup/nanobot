@@ -493,6 +493,130 @@ async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    alice_headers = await auth_headers_for("alice-byo", role="admin", tenant_id="tenant-byo-a")
+    bob_headers = await auth_headers_for("bob-byo", role="admin", tenant_id="tenant-byo-b")
+
+    update = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+        json={"app_id": "tenant-app-id", "app_secret": "tenant-app-secret"},
+    )
+    assert update.status_code == 200
+    update_body = update.json()
+    assert update_body["config_scope"] == "workspace"
+    assert update_body["runtime_scope"] == "tenant"
+    assert update_body["active_in_runtime"] is False
+    assert update_body["configured"] is True
+    assert update_body["config"]["app_id"] == "tenant-app-id"
+    assert update_body["config"]["app_secret"] == "****"
+
+    alice_get = await http_client.get(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+    )
+    assert alice_get.status_code == 200
+    alice_body = alice_get.json()
+    assert alice_body["config"]["app_id"] == "tenant-app-id"
+    assert alice_body["config"]["app_secret"] == "****"
+    assert alice_body["sensitive_has_value"]["app_secret"] is True
+
+    bob_get = await http_client.get(
+        "/api/channels/feishu/credentials",
+        headers=bob_headers,
+    )
+    assert bob_get.status_code == 200
+    bob_body = bob_get.json()
+    assert bob_body["configured"] is False
+    assert bob_body["config"]["app_id"] == ""
+    assert bob_body["config"]["app_secret"] == ""
+
+    tenant_cfg = _tenant_cfg(web_ctx, "tenant-byo-a")
+    assert tenant_cfg.workspace.channels.feishu.app_id == "tenant-app-id"
+    assert tenant_cfg.workspace.channels.feishu.app_secret == "tenant-app-secret"
+
+    system_cfg = _system_cfg(web_ctx)
+    assert system_cfg.channels.feishu.app_id == ""
+    assert system_cfg.channels.feishu.app_secret == ""
+
+    workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
+    assert workspace_list.status_code == 200
+    rows = {row["name"]: row for row in workspace_list.json()}
+    assert rows["feishu"]["byo_supported"] is True
+    assert rows["feishu"]["byo_configured"] is True
+    assert rows["feishu"]["active_in_runtime"] is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_credentials_preserve_existing_secret_on_blank_or_redacted_update(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    headers = await auth_headers_for("alice-byo-secret", role="admin", tenant_id="tenant-byo-secret")
+
+    initial = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-a", "client_secret": "secret-a"},
+    )
+    assert initial.status_code == 200
+
+    blank_update = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-b", "client_secret": ""},
+    )
+    assert blank_update.status_code == 200
+
+    redacted_update = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-c", "client_secret": "****"},
+    )
+    assert redacted_update.status_code == 200
+
+    tenant_cfg = _tenant_cfg(web_ctx, "tenant-byo-secret")
+    assert tenant_cfg.workspace.channels.dingtalk.client_id == "client-c"
+    assert tenant_cfg.workspace.channels.dingtalk.client_secret == "secret-a"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_credentials_require_admin_and_reject_unsupported_channels(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for("alice-byo-admin", role="admin", tenant_id="tenant-byo-admin")
+    member_headers = await auth_headers_for(
+        "alice-byo-member",
+        role="member",
+        tenant_id="tenant-byo-member",
+    )
+
+    member_update = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=member_headers,
+        json={"app_id": "member-app"},
+    )
+    assert member_update.status_code == 403
+
+    unsupported_get = await http_client.get(
+        "/api/channels/telegram/credentials",
+        headers=admin_headers,
+    )
+    assert unsupported_get.status_code == 404
+
+    unsupported_put = await http_client.put(
+        "/api/channels/telegram/credentials",
+        headers=admin_headers,
+        json={"token": "not-supported"},
+    )
+    assert unsupported_put.status_code == 404
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_workspace_routing_load_returns_409_for_invalid_persisted_subset(
     http_client, auth_headers_for, web_ctx
 ) -> None:

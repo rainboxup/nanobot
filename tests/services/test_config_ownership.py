@@ -17,6 +17,11 @@ def test_get_config_scope_workspace_keys() -> None:
     assert ConfigOwnershipService.get_config_scope("agents.defaults.model") == ConfigScope.WORKSPACE
     assert ConfigOwnershipService.get_config_scope("tools.exec.enabled") == ConfigScope.WORKSPACE
     assert ConfigOwnershipService.get_config_scope("providers.openai.api_key") == ConfigScope.WORKSPACE
+    assert ConfigOwnershipService.get_config_scope("workspace.channels.feishu.app_id") == ConfigScope.WORKSPACE
+    assert (
+        ConfigOwnershipService.get_config_scope("workspace.channels.dingtalk.client_secret")
+        == ConfigScope.WORKSPACE
+    )
 
 
 def test_get_config_scope_session_keys() -> None:
@@ -159,6 +164,25 @@ def test_workspace_channel_routing_ownership_rejects_unsupported_channel() -> No
     decision = ConfigOwnershipService.check_workspace_channel_routing_ownership(
         runtime_mode="multi",
         channel_name="slack",
+    )
+    assert decision.allowed is False
+    assert decision.scope == ConfigScope.WORKSPACE
+    assert decision.reason_code == "unsupported_workspace_channel"
+
+
+def test_workspace_channel_credentials_ownership_allows_workspace_scope_in_multi() -> None:
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode="multi",
+        channel_name="feishu",
+    )
+    assert decision.allowed is True
+    assert decision.scope == ConfigScope.WORKSPACE
+
+
+def test_workspace_channel_credentials_ownership_rejects_unsupported_channel() -> None:
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode="multi",
+        channel_name="telegram",
     )
     assert decision.allowed is False
     assert decision.scope == ConfigScope.WORKSPACE

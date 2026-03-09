@@ -99,6 +99,23 @@ class ConfigOwnershipService:
         )
 
     @classmethod
+    def check_workspace_channel_credentials_ownership(
+        cls, *, runtime_mode: str, channel_name: str
+    ) -> OwnershipDecision:
+        normalized = normalize_workspace_routing_channel_name(channel_name)
+        if not is_workspace_routing_channel(normalized):
+            return OwnershipDecision(
+                allowed=False,
+                scope=ConfigScope.WORKSPACE,
+                reason_code="unsupported_workspace_channel",
+            )
+
+        return cls.check_workspace_config_ownership(
+            runtime_mode=runtime_mode,
+            config_key=f"workspace.channels.{normalized}.credentials",
+        )
+
+    @classmethod
     def validate_config_change(
         cls,
         *,

@@ -23,6 +23,25 @@ interface WorkspaceChannelItem {
   runtime_warning?: string
   help_slug?: string
   help_url?: string
+  byo_supported?: boolean
+  byo_configured?: boolean
+  active_in_runtime?: boolean
+  writable?: boolean
+  write_block_reason?: string | null
+}
+
+interface WorkspaceChannelCredentialsDetail {
+  name: string
+  channel: string
+  config: Record<string, string>
+  configured: boolean
+  byo_supported: boolean
+  active_in_runtime: boolean
+  redacted_value?: string
+  sensitive_has_value?: Record<string, boolean>
+  takes_effect?: string
+  runtime_warning?: string
+  help_slug?: string
   writable?: boolean
   write_block_reason?: string | null
 }
@@ -47,6 +66,20 @@ function parseTextareaList(value: string) {
     .filter(Boolean)
 }
 
+const WORKSPACE_CREDENTIAL_FIELDS: Record<
+  string,
+  Array<{ name: string; label: string; sensitive?: boolean; placeholder?: string }>
+> = {
+  feishu: [
+    { name: "app_id", label: "App ID", placeholder: "tenant-feishu-app-id" },
+    { name: "app_secret", label: "App Secret", sensitive: true, placeholder: "Leave blank to keep existing secret" },
+  ],
+  dingtalk: [
+    { name: "client_id", label: "Client ID", placeholder: "tenant-dingtalk-client-id" },
+    { name: "client_secret", label: "Client Secret", sensitive: true, placeholder: "Leave blank to keep existing secret" },
+  ],
+}
+
 export function ChannelsWorkspace() {
   const { addToast } = useStore()
   const [channels, setChannels] = useState<WorkspaceChannelItem[]>([])
@@ -64,6 +97,10 @@ export function ChannelsWorkspace() {
   const [bindingChannel, setBindingChannel] = useState<string | null>(null)
   const [bindingInstructions, setBindingInstructions] = useState("")
   const [bindingError, setBindingError] = useState("")
+  const [credentialsEditing, setCredentialsEditing] = useState<WorkspaceChannelCredentialsDetail | null>(null)
+  const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
+  const [credentialError, setCredentialError] = useState("")
+  const [credentialSaving, setCredentialSaving] = useState(false)
 
   async function loadChannels() {
     setLoading(true)
@@ -145,6 +182,51 @@ export function ChannelsWorkspace() {
     } catch (err) {
       const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Load failed")
       setBindingError(message)
+    }
+  }
+
+  async function openCredentialsEditor(name: string) {
+    setCredentialError("")
+    setCredentialValues({})
+    try {
+      const detail = await api.get<WorkspaceChannelCredentialsDetail>(
+        `/api/channels/${encodeURIComponent(name)}/credentials`
+      )
+      const nextValues: Record<string, string> = {}
+      const redactedValue = String(detail.redacted_value || "****")
+      for (const field of WORKSPACE_CREDENTIAL_FIELDS[detail.name] || []) {
+        const raw = String(detail.config?.[field.name] || "")
+        nextValues[field.name] = field.sensitive && raw === redactedValue ? "" : raw
+      }
+      setCredentialValues(nextValues)
+      setCredentialsEditing(detail)
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Load failed")
+      addToast({ type: "error", message })
+    }
+  }
+
+  async function saveCredentials() {
+    if (!credentialsEditing) return
+    setCredentialSaving(true)
+    setCredentialError("")
+    try {
+      const payload: Record<string, string> = {}
+      for (const field of WORKSPACE_CREDENTIAL_FIELDS[credentialsEditing.name] || []) {
+        payload[field.name] = String(credentialValues[field.name] || "")
+      }
+      const detail = await api.put<WorkspaceChannelCredentialsDetail>(
+        `/api/channels/${encodeURIComponent(credentialsEditing.name)}/credentials`,
+        payload
+      )
+      addToast({ type: "success", message: `${credentialsEditing.name} BYO credentials saved` })
+      setCredentialsEditing(detail)
+      await loadChannels()
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Save failed")
+      setCredentialError(message)
+    } finally {
+      setCredentialSaving(false)
     }
   }
 
@@ -238,6 +320,11 @@ export function ChannelsWorkspace() {
                 <TableCell>
                   <div className="space-y-1 text-xs text-muted-foreground">
                     <div>{String(channel.takes_effect || "immediate")}</div>
+                    {channel.byo_supported && (
+                      <div>
+                        BYO {channel.byo_configured ? "stored" : "not configured"} · runtime {channel.active_in_runtime ? "active" : "inactive"}
+                      </div>
+                    )}
                     {!channel.writable && channel.write_block_reason && <div>{channel.write_block_reason}</div>}
                   </div>
                 </TableCell>
@@ -247,6 +334,17 @@ export function ChannelsWorkspace() {
                       <Copy className="mr-2 h-4 w-4" />
                       Binding
                     </Button>
+                    {channel.byo_supported && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => openCredentialsEditor(channel.name)}
+                        disabled={!channel.writable}
+                      >
+                        <Edit2 className="mr-2 h-4 w-4" />
+                        Credentials
+                      </Button>
+                    )}
                     <Button
                       variant="outline"
                       size="sm"
@@ -348,6 +446,70 @@ export function ChannelsWorkspace() {
                 disabled={!editing.writable || saving || groupPolicy !== "allowlist"}
               />
             </label>
+          </div>
+        )}
+      </Drawer>
+
+      <Drawer
+        isOpen={Boolean(credentialsEditing)}
+        onClose={() => setCredentialsEditing(null)}
+        title={credentialsEditing ? `${credentialsEditing.name} BYO credentials` : "Workspace BYO credentials"}
+        description="Stored per workspace for future channel runtime support. These credentials are not active yet."
+        footer={
+          <>
+            <Button variant="outline" onClick={() => setCredentialsEditing(null)} disabled={credentialSaving}>
+              Close
+            </Button>
+            <Button
+              onClick={() => saveCredentials().catch(() => {})}
+              disabled={credentialSaving || !credentialsEditing?.writable}
+            >
+              Save
+            </Button>
+          </>
+        }
+      >
+        {credentialsEditing && (
+          <div className="space-y-4">
+            <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              {String(credentialsEditing.runtime_warning || "Stored only. Workspace-specific channel runtimes are not active yet.")}
+            </div>
+            {!credentialsEditing.writable && credentialsEditing.write_block_reason && (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                {credentialsEditing.write_block_reason}
+              </div>
+            )}
+            {credentialError && (
+              <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                {credentialError}
+              </div>
+            )}
+            <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+              Saving here only stores tenant-scoped credentials for future BYO runtime support. Current channel connections still use the system owner-managed credentials.
+            </div>
+            {(WORKSPACE_CREDENTIAL_FIELDS[credentialsEditing.name] || []).map((field) => {
+              const hasStoredSecret = Boolean(credentialsEditing.sensitive_has_value?.[field.name])
+              return (
+                <label key={field.name} className="space-y-2 text-sm block">
+                  <span className="font-medium">{field.label}</span>
+                  <input
+                    className="w-full rounded-md border bg-background px-3 py-2"
+                    type={field.sensitive ? "password" : "text"}
+                    value={credentialValues[field.name] || ""}
+                    onChange={(event) =>
+                      setCredentialValues((prev) => ({ ...prev, [field.name]: event.target.value }))
+                    }
+                    placeholder={field.placeholder}
+                    disabled={!credentialsEditing.writable || credentialSaving}
+                  />
+                  {field.sensitive && hasStoredSecret && (
+                    <div className="text-xs text-muted-foreground">
+                      Secret already stored. Leave blank to keep the existing value.
+                    </div>
+                  )}
+                </label>
+              )
+            })}
           </div>
         )}
       </Drawer>

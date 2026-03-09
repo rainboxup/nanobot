@@ -505,6 +505,9 @@ export function ChannelsAdmin() {
         <div>
           <h2 className="text-2xl font-bold tracking-tight">渠道</h2>
           <p className="text-muted-foreground">{systemWarning} 可直接检查接入就绪与运行状态。</p>
+          <p className="text-sm text-muted-foreground">
+            Workspace BYO 凭据如已配置，请在 Workspace 页面管理；在工作区级渠道运行时支持落地前，这些凭据仅会被保存，不会立即生效。
+          </p>
         </div>
       </div>
 

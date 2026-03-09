@@ -202,6 +202,10 @@ class TenantChannelOverride(Base):
     group_allow_from: list[str] | None = None
     enable_group_chat: bool = False  # Legacy compatibility flag; derived from group_policy in new flows.
     audit_overrides: bool = True  # Log all override usage for security auditing
+    app_id: str = ""  # Workspace BYO Feishu App ID (stored only until runtime support lands)
+    app_secret: str = ""  # Workspace BYO Feishu App Secret (stored only until runtime support lands)
+    client_id: str = ""  # Workspace BYO DingTalk Client ID (stored only until runtime support lands)
+    client_secret: str = ""  # Workspace BYO DingTalk Client Secret (stored only until runtime support lands)
 
 
 class WorkspaceChannelsConfig(Base):

@@ -33,10 +33,22 @@ _CHANNEL_CONFIG_WRITE_BLOCK_DETAIL = "Only owner can modify system channel confi
 _WORKSPACE_ROUTING_SCOPE_WARNING = (
     "Workspace channel routing is tenant-scoped. Changes apply immediately and do not restart channel connections."
 )
+_WORKSPACE_CREDENTIALS_SCOPE_WARNING = (
+    "Workspace BYO channel credentials are tenant-scoped, but they are stored only for now. "
+    "They will not activate channel connections until workspace-specific runtime support lands."
+)
 _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
     "Workspace-scoped channel routing is unavailable in single-tenant runtime mode."
 )
+_WORKSPACE_CREDENTIALS_SINGLE_TENANT_DETAIL = (
+    "Workspace-scoped channel credentials are unavailable in single-tenant runtime mode."
+)
 _WORKSPACE_ROUTING_HELP_SLUG = "workspace-routing-and-binding"
+_WORKSPACE_CREDENTIALS_HELP_SLUG = "workspace-routing-and-binding"
+_WORKSPACE_CREDENTIALS_FIELDS: dict[str, tuple[str, ...]] = {
+    "feishu": ("app_id", "app_secret"),
+    "dingtalk": ("client_id", "client_secret"),
+}
 
 SENSITIVE_KEYS = {
     "token",
@@ -340,8 +352,23 @@ def _ensure_workspace_channel(name: str) -> str:
     return normalized
 
 
+def _workspace_channel_supports_credentials(name: str) -> bool:
+    return name in _WORKSPACE_CREDENTIALS_FIELDS
+
+
+def _ensure_workspace_credentials_channel(name: str) -> str:
+    normalized = _ensure_workspace_channel(name)
+    if not _workspace_channel_supports_credentials(normalized):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workspace channel")
+    return normalized
+
+
 def _workspace_takes_effect() -> str:
     return "immediate"
+
+
+def _workspace_credentials_takes_effect() -> str:
+    return "stored_only"
 
 
 def _workspace_require_mention(policy: str) -> bool:
@@ -426,6 +453,114 @@ def _workspace_runtime_meta(
     return payload
 
 
+def _workspace_credentials_ownership_error(decision) -> tuple[int, str, str]:
+    reason_code = str(decision.reason_code or "workspace_channel_credentials_unavailable")
+    if reason_code == "single_tenant_runtime_mode":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            _WORKSPACE_CREDENTIALS_SINGLE_TENANT_DETAIL,
+        )
+    if reason_code == "system_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel credentials are system-scoped and cannot be modified here.",
+        )
+    if reason_code == "session_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel credentials are session-scoped and cannot be persisted here.",
+        )
+    return (
+        status.HTTP_409_CONFLICT,
+        reason_code,
+        "Workspace channel credentials are unavailable.",
+    )
+
+
+def _workspace_credentials_write_status(request: Request, *, channel_name: str) -> dict[str, Any]:
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if decision.allowed:
+        return {
+            "writable": True,
+            "write_block_reason_code": None,
+            "write_block_reason": None,
+        }
+    status_code, reason_code, reason = _workspace_credentials_ownership_error(decision)
+    del status_code
+    return {
+        "writable": False,
+        "write_block_reason_code": reason_code,
+        "write_block_reason": reason,
+    }
+
+
+def _workspace_credentials_runtime_meta(
+    request: Request, *, channel_name: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload["runtime_mode"] = _runtime_mode(request)
+    payload["runtime_scope"] = "tenant"
+    payload["config_scope"] = ConfigScope.WORKSPACE.value
+    payload["takes_effect"] = _workspace_credentials_takes_effect()
+    payload["runtime_warning"] = _WORKSPACE_CREDENTIALS_SCOPE_WARNING
+    payload["help_slug"] = _WORKSPACE_CREDENTIALS_HELP_SLUG
+    payload.update(_workspace_credentials_write_status(request, channel_name=channel_name))
+    return payload
+
+
+def _workspace_channel_credentials_fields(name: str) -> tuple[str, ...]:
+    return _WORKSPACE_CREDENTIALS_FIELDS.get(name, ())
+
+
+def _workspace_channel_credentials_config(name: str, routing: TenantChannelOverride) -> dict[str, Any]:
+    return {
+        field: getattr(routing, field, "") or ""
+        for field in _workspace_channel_credentials_fields(name)
+    }
+
+
+def _workspace_channel_credentials_configured(name: str, routing: TenantChannelOverride) -> bool:
+    config = _workspace_channel_credentials_config(name, routing)
+    fields = _workspace_channel_credentials_fields(name)
+    return bool(fields) and all(str(config.get(field) or "").strip() for field in fields)
+
+
+def _workspace_channel_credentials_summary(name: str, routing: TenantChannelOverride) -> dict[str, Any]:
+    return {
+        "byo_supported": _workspace_channel_supports_credentials(name),
+        "byo_configured": _workspace_channel_credentials_configured(name, routing),
+        "active_in_runtime": False,
+    }
+
+
+def _workspace_credentials_payload(
+    request: Request,
+    *,
+    name: str,
+    routing: TenantChannelOverride,
+) -> dict[str, Any]:
+    raw = _workspace_channel_credentials_config(name, routing)
+    redacted, sensitive_paths, sensitive_has_value = _redact_sensitive(raw)
+    payload = {
+        "name": name,
+        "channel": name,
+        "config": redacted,
+        "configured": _workspace_channel_credentials_configured(name, routing),
+        "byo_supported": True,
+        "active_in_runtime": False,
+        "redacted_value": _REDACTED_VALUE,
+        "sensitive_keys": sorted([field for field in raw if _is_sensitive_key(field)]),
+        "sensitive_paths": sorted(list(sensitive_paths)),
+        "sensitive_has_value": sensitive_has_value,
+    }
+    return _workspace_credentials_runtime_meta(request, channel_name=name, payload=payload)
+
+
 def _workspace_routing_payload(
     request: Request,
     *,
@@ -447,6 +582,7 @@ def _workspace_routing_payload(
         "require_mention": _workspace_require_mention(routing.group_policy),
         "binding_supported": True,
     }
+    payload.update(_workspace_channel_credentials_summary(name, routing))
     return _workspace_runtime_meta(request, channel_name=name, payload=payload)
 
 
@@ -465,6 +601,22 @@ def _normalize_workspace_routing_update(
             )
         data["group_policy"] = derived_policy
     return data
+
+
+def _normalize_workspace_credentials_update(
+    channel_name: str,
+    update: dict[str, Any],
+) -> dict[str, Any]:
+    data = dict(update or {})
+    allowed_fields = set(_workspace_channel_credentials_fields(channel_name))
+    invalid_fields = sorted(key for key in data if key not in allowed_fields)
+    if invalid_fields:
+        raise _unprocessable_entity(
+            "workspace_channel_credentials_invalid",
+            "Workspace channel credentials update is invalid.",
+            details={"fields": invalid_fields},
+        )
+    return _prune_sensitive_updates(data)
 
 
 def _config_summary(name: str, cfg: BaseModel) -> dict[str, Any]:
@@ -725,6 +877,71 @@ async def get_channel_binding_instructions(
         "instructions": _workspace_binding_instructions(channel_name),
     }
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
+
+
+@router.get("/api/channels/{name}/credentials")
+async def get_workspace_channel_credentials(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_credentials_channel(name)
+    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    return _workspace_credentials_payload(
+        request,
+        name=channel_name,
+        routing=getattr(tenant_cfg.workspace.channels, channel_name),
+    )
+
+
+@router.put("/api/channels/{name}/credentials")
+async def update_workspace_channel_credentials(
+    name: str,
+    update: dict[str, Any],
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_credentials_channel(name)
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if not decision.allowed:
+        status_code, reason_code, reason = _workspace_credentials_ownership_error(decision)
+        raise HTTPException(
+            status_code=status_code,
+            detail=_api_error_detail(reason_code, reason),
+        )
+
+    tenant_id, store, tenant_cfg = load_tenant_config(request, user)
+    current = getattr(tenant_cfg.workspace.channels, channel_name)
+    data = _normalize_workspace_credentials_update(channel_name, update)
+    merged = current.model_dump()
+    merged.update(data)
+    try:
+        updated = TenantChannelOverride.model_validate(merged)
+    except ValidationError as exc:
+        raise _channel_validation_error(
+            "workspace_channel_credentials_invalid",
+            "Workspace channel credentials update is invalid.",
+            exc=exc,
+        ) from exc
+
+    setattr(tenant_cfg.workspace.channels, channel_name, updated)
+    await save_tenant_config(request, tenant_id, store, tenant_cfg)
+    _audit(
+        request,
+        event="config.channel.credentials.update",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name},
+    )
+    return _workspace_credentials_payload(
+        request,
+        name=channel_name,
+        routing=updated,
+    )
 
 
 @router.get("/api/channels/{name}/routing")

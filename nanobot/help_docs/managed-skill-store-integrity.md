@@ -139,7 +139,7 @@ manifest 文件名固定为：
 
 - workspace 已安装技能：`source=workspace`，`origin_source=workspace`，`install_source=local`
 - 本地托管商店条目：`source=managed`，`origin_source=store`，`install_source=local`
-- bundled 技能：`source=builtin`，`origin_source=builtin`，`install_source=local`
+- bundled 技能：`source=bundled`，`origin_source=builtin`，`install_source=local`
 - ClawHub 远端目录条目：`source=clawhub`，`origin_source=clawhub`，`install_source=clawhub`
 
 主要接口的大致字段集合如下：

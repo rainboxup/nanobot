@@ -86,6 +86,7 @@ function normalizeSkillSourceToken(source?: string): string {
   const value = String(source || "").trim().toLowerCase()
   if (!value) return ""
   if (value === "store") return "managed"
+  if (value === "builtin") return "bundled"
   return value
 }
 
@@ -104,7 +105,7 @@ function productizedSkillSourceLabel(source?: string): string {
   if (!normalized) return "-"
   if (normalized === "workspace") return "工作区"
   if (normalized === "managed") return "平台托管"
-  if (normalized === "builtin") return "内置"
+  if (normalized === "bundled") return "内置"
   if (normalized === "clawhub") return "ClawHub"
   return normalized
 }
@@ -127,7 +128,7 @@ function resolveSkillSourceContract(item: Pick<SkillCatalogItem, "source" | "ori
       ? "clawhub"
       : preferredSource === "local" ||
           preferredSource === "workspace" ||
-          preferredSource === "builtin" ||
+          preferredSource === "bundled" ||
           preferredSource === "managed"
         ? "local"
         : ""

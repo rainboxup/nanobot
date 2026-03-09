@@ -47,6 +47,8 @@ def _normalize_runtime_skill_source(source: Any) -> str | None:
         return None
     if value == "store":
         return "managed"
+    if value == "builtin":
+        return "bundled"
     return value
 
 
@@ -370,8 +372,8 @@ def _skill_path_label(source: Any, skill_name: str) -> str:
         return f"managed://{name}"
     if src == "store":
         return f"store://{name}"
-    if src == "builtin":
-        return f"builtin://{name}"
+    if src == "bundled":
+        return f"bundled://{name}"
     if src == "clawhub":
         return f"clawhub://{name}"
     return f"skill://{name}"

@@ -1321,7 +1321,7 @@ async def test_skills_api_paths_are_sanitized(web_ctx, http_client, auth_headers
     assert isinstance(rows, list)
     assert rows
 
-    allowed_prefixes = ("workspace://", "builtin://", "store://", "managed://")
+    allowed_prefixes = ("workspace://", "bundled://", "store://", "managed://")
     workspace_path_text = str(web_ctx.workspace_dir).lower()
 
     first_name = str(rows[0].get("name") or "")
@@ -1379,7 +1379,23 @@ async def test_skill_install_is_tenant_isolated(http_client, auth_headers_for) -
     assert alice_item is not None
     assert bob_item is not None
     assert alice_item.get("source") == "workspace"
-    assert bob_item.get("source") == "builtin"
+    assert bob_item.get("source") == "bundled"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_catalog_uses_bundled_as_public_term(http_client, auth_headers) -> None:
+    response = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert response.status_code == 200
+    items = response.json()
+    assert items
+
+    bundled_item = next(
+        (item for item in items if str(item.get("source") or "") == "bundled"),
+        None,
+    )
+    assert bundled_item is not None
+    assert bundled_item.get("origin_source") == "builtin"
 
 
 @pytest.mark.integration

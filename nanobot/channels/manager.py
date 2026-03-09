@@ -75,6 +75,7 @@ class _TenantBoundInboundBus:
                     canonical_sender,
                     e,
                 )
+                return False
             msg.metadata["canonical_sender_id"] = canonical_sender
 
         return await self._bus.publish_inbound(msg)
@@ -581,7 +582,7 @@ class ChannelManager:
         """Get status of all channels."""
         return {
             name: {"enabled": True, "running": channel.is_running}
-            for name, channel in self._iter_all_channels()
+            for name, channel in self.channels.items()
         }
 
     @property

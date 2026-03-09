@@ -282,3 +282,95 @@ async def test_refresh_workspace_channel_runtimes_loads_credentials_and_stamps_i
     assert sink_messages
     assert sink_messages[0].metadata["tenant_id"] == tenant_id
     assert tenant_store.resolve_tenant("feishu", "123") == tenant_id
+
+
+@pytest.mark.asyncio
+async def test_workspace_runtime_inbound_fails_closed_when_prelink_fails(tmp_path) -> None:
+    sink_messages: list[InboundMessage] = []
+
+    class SinkBus:
+        async def publish_inbound(self, msg: InboundMessage) -> bool:
+            sink_messages.append(msg)
+            return True
+
+    class DummyChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    tenant_store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = tenant_store.ensure_tenant("web", "owner")
+    tenant_cfg = tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
+    tenant_cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    def failing_link_identity(*args, **kwargs):
+        raise RuntimeError("index unavailable")
+
+    tenant_store.link_identity = failing_link_identity  # type: ignore[method-assign]
+
+    manager = ChannelManager(
+        Config(),
+        MessageBus(),
+        inbound_bus=SinkBus(),
+        tenant_store=tenant_store,
+        runtime_mode="multi",
+    )
+
+    def build_workspace_channel(name, config, inbound_bus):
+        assert name == "feishu"
+        return DummyChannel(config=config, bus=inbound_bus)
+
+    manager._create_workspace_channel = build_workspace_channel  # type: ignore[attr-defined]
+
+    await manager.refresh_workspace_channel_runtimes()
+    runtime = manager.get_workspace_channel_runtime(tenant_id, "feishu")
+    assert runtime is not None
+
+    ok = await runtime.bus.publish_inbound(
+        InboundMessage(
+            channel="feishu",
+            sender_id="123",
+            chat_id="chat-1",
+            content="hello",
+            metadata={},
+        )
+    )
+
+    assert ok is False
+    assert sink_messages == []
+
+
+def test_get_status_preserves_global_channel_key_shape() -> None:
+    bus = MessageBus()
+    manager = ChannelManager(Config(), bus, runtime_mode="multi")
+
+    class DummyChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    manager.register_channel("feishu", DummyChannel(config=None, bus=bus))
+    manager.register_workspace_channel_runtime(
+        "tenant-a",
+        "feishu",
+        DummyChannel(config=None, bus=bus),
+        credential_config={"app_id": "tenant-app", "app_secret": "tenant-secret"},
+    )
+
+    assert list(manager.get_status().keys()) == ["feishu"]

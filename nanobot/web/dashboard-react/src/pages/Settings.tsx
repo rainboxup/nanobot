@@ -19,6 +19,8 @@ export function getAllowedSettingsTabs(
     tabs.unshift("soul")
     tabs.unshift("channels")
     tabs.unshift("providers")
+  } else {
+    tabs.unshift("channels")
   }
   if (isOwner) {
     tabs.push("cron")

@@ -1,9 +1,9 @@
-# Workspace Routing & Binding (`!link`)（Feishu / DingTalk）
+# Workspace Routing & Binding（Dashboard + `!prove` / `!link`）（Feishu / DingTalk）
 
 这是一份面向 **运维 / Owner / Admin / 试用用户** 的操作与排障指南，解决两类问题：
 
 1) **如何配置 Workspace Routing**（让消息“能否进入当前 workspace”可控且立即生效）  
-2) **如何安全绑定身份**（用 `!link` 把多个账号/平台绑定到同一个 workspace，共享记忆/技能）
+2) **如何安全绑定身份**（优先用 Dashboard + `!prove` 校验身份；`!link` 仅作兼容兜底）
 
 另见：
 
@@ -82,7 +82,7 @@
 
 ---
 
-## 2) 安全绑定身份：`!link`（强烈建议只在私聊/DM 使用）
+## 2) 安全绑定身份（优先用 Dashboard + `!prove`）
 
 绑定的意义：
 
@@ -90,7 +90,30 @@
 - 绑定后共享：记忆/技能/工作区配置
 - 仍隔离：会话历史（按身份/渠道隔离）
 
-### 2.1 如何绑定（两步走）
+### 2.1 推荐方式：Dashboard 发起 challenge，目标身份用 `!prove` 完成校验
+
+入口：**Settings → Channels → Workspace Routing → 目标 channel → Binding**
+
+1) 在 Dashboard 中点击 **Start verification**
+2) 系统会生成一个短时有效的 challenge code（当前默认约 **5 分钟**）
+3) 在“要加入这个 workspace”的目标身份里，打开 **私聊/DM**，发送：
+
+```text
+!prove <CODE>
+```
+
+4) 回到 Dashboard，点击 **Refresh status**
+5) 当你看到 `verified identity` 后，点击 **Confirm binding**
+
+这个主流程的好处：
+
+- 不要求用户手填 `sender_id`
+- 绑定的是**实际发出 `!prove` 的身份**
+- member/admin 都可以对自己的账号完成绑定管理
+
+### 2.2 兼容兜底：`!link`
+
+如果当前环境还在使用旧流程，或者你临时无法走 Dashboard challenge 流，可以退回兼容命令：
 
 1) 在“已经绑定到目标 workspace”的任意身份中（私聊/DM）发送：
 
@@ -98,21 +121,18 @@
 !link
 ```
 
-机器人会返回一次性绑定码（有效期约 10 分钟）。
-
 2) 在“要加入这个 workspace”的新身份中（私聊/DM）发送：
 
 ```text
 !link <CODE>
 ```
 
-成功后，建议立刻执行 `!whoami` 确认绑定是否生效。
+### 2.3 安全注意事项（必须读）
 
-### 2.2 安全注意事项（必须读）
-
-- 绑定码等同“临时密码”：**不要发到群里、不要截图外传**
-- 群聊里执行 `!link` 会被拒绝（防止泄露）
-- 如果你怀疑绑定码泄漏：重新绑定（生成新 code），并按需调整 allowlist
+- challenge code / `!link` code 都等同“临时密码”：**不要发到群里、不要截图外传**
+- 群聊里执行 `!prove` / `!link` 会被拒绝（防止泄露）
+- 如果你怀疑 code 泄漏：直接在 Dashboard 里重新生成 challenge，或重新执行 `!link`
+- 绑定成功后，建议立刻执行 `!whoami` 确认新的 identity 已出现在 `linked identities`
 
 ---
 
@@ -128,7 +148,7 @@
 
 - 确认“我现在在哪个 workspace”
 - 拿到 `sender_id`（用于配置 workspace routing 的 allow_from）
-- 验证 `!link` 是否生效（是否出现新的 identity）
+- 验证绑定是否生效（是否出现新的 identity）
 
 ---
 
@@ -164,4 +184,3 @@
 | `missing_sender_id` | 平台消息里缺少 sender_id | 多为适配器/平台异常；联系运维看日志 |
 
 > 如果你“完全没看到任何拒绝信息”，这通常是**刻意的静默丢弃**（避免泄露策略）。此时最有效的办法是让运维看一眼 ingress 侧日志。
-

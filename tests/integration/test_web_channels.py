@@ -433,7 +433,7 @@ async def test_workspace_routing_roundtrip_is_tenant_isolated(
 async def test_workspace_routing_binding_instructions_are_readable(
     http_client, auth_headers_for
 ) -> None:
-    alice_headers = await auth_headers_for("alice-binding", role="admin", tenant_id="tenant-binding")
+    alice_headers = await auth_headers_for("alice-binding", role="member", tenant_id="tenant-binding")
 
     workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
     assert workspace_list.status_code == 200
@@ -441,6 +441,9 @@ async def test_workspace_routing_binding_instructions_are_readable(
     assert set(rows) == set(workspace_routing_channel_names())
     assert all(row["config_scope"] == "workspace" for row in rows.values())
     assert all(row.get("help_slug") == "workspace-routing-and-binding" for row in rows.values())
+    assert all(row["writable"] is False for row in rows.values())
+    assert all(row["write_block_reason_code"] == "admin_required" for row in rows.values())
+    assert all("binding remains available" in str(row["write_block_reason"] or "").lower() for row in rows.values())
 
     binding_resp = await http_client.get(
         "/api/channels/dingtalk/binding-instructions",
@@ -454,9 +457,11 @@ async def test_workspace_routing_binding_instructions_are_readable(
 
     instructions = str(body["instructions"] or "")
     assert "account" in instructions.lower() or "dashboard" in instructions.lower()
+    assert "!prove" in instructions
     assert "!link" in instructions
     assert "!whoami" in instructions
     assert "dm" in instructions.lower() or "private" in instructions.lower()
+    assert "sender_id" not in instructions.lower()
     assert body["config_scope"] == "workspace"
 
 

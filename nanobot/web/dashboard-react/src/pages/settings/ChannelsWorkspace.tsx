@@ -46,13 +46,12 @@ interface WorkspaceChannelCredentialsDetail {
   write_block_reason?: string | null
 }
 
-interface BindingInstructionsResponse {
-  name: string
-  channel: string
-  instructions: string
-  runtime_warning?: string
-  help_slug?: string
-  help_url?: string
+interface WorkspaceBindingChallenge {
+  code: string
+  status: "pending" | "verified"
+  expires_at?: string | null
+  verified_identity?: string | null
+  verification_command?: string | null
 }
 
 interface WorkspaceAccountBindingDetail {
@@ -61,6 +60,12 @@ interface WorkspaceAccountBindingDetail {
   account_id: string
   tenant_id: string
   identities: string[]
+  proof_of_possession_supported?: boolean
+  legacy_link_supported?: boolean
+  active_challenge?: WorkspaceBindingChallenge | null
+  runtime_warning?: string
+  help_slug?: string
+  help_url?: string
   writable?: boolean
   write_block_reason?: string | null
 }
@@ -74,6 +79,23 @@ function parseTextareaList(value: string) {
     .split(/\r?\n|,/) 
     .map((item) => item.trim())
     .filter(Boolean)
+}
+
+function defaultBindingInstructions(channelName?: string | null) {
+  const channelLabel = String(channelName || "target").trim() || "target"
+  return [
+    "Compatibility fallback (`!link`):",
+    "1. In your current private chat/DM, send `!link` to generate a one-time code.",
+    `2. In the target ${channelLabel} identity, send !link <CODE>.`,
+    "3. Use `!whoami` if you need to inspect the current tenant and linked identities.",
+  ].join("\n")
+}
+
+function bindingChallengeCommand(challenge?: WorkspaceBindingChallenge | null) {
+  const code = String(challenge?.code || "").trim()
+  if (!code) return ""
+  const command = String(challenge?.verification_command || "").trim()
+  return command || `!prove ${code}`
 }
 
 const WORKSPACE_CREDENTIAL_FIELDS: Record<
@@ -108,7 +130,6 @@ export function ChannelsWorkspace() {
   const [bindingInstructions, setBindingInstructions] = useState("")
   const [bindingError, setBindingError] = useState("")
   const [bindingDetail, setBindingDetail] = useState<WorkspaceAccountBindingDetail | null>(null)
-  const [bindingSenderId, setBindingSenderId] = useState("")
   const [bindingSaving, setBindingSaving] = useState(false)
   const [credentialsEditing, setCredentialsEditing] = useState<WorkspaceChannelCredentialsDetail | null>(null)
   const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
@@ -183,42 +204,72 @@ export function ChannelsWorkspace() {
     }
   }
 
+  async function loadBindingDetail(name: string) {
+    const accountBinding = await api.get<WorkspaceAccountBindingDetail>(
+      `/api/channels/${encodeURIComponent(name)}/binding`
+    )
+    setBindingDetail(accountBinding)
+  }
+
   async function openBindingInstructions(name: string) {
     setBindingChannel(name)
-    setBindingInstructions("")
+    setBindingInstructions(defaultBindingInstructions(name))
     setBindingError("")
     setBindingDetail(null)
-    setBindingSenderId("")
     try {
-      const detail = await api.get<BindingInstructionsResponse>(
-        `/api/channels/${encodeURIComponent(name)}/binding-instructions`
-      )
-      const accountBinding = await api.get<WorkspaceAccountBindingDetail>(
-        `/api/channels/${encodeURIComponent(name)}/binding`
-      )
-      setBindingInstructions(String(detail.instructions || ""))
-      setBindingDetail(accountBinding)
+      await loadBindingDetail(name)
     } catch (err) {
       const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Load failed")
       setBindingError(message)
     }
   }
 
-  async function attachBindingIdentity() {
+  async function refreshBindingDetail() {
+    if (!bindingChannel) return
+    setBindingSaving(true)
+    setBindingError("")
+    try {
+      await loadBindingDetail(bindingChannel)
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Refresh failed")
+      setBindingError(message)
+    } finally {
+      setBindingSaving(false)
+    }
+  }
+
+  async function startBindingChallenge() {
     if (!bindingChannel) return
     setBindingSaving(true)
     setBindingError("")
     try {
       const detail = await api.post<WorkspaceAccountBindingDetail>(
-        `/api/channels/${encodeURIComponent(bindingChannel)}/binding/attach`,
-        { sender_id: bindingSenderId }
+        `/api/channels/${encodeURIComponent(bindingChannel)}/binding/challenges`,
+        {}
       )
       setBindingDetail(detail)
-      setBindingSenderId("")
-      setBindingInstructions((prev) => prev)
+      addToast({ type: "success", message: `${bindingChannel} verification code created` })
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Verification start failed")
+      setBindingError(message)
+    } finally {
+      setBindingSaving(false)
+    }
+  }
+
+  async function confirmBindingChallenge() {
+    if (!bindingChannel || !bindingDetail?.active_challenge?.code) return
+    setBindingSaving(true)
+    setBindingError("")
+    try {
+      const detail = await api.post<WorkspaceAccountBindingDetail>(
+        `/api/channels/${encodeURIComponent(bindingChannel)}/binding/confirm`,
+        { code: bindingDetail.active_challenge.code }
+      )
+      setBindingDetail(detail)
       addToast({ type: "success", message: `${bindingChannel} identity attached` })
     } catch (err) {
-      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Attach failed")
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Confirm failed")
       setBindingError(message)
     } finally {
       setBindingSaving(false)
@@ -291,10 +342,19 @@ export function ChannelsWorkspace() {
   }
 
   function copyBindingInstructions() {
-    if (!bindingInstructions) return
-    navigator.clipboard.writeText(bindingInstructions)
-    addToast({ type: "success", message: "Binding instructions copied" })
+    const command = bindingChallengeCommand(bindingDetail?.active_challenge)
+    const value = command || bindingInstructions
+    if (!value) return
+    navigator.clipboard.writeText(value)
+    addToast({
+      type: "success",
+      message: command ? "Verification command copied" : "Fallback instructions copied",
+    })
   }
+
+  const proofOfPossessionSupported = Boolean(bindingDetail?.proof_of_possession_supported || bindingDetail?.active_challenge)
+  const legacyLinkSupported = bindingDetail ? bindingDetail.legacy_link_supported !== false : true
+  const verificationCommand = bindingChallengeCommand(bindingDetail?.active_challenge)
 
   return (
     <div className="space-y-4">
@@ -580,25 +640,108 @@ export function ChannelsWorkspace() {
       <Drawer
         isOpen={Boolean(bindingChannel)}
         onClose={() => setBindingChannel(null)}
-        title={bindingChannel ? `${bindingChannel} binding instructions` : "Binding instructions"}
-        description="Preferred: manage channel identities with the current signed-in account. !link remains available as a compatibility fallback."
+        title={bindingChannel ? `${bindingChannel} binding` : "Binding"}
+        description="Preferred: create a short-lived verification code in the dashboard, prove it in a private chat, then confirm the verified identity here."
         footer={
           <>
             <Button variant="outline" onClick={() => setBindingChannel(null)}>
               Close
             </Button>
-            <Button onClick={copyBindingInstructions} disabled={!bindingInstructions}>
+            <Button
+              variant="outline"
+              onClick={() => refreshBindingDetail().catch(() => {})}
+              disabled={!bindingChannel || bindingSaving}
+            >
+              <RefreshCw className="mr-2 h-4 w-4" />
+              Refresh status
+            </Button>
+            <Button
+              onClick={copyBindingInstructions}
+              disabled={!bindingInstructions && !verificationCommand}
+            >
               <Copy className="mr-2 h-4 w-4" />
-              Copy
+              {verificationCommand ? "Copy !prove" : "Copy fallback"}
             </Button>
           </>
         }
       >
         <div className="space-y-3">
           {bindingDetail && (
-            <div className="rounded-md border bg-muted/20 p-3 text-sm space-y-2">
-              <div>Account: {bindingDetail.account_id || "-"}</div>
-              <div>Tenant: {bindingDetail.tenant_id || "-"}</div>
+            <div className="space-y-3 rounded-md border bg-muted/20 p-3 text-sm">
+              <div className="flex flex-wrap items-center gap-2">
+                <div>Account: {bindingDetail.account_id || "-"}</div>
+                <Badge variant="outline">Tenant: {bindingDetail.tenant_id || "-"}</Badge>
+                {bindingDetail.proof_of_possession_supported && <Badge variant="success">proof-of-possession</Badge>}
+              </div>
+
+              <div className="space-y-2">
+                <div className="font-medium">Verify a new identity</div>
+                {!proofOfPossessionSupported ? (
+                  <div className="space-y-2 rounded-md border bg-background px-3 py-3">
+                    <p className="text-sm text-muted-foreground">
+                      Dashboard verification is not available for this channel/runtime. Use the compatibility flow below.
+                    </p>
+                  </div>
+                ) : !bindingDetail.active_challenge ? (
+                  <div className="space-y-3 rounded-md border bg-background px-3 py-3">
+                    <p className="text-sm text-muted-foreground">
+                      Start a short-lived verification code, then send it privately from the target identity.
+                    </p>
+                    <Button onClick={() => startBindingChallenge().catch(() => {})} disabled={bindingSaving}>
+                      Start verification
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="space-y-3 rounded-md border bg-background px-3 py-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={bindingDetail.active_challenge.status === "verified" ? "success" : "warning"}>
+                        {bindingDetail.active_challenge.status}
+                      </Badge>
+                      {bindingDetail.active_challenge.expires_at && (
+                        <span className="text-xs text-muted-foreground">
+                          Expires at {bindingDetail.active_challenge.expires_at}
+                        </span>
+                      )}
+                    </div>
+                    <div className="rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
+                      {bindingDetail.active_challenge.code}
+                    </div>
+                    {bindingDetail.active_challenge.status === "pending" ? (
+                      <div className="space-y-1 text-sm text-muted-foreground">
+                        <div>In the target private chat/DM, send:</div>
+                        <div className="font-mono text-foreground">{verificationCommand}</div>
+                        <div>After sending it, click Refresh status here.</div>
+                      </div>
+                    ) : (
+                      <div className="space-y-1 text-sm">
+                        <div className="text-muted-foreground">Verified identity</div>
+                        <div className="font-mono text-xs text-foreground">
+                          {bindingDetail.active_challenge.verified_identity || "-"}
+                        </div>
+                      </div>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      {bindingDetail.active_challenge.status === "verified" ? (
+                        <Button onClick={() => confirmBindingChallenge().catch(() => {})} disabled={bindingSaving}>
+                          Confirm binding
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="outline"
+                          onClick={() => refreshBindingDetail().catch(() => {})}
+                          disabled={!bindingChannel || bindingSaving}
+                        >
+                          Refresh status
+                        </Button>
+                      )}
+                      <Button variant="outline" onClick={() => startBindingChallenge().catch(() => {})} disabled={bindingSaving}>
+                        New code
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+
               <div className="space-y-2">
                 <div className="font-medium">Attached identities</div>
                 {bindingDetail.identities.length === 0 ? (
@@ -621,22 +764,6 @@ export function ChannelsWorkspace() {
                   </div>
                 )}
               </div>
-              <div className="space-y-2">
-                <label className="text-sm font-medium">Sender ID</label>
-                <input
-                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
-                  value={bindingSenderId}
-                  onChange={(e) => setBindingSenderId(e.target.value)}
-                  placeholder="Enter the channel sender_id to attach"
-                  disabled={bindingSaving}
-                />
-                <Button
-                  onClick={() => attachBindingIdentity().catch(() => {})}
-                  disabled={bindingSaving || !bindingSenderId.trim()}
-                >
-                  Attach Identity
-                </Button>
-              </div>
             </div>
           )}
           {bindingError && (
@@ -644,10 +771,15 @@ export function ChannelsWorkspace() {
               {bindingError}
             </div>
           )}
-          {!bindingError && (
-            <pre className="whitespace-pre-wrap rounded-md border bg-muted/30 p-3 text-sm leading-6">
-              {bindingInstructions || "Loading..."}
-            </pre>
+          {legacyLinkSupported ? (
+            <div className="rounded-md border bg-muted/30 p-3 text-sm leading-6">
+              <div className="mb-2 font-medium">Compatibility fallback</div>
+              <pre className="whitespace-pre-wrap text-sm leading-6">{bindingInstructions || "Loading..."}</pre>
+            </div>
+          ) : (
+            <div className="rounded-md border bg-muted/30 p-3 text-sm text-muted-foreground">
+              Legacy `!link` fallback is not available for this channel.
+            </div>
           )}
         </div>
       </Drawer>

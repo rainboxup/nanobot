@@ -397,16 +397,21 @@ def _workspace_binding_instructions(name: str) -> str:
     normalized = _ensure_workspace_channel(name)
     channel_display = workspace_routing_channel_display_name(normalized)
     return (
-        "1. Preferred: sign in to the dashboard with your workspace account and use Binding to attach/detach identities for this workspace.\n"
-        f"2. For {channel_display}, attach the current sender identity from the dashboard after you confirm the sender_id.\n"
-        "3. Run `!whoami` to verify the tenant_id and linked identities.\n"
+        "1. Preferred: sign in to the dashboard with your workspace account and open Settings → Channels → Workspace Routing → Binding.\n"
+        f"2. For {channel_display}, start a short-lived verification challenge in the dashboard to generate a one-time code.\n"
+        "3. In the target private chat/DM, send `!prove <CODE>`, then return to the dashboard and confirm the verified identity.\n"
         "4. Compatibility fallback: run `!link` in a private chat/DM to generate a one-time code, then use `!link <CODE>` in the target identity.\n"
-        "5. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
+        "5. Run `!whoami` to verify the tenant_id and linked identities after binding."
     )
 
 
 def _current_account_id(user: dict[str, Any]) -> str:
     return str(user.get("sub") or user.get("username") or "").strip().lower()
+
+
+def _user_has_admin_access(user: dict[str, Any]) -> bool:
+    role = str(user.get("role") or "").strip().lower()
+    return role in {"admin", "owner"}
 
 
 def _workspace_binding_challenge_payload(challenge: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -995,21 +1000,27 @@ async def list_channels(
 async def list_workspace_channels(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
-    require_min_role(user, "admin")
+    require_min_role(user, "member")
     tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
     system_cfg = _system_config(request)
 
     result: list[dict[str, Any]] = []
     for name in _workspace_channel_names():
-        result.append(
-            _workspace_routing_payload(
-                request,
-                tenant_id=tenant_id,
-                name=name,
-                system_channel=getattr(system_cfg.channels, name),
-                routing=getattr(tenant_cfg.workspace.channels, name),
-            )
+        payload = _workspace_routing_payload(
+            request,
+            tenant_id=tenant_id,
+            name=name,
+            system_channel=getattr(system_cfg.channels, name),
+            routing=getattr(tenant_cfg.workspace.channels, name),
         )
+        if not _user_has_admin_access(user):
+            payload["writable"] = False
+            payload["write_block_reason_code"] = "admin_required"
+            payload["write_block_reason"] = (
+                "Workspace routing and BYO credential changes require admin access. "
+                "Binding remains available to workspace members."
+            )
+        result.append(payload)
     return result
 
 
@@ -1017,7 +1028,7 @@ async def list_workspace_channels(
 async def get_channel_binding_instructions(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "member")
     channel_name = _ensure_workspace_channel(name)
     payload = {
         "name": channel_name,

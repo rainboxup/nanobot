@@ -128,6 +128,99 @@ async def test_websocket_chat_roundtrip(web_ctx, auth_token, http_client, auth_h
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_websocket_chat_roundtrip_forwards_overlay_metadata(web_ctx, auth_token) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    request_id = "req-overlay-meta"
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        assert meta["type"] == "session"
+        session_id = meta["session_id"]
+
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "chat",
+                    "request_id": request_id,
+                    "content": "hello",
+                    "overlay": "Please answer concisely",
+                    "session_overlay": "ignored alias",
+                }
+            )
+        )
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert ack.get("type") == "request"
+
+        inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+        assert inbound.channel == "web"
+        assert inbound.chat_id == session_id
+        assert inbound.metadata.get("session_overlay") == "Please answer concisely"
+        assert str(inbound.metadata.get("web_request_id") or "") == request_id
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_roundtrip_ignores_blank_overlay_metadata(web_ctx, auth_token) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        assert meta["type"] == "session"
+        session_id = meta["session_id"]
+
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "chat",
+                    "content": "hello",
+                    "overlay": "   ",
+                    "session_overlay": " ",
+                }
+            )
+        )
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert ack.get("type") == "request"
+
+        inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+        assert inbound.channel == "web"
+        assert inbound.chat_id == session_id
+        assert "session_overlay" not in inbound.metadata
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_websocket_chat_roundtrip_drops_oversized_overlay_metadata(web_ctx, auth_token) -> None:
+    ws_uri = _ws_uri(web_ctx.ws_url)
+    oversized_overlay = "x" * 10000
+
+    async with websockets.connect(ws_uri, subprotocols=_ws_subprotocols(auth_token)) as ws:
+        first = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        meta = json.loads(first)
+        assert meta["type"] == "session"
+        session_id = meta["session_id"]
+
+        await ws.send(
+            json.dumps(
+                {
+                    "type": "chat",
+                    "content": "hello",
+                    "overlay": oversized_overlay,
+                }
+            )
+        )
+        ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert ack.get("type") == "request"
+
+        inbound = await asyncio.wait_for(web_ctx.bus.consume_inbound(), timeout=5.0)
+        assert inbound.channel == "web"
+        assert inbound.chat_id == session_id
+        assert "session_overlay" not in inbound.metadata
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_websocket_chat_connection_replacement_enforces_single_active_connection(
     web_ctx, auth_token
 ) -> None:

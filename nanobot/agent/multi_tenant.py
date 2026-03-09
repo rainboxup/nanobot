@@ -24,6 +24,7 @@ from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
+from nanobot.services.baseline_rollout import BaselineRolloutService
 from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
 from nanobot.session.manager import SessionManager
@@ -39,6 +40,7 @@ from nanobot.utils.whitelist import parse_str_list, to_set
 class _TenantRuntime:
     tenant_id: str
     config_mtime_ns: int
+    baseline_version_id: str
     enable_exec: bool
     enable_web: bool
     agent: AgentLoop
@@ -104,7 +106,12 @@ class MultiTenantAgentLoop:
         # Exec is intentionally opt-in (paid/whitelist) in multi-tenant mode.
         env_wl = to_set(parse_str_list(os.getenv("EXEC_WHITELIST")))
         cfg_wl = to_set(getattr(system_config.tools.exec, "whitelist", None))
+        self._exec_whitelist_env = env_wl
         self._exec_whitelist = env_wl | cfg_wl
+        self._platform_base_soul_path = resolve_platform_base_soul_path(config=system_config)
+        self._baseline_rollout = BaselineRolloutService(
+            workspace_path=Path(system_config.workspace_path),
+        )
 
         configure_link_throttle(
             attempt_window_seconds=system_config.traffic.link_attempt_window_seconds,
@@ -196,7 +203,9 @@ class MultiTenantAgentLoop:
 
         canonical_sender = _canonical_sender_id(msg)
         if not canonical_sender:
-            logger.warning("Dropping inbound message with missing canonical sender_id: {}", msg.channel)
+            logger.warning(
+                "Dropping inbound message with missing canonical sender_id: {}", msg.channel
+            )
             return None
 
         tenant_id = ""
@@ -309,15 +318,42 @@ class MultiTenantAgentLoop:
             )
 
         tenant_exec_wl = to_set(getattr(tenant_cfg.tools.exec, "whitelist", None))
+        baseline_resolution = self._baseline_rollout.resolve_for_tenant(
+            tenant_id=tenant_id,
+            system_config=self.system_config,
+            fallback_platform_base_soul_path=self._platform_base_soul_path,
+        )
+        baseline_policy = (
+            baseline_resolution.get("policy")
+            if isinstance(baseline_resolution.get("policy"), dict)
+            else {}
+        )
+        system_exec_enabled = bool(
+            baseline_policy.get(
+                "exec_enabled",
+                bool(getattr(self.system_config.tools.exec, "enabled", True)),
+            )
+        )
+        system_exec_whitelist = self._exec_whitelist_env | to_set(
+            baseline_policy.get("exec_whitelist")
+        )
+        system_web_enabled = bool(
+            baseline_policy.get(
+                "web_enabled",
+                bool(getattr(self.system_config.tools.web, "enabled", True)),
+            )
+        )
         user_exec_setting = _parse_bool(
             msg.metadata.get("exec_enabled") if isinstance(msg.metadata, dict) else None
         )
         identities: list[str] = []
-        if self._exec_whitelist or tenant_exec_wl:
+        if system_exec_whitelist or tenant_exec_wl:
             async with self._store_lock:
                 identities = self.store.list_identities(tenant_id)
 
         enable_exec = self._resolve_exec_enabled(
+            system_exec_enabled=system_exec_enabled,
+            system_exec_whitelist=system_exec_whitelist,
             tenant_id=tenant_id,
             identities=identities,
             tenant_exec_whitelist=tenant_exec_wl,
@@ -329,6 +365,7 @@ class MultiTenantAgentLoop:
             msg.metadata.get("web_enabled") if isinstance(msg.metadata, dict) else None
         )
         enable_web = self._resolve_web_enabled(
+            system_web_enabled=system_web_enabled,
             tenant_web_enabled=bool(getattr(tenant_cfg.tools.web, "enabled", True)),
             user_web_setting=user_web_setting,
         )
@@ -336,6 +373,9 @@ class MultiTenantAgentLoop:
         runtime = self._get_or_create_runtime(
             tenant,
             tenant_cfg,
+            baseline_version_id=str(baseline_resolution.get("version_id") or ""),
+            platform_base_soul_content=str(baseline_resolution.get("platform_base_soul") or ""),
+            system_exec_enabled=system_exec_enabled,
             enable_exec=enable_exec,
             enable_web=enable_web,
         )
@@ -401,15 +441,29 @@ class MultiTenantAgentLoop:
     def _resolve_exec_enabled(
         self,
         *,
+        system_exec_enabled: bool | None = None,
+        system_exec_whitelist: set[str] | None = None,
         tenant_id: str,
         identities: list[str],
         tenant_exec_whitelist: set[str],
         tenant_exec_enabled: bool,
         user_exec_setting: bool | None,
     ) -> bool:
+        resolved_system_exec_enabled = (
+            bool(system_exec_enabled)
+            if system_exec_enabled is not None
+            else bool(getattr(self.system_config.tools.exec, "enabled", True))
+        )
+        resolved_system_exec_whitelist = (
+            set(system_exec_whitelist)
+            if system_exec_whitelist is not None
+            else set(self._exec_whitelist)
+        )
         effective, _reason_codes = resolve_exec_effective(
-            system_enabled=bool(getattr(self.system_config.tools.exec, "enabled", True)),
-            system_allowlisted=self._is_allowlist_match(self._exec_whitelist, tenant_id, identities),
+            system_enabled=resolved_system_exec_enabled,
+            system_allowlisted=self._is_allowlist_match(
+                resolved_system_exec_whitelist, tenant_id, identities
+            ),
             tenant_enabled=bool(tenant_exec_enabled),
             tenant_has_allowlist=bool(tenant_exec_whitelist),
             tenant_allowlisted=(
@@ -421,9 +475,20 @@ class MultiTenantAgentLoop:
         )
         return bool(effective)
 
-    def _resolve_web_enabled(self, *, tenant_web_enabled: bool, user_web_setting: bool | None) -> bool:
+    def _resolve_web_enabled(
+        self,
+        *,
+        system_web_enabled: bool | None = None,
+        tenant_web_enabled: bool,
+        user_web_setting: bool | None,
+    ) -> bool:
+        resolved_system_web_enabled = (
+            bool(system_web_enabled)
+            if system_web_enabled is not None
+            else bool(getattr(self.system_config.tools.web, "enabled", True))
+        )
         effective, _reason_codes = resolve_web_effective(
-            system_enabled=bool(getattr(self.system_config.tools.web, "enabled", True)),
+            system_enabled=resolved_system_web_enabled,
             tenant_enabled=bool(tenant_web_enabled),
             user_enabled=user_web_setting,
         )
@@ -434,6 +499,9 @@ class MultiTenantAgentLoop:
         tenant: TenantContext,
         tenant_cfg: Config,
         *,
+        baseline_version_id: str = "",
+        platform_base_soul_content: str | None = None,
+        system_exec_enabled: bool | None = None,
         enable_exec: bool,
         enable_web: bool = True,
     ) -> _TenantRuntime:
@@ -447,12 +515,16 @@ class MultiTenantAgentLoop:
         if (
             existing
             and existing.config_mtime_ns == config_mtime_ns
+            and existing.baseline_version_id == baseline_version_id
             and existing.enable_exec == enable_exec
             and existing.enable_web == enable_web
         ):
             existing.last_used_monotonic = time.monotonic()
             self._tenant_last_seen[tenant.tenant_id] = existing.last_used_monotonic
             return existing
+
+        if system_exec_enabled is None:
+            system_exec_enabled = bool(getattr(self.system_config.tools.exec, "enabled", True))
 
         # Per-tenant session store
         sessions = SessionManager(tenant.workspace, sessions_dir=tenant.sessions_dir)
@@ -471,6 +543,7 @@ class MultiTenantAgentLoop:
 
         # Multi-tenant exec runs in a sandbox container by default.
         exec_cfg = self.system_config.tools.exec.model_copy()
+        exec_cfg.enabled = bool(system_exec_enabled)
         exec_cfg.mode = "docker"
         exec_cfg.timeout = 30
         exec_cfg.require_runtime = True
@@ -482,10 +555,13 @@ class MultiTenantAgentLoop:
             bus=self.bus,
             provider=provider,
             workspace=tenant.workspace,
-            platform_base_soul_path=resolve_platform_base_soul_path(config=self.system_config),
+            platform_base_soul_path=self._platform_base_soul_path,
+            platform_base_soul_content=platform_base_soul_content,
             model=tenant_cfg.agents.defaults.model,
             max_iterations=tenant_cfg.agents.defaults.max_tool_iterations,
-            brave_api_key=(self.system_config.tools.web.search.api_key or None) if enable_web else None,
+            brave_api_key=(self.system_config.tools.web.search.api_key or None)
+            if enable_web
+            else None,
             web_config=web_cfg,
             exec_config=exec_cfg,
             filesystem_config=self.system_config.tools.filesystem,
@@ -502,6 +578,7 @@ class MultiTenantAgentLoop:
         rt = _TenantRuntime(
             tenant_id=tenant.tenant_id,
             config_mtime_ns=config_mtime_ns,
+            baseline_version_id=baseline_version_id,
             enable_exec=enable_exec,
             enable_web=enable_web,
             agent=agent,

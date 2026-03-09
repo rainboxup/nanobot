@@ -44,6 +44,7 @@ class WorkspaceToolPolicyService:
         runtime_mode: str,
         write_status: dict[str, Any],
         runtime_cache: dict[str, Any],
+        system_policy_override: dict[str, Any] | None = None,
         runtime_warning: str | None = None,
         owner_role: str = "owner",
     ) -> dict[str, Any]:
@@ -60,9 +61,20 @@ class WorkspaceToolPolicyService:
         system_tools_cfg = getattr(system_cfg, "tools", None)
         system_exec_cfg = getattr(system_tools_cfg, "exec", None)
         system_web_cfg = getattr(system_tools_cfg, "web", None)
+        policy_override = (
+            system_policy_override if isinstance(system_policy_override, dict) else None
+        )
 
-        system_exec_enabled = bool(getattr(system_exec_cfg, "enabled", True))
-        system_exec_wl = _to_str_set(getattr(system_exec_cfg, "whitelist", None))
+        system_exec_enabled = bool(
+            policy_override.get("exec_enabled", getattr(system_exec_cfg, "enabled", True))
+            if policy_override is not None
+            else getattr(system_exec_cfg, "enabled", True)
+        )
+        system_exec_wl = _to_str_set(
+            policy_override.get("exec_whitelist", getattr(system_exec_cfg, "whitelist", None))
+            if policy_override is not None
+            else getattr(system_exec_cfg, "whitelist", None)
+        )
         system_exec_allowlisted = self._evaluator.allowlist_match(system_exec_wl, tenant_id, identities)
 
         tenant_exec_wl = _to_str_set(getattr(tenant_exec_cfg, "whitelist", None))
@@ -82,7 +94,11 @@ class WorkspaceToolPolicyService:
             user_enabled=user_exec_enabled,
         )
 
-        system_web_enabled = bool(getattr(system_web_cfg, "enabled", True))
+        system_web_enabled = bool(
+            policy_override.get("web_enabled", getattr(system_web_cfg, "enabled", True))
+            if policy_override is not None
+            else getattr(system_web_cfg, "enabled", True)
+        )
         tenant_web_policy = bool(getattr(tenant_web_cfg, "enabled", True))
         user_web_enabled = bool(getattr(tenant_web_cfg, "enabled", True))
         web_decision = self._evaluator.resolve_web_policy(

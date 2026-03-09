@@ -52,12 +52,33 @@ class AgentLoop:
 
     _TOOL_RESULT_MAX_CHARS = 500
 
+    @staticmethod
+    def _session_overlay_from_metadata(metadata: dict | None) -> str | None:
+        if not isinstance(metadata, dict):
+            return None
+        for key in ("overlay", "session_overlay"):
+            value = metadata.get(key)
+            if value is None:
+                continue
+            text = str(value).strip()
+            if text:
+                return text
+        return None
+
+    @staticmethod
+    def _sanitize_outbound_metadata(metadata: dict | None) -> dict:
+        sanitized = dict(metadata or {})
+        sanitized.pop("overlay", None)
+        sanitized.pop("session_overlay", None)
+        return sanitized
+
     def __init__(
         self,
         bus: MessageBus,
         provider: LLMProvider,
         workspace: Path,
         platform_base_soul_path: Path | None = None,
+        platform_base_soul_content: str | None = None,
         model: str | None = None,
         max_iterations: int = 40,
         temperature: float = 0.1,
@@ -106,6 +127,7 @@ class AgentLoop:
         self.context = ContextBuilder(
             workspace,
             platform_base_soul_path=platform_base_soul_path,
+            platform_base_soul_content=platform_base_soul_content,
             managed_skills_dir=self.managed_skills_dir,
         )
         self.sessions = session_manager or SessionManager(workspace)
@@ -416,7 +438,7 @@ class AgentLoop:
         )
         total = cancelled + sub_cancelled
         content = f"⏹ Stopped {total} task(s)." if total else "No active task to stop."
-        stop_meta = dict(msg.metadata or {})
+        stop_meta = self._sanitize_outbound_metadata(msg.metadata)
         stop_meta["_response_state"] = "stopped"
         await self.bus.publish_outbound(OutboundMessage(
             channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=stop_meta,
@@ -432,14 +454,14 @@ class AgentLoop:
                 elif msg.channel == "cli":
                     await self.bus.publish_outbound(OutboundMessage(
                         channel=msg.channel, chat_id=msg.chat_id,
-                        content="", metadata=msg.metadata or {},
+                        content="", metadata=self._sanitize_outbound_metadata(msg.metadata),
                     ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
             except Exception:
                 logger.exception("Error processing message for session {}", msg.session_key)
-                error_meta = dict(msg.metadata or {})
+                error_meta = self._sanitize_outbound_metadata(msg.metadata)
                 error_meta["_response_state"] = "failed"
                 await self.bus.publish_outbound(OutboundMessage(
                     channel=msg.channel, chat_id=msg.chat_id,
@@ -468,7 +490,8 @@ class AgentLoop:
         on_progress: Callable[[str], Awaitable[None]] | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
-        base_metadata = dict(msg.metadata or {})
+        base_metadata = self._sanitize_outbound_metadata(msg.metadata)
+        session_overlay = self._session_overlay_from_metadata(msg.metadata)
 
         def _response_metadata(state: str = "completed", **extra: str | bool | int) -> dict:
             metadata = dict(base_metadata)
@@ -492,7 +515,10 @@ class AgentLoop:
             history = session.get_history(max_messages=self.memory_window)
             messages = self.context.build_messages(
                 history=history,
-                current_message=msg.content, channel=channel, chat_id=chat_id,
+                current_message=msg.content,
+                channel=channel,
+                chat_id=chat_id,
+                session_overlay=session_overlay,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -580,11 +606,13 @@ class AgentLoop:
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+            session_overlay=session_overlay,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
-            meta = dict(msg.metadata or {})
+            meta = self._sanitize_outbound_metadata(msg.metadata)
             meta["_progress"] = True
             meta["_tool_hint"] = tool_hint
             meta["_response_state"] = "delta"

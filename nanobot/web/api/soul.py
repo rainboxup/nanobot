@@ -12,6 +12,10 @@ from pydantic import BaseModel, Field
 
 from nanobot.services.soul_layering import SoulLayeringService
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
+from nanobot.web.api.baseline_rollout import (
+    baseline_metadata_from_resolution,
+    resolve_baseline_for_tenant,
+)
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.tenant import load_tenant_config
@@ -76,7 +80,9 @@ def _attach_runtime_meta(request: Request, payload: dict[str, Any]) -> dict[str,
 
 def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
     if _runtime_mode(request) == "single":
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=_SINGLE_TENANT_WRITE_BLOCK_DETAIL
+        )
 
 
 def _platform_base_soul_path(request: Request) -> Path | None:
@@ -152,13 +158,27 @@ def _effective_payload(
     workspace: Path,
     overlay: str | None,
     workspace_content: str | None = None,
+    baseline_resolution: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base_path = _platform_base_soul_path(request)
     svc = SoulLayeringService(platform_base_soul_path=base_path)
+    baseline_platform_base = (
+        str((baseline_resolution or {}).get("platform_base_soul") or "")
+        if baseline_resolution is not None
+        else None
+    )
     if workspace_content is None:
-        effective = svc.generate_effective_preview(workspace=workspace, session_overlay=overlay)
+        effective = svc.generate_effective_preview(
+            workspace=workspace,
+            session_overlay=overlay,
+            platform_base_override=baseline_platform_base,
+        )
     else:
-        platform_base = svc.load_platform_base_soul()
+        platform_base = (
+            str(baseline_platform_base)
+            if baseline_platform_base is not None
+            else svc.load_platform_base_soul()
+        )
         effective = svc.merge_soul_layers(
             platform_base=platform_base,
             workspace=workspace_content,
@@ -199,6 +219,7 @@ async def get_soul(
     require_min_role(user, "admin")
     tenant_id, store, _cfg = load_tenant_config(request, user)
     workspace = store.ensure_tenant_files(tenant_id).workspace
+    baseline_resolution = resolve_baseline_for_tenant(request, tenant_id)
 
     workspace_file = _workspace_soul_file(workspace)
     workspace_content = _read_text(workspace_file)
@@ -214,7 +235,9 @@ async def get_soul(
             tenant_id=tenant_id,
             workspace=workspace,
             overlay=None,
+            baseline_resolution=baseline_resolution,
         ),
+        "baseline": baseline_metadata_from_resolution(baseline_resolution),
     }
     return _attach_runtime_meta(request, payload)
 
@@ -265,13 +288,16 @@ async def preview_soul(
     require_min_role(user, "admin")
     tenant_id, store, _cfg = load_tenant_config(request, user)
     workspace = store.ensure_tenant_files(tenant_id).workspace
+    baseline_resolution = resolve_baseline_for_tenant(request, tenant_id)
     overlay = str(payload.overlay) if payload.overlay is not None else None
     if overlay is not None and len(overlay) > _MAX_SOUL_CHARS:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="Soul overlay too large",
         )
-    draft_workspace = str(payload.workspace_content) if payload.workspace_content is not None else None
+    draft_workspace = (
+        str(payload.workspace_content) if payload.workspace_content is not None else None
+    )
     if draft_workspace is not None and len(draft_workspace) > _MAX_SOUL_CHARS:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -290,6 +316,7 @@ async def preview_soul(
         workspace=workspace,
         overlay=overlay,
         workspace_content=draft_workspace,
+        baseline_resolution=baseline_resolution,
     )
     return _attach_runtime_meta(
         request,
@@ -297,5 +324,6 @@ async def preview_soul(
             "subject": {"tenant_id": tenant_id},
             "overlay": overlay,
             "effective": preview,
+            "baseline": baseline_metadata_from_resolution(baseline_resolution),
         },
     )

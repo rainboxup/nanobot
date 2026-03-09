@@ -1,7 +1,9 @@
 import json
+from datetime import datetime
 
 import pytest
 
+from nanobot.channels.base import BaseChannel
 from nanobot.config.loader import load_config, save_config
 from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError
 from nanobot.tenants.validation import (
@@ -431,7 +433,7 @@ async def test_workspace_routing_roundtrip_is_tenant_isolated(
 async def test_workspace_routing_binding_instructions_are_readable(
     http_client, auth_headers_for
 ) -> None:
-    alice_headers = await auth_headers_for("alice-binding", role="admin", tenant_id="tenant-binding")
+    alice_headers = await auth_headers_for("alice-binding", role="member", tenant_id="tenant-binding")
 
     workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
     assert workspace_list.status_code == 200
@@ -439,6 +441,9 @@ async def test_workspace_routing_binding_instructions_are_readable(
     assert set(rows) == set(workspace_routing_channel_names())
     assert all(row["config_scope"] == "workspace" for row in rows.values())
     assert all(row.get("help_slug") == "workspace-routing-and-binding" for row in rows.values())
+    assert all(row["writable"] is False for row in rows.values())
+    assert all(row["write_block_reason_code"] == "admin_required" for row in rows.values())
+    assert all("binding remains available" in str(row["write_block_reason"] or "").lower() for row in rows.values())
 
     binding_resp = await http_client.get(
         "/api/channels/dingtalk/binding-instructions",
@@ -451,10 +456,285 @@ async def test_workspace_routing_binding_instructions_are_readable(
     assert body.get("help_slug") == "workspace-routing-and-binding"
 
     instructions = str(body["instructions"] or "")
+    assert "account" in instructions.lower() or "dashboard" in instructions.lower()
+    assert "!prove" in instructions
     assert "!link" in instructions
     assert "!whoami" in instructions
     assert "dm" in instructions.lower() or "private" in instructions.lower()
+    assert "sender_id" not in instructions.lower()
     assert body["config_scope"] == "workspace"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_account_binding_attach_and_detach_identities_for_current_account(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    admin_headers = await auth_headers_for("alice-account", role="admin", tenant_id="tenant-account")
+    peer_admin_headers = await auth_headers_for("charlie-account", role="admin", tenant_id="tenant-account")
+    member_headers = await auth_headers_for(
+        "bob-account",
+        role="member",
+        tenant_id="tenant-account-member",
+    )
+
+    web_ctx.tenant_store.link_identity("tenant-account", "feishu", "feishu-user-1")
+
+    binding_before = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=admin_headers,
+    )
+    assert binding_before.status_code == 200
+    before_body = binding_before.json()
+    assert before_body["account_id"] == "alice-account"
+    assert before_body["tenant_id"] == "tenant-account"
+    assert before_body["identities"] == []
+
+    member_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=member_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert member_attach.status_code == 403
+
+    unlinked_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-2"},
+    )
+    assert unlinked_attach.status_code == 409
+
+    attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert attach.status_code == 200
+    attach_body = attach.json()
+    assert attach_body["account_id"] == "alice-account"
+    assert attach_body["tenant_id"] == "tenant-account"
+    assert attach_body["identities"] == ["feishu:feishu-user-1"]
+    assert web_ctx.tenant_store.resolve_tenant("feishu", "feishu-user-1") == "tenant-account"
+
+    peer_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=peer_admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert peer_attach.status_code == 409
+
+    detach = await http_client.post(
+        "/api/channels/feishu/binding/detach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert detach.status_code == 200
+    detach_body = detach.json()
+    assert detach_body["identities"] == []
+    assert web_ctx.tenant_store.resolve_tenant("feishu", "feishu-user-1") == "tenant-account"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_roundtrip_requires_verification_before_confirm(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof",
+        role="member",
+        tenant_id="tenant-proof",
+    )
+    web_ctx.tenant_store.link_identity("tenant-proof", "feishu", "user-1")
+
+    binding_before = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_before.status_code == 200
+    assert binding_before.json()["account_id"] == "alice-proof"
+    assert binding_before.json()["active_challenge"] is None
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    created_body = created.json()
+    assert created_body["proof_of_possession_supported"] is True
+    assert created_body["active_challenge"]["status"] == "pending"
+    code = created_body["active_challenge"]["code"]
+
+    confirm_before = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm_before.status_code == 409
+    assert confirm_before.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_verified"
+
+    web_ctx.tenant_store.verify_binding_challenge(code, "feishu", "user-1")
+
+    binding_verified = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_verified.status_code == 200
+    assert binding_verified.json()["active_challenge"]["status"] == "verified"
+    assert binding_verified.json()["active_challenge"]["verified_identity"] == "feishu:user-1"
+
+    confirm_after = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm_after.status_code == 200
+    assert confirm_after.json()["identities"] == ["feishu:user-1"]
+    assert confirm_after.json()["active_challenge"] is None
+
+    detach = await http_client.post(
+        "/api/channels/feishu/binding/detach",
+        headers=member_headers,
+        json={"sender_id": "user-1"},
+    )
+    assert detach.status_code == 200
+    assert detach.json()["identities"] == []
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_confirm_rejects_mismatch_and_missing_cases(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    alice_headers = await auth_headers_for(
+        "alice-proof-mismatch",
+        role="member",
+        tenant_id="tenant-proof-mismatch",
+    )
+    bob_headers = await auth_headers_for(
+        "bob-proof-mismatch",
+        role="member",
+        tenant_id="tenant-proof-mismatch",
+    )
+
+    web_ctx.tenant_store.link_identity("tenant-proof-mismatch", "feishu", "user-1")
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=alice_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    code = created.json()["active_challenge"]["code"]
+
+    wrong_account = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=bob_headers,
+        json={"code": code},
+    )
+    assert wrong_account.status_code == 409
+    assert wrong_account.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_mismatch"
+
+    wrong_channel = await http_client.post(
+        "/api/channels/dingtalk/binding/confirm",
+        headers=alice_headers,
+        json={"code": code},
+    )
+    assert wrong_channel.status_code == 409
+    assert wrong_channel.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_channel_mismatch"
+
+    missing = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=alice_headers,
+        json={"code": "BADCODE"},
+    )
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_found"
+
+    expired = web_ctx.tenant_store.create_binding_challenge(
+        account_id="alice-proof-mismatch",
+        tenant_id="tenant-proof-mismatch",
+        channel="feishu",
+        ttl_s=0,
+    )
+    expired_confirm = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=alice_headers,
+        json={"code": expired["code"]},
+    )
+    assert expired_confirm.status_code == 404
+    assert expired_confirm.json()["detail"]["reason_code"] == "workspace_account_binding_challenge_not_found"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_confirm_conflict_preserves_verified_challenge(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof-conflict",
+        role="member",
+        tenant_id="tenant-proof-conflict",
+    )
+    web_ctx.tenant_store.link_identity("tenant-proof-conflict", "feishu", "user-1")
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={},
+    )
+    assert created.status_code == 201
+    code = created.json()["active_challenge"]["code"]
+
+    web_ctx.tenant_store.verify_binding_challenge(code, "feishu", "user-1")
+    web_ctx.tenant_store.attach_account_identity(
+        "other-account",
+        "tenant-proof-conflict",
+        "feishu",
+        "user-1",
+    )
+
+    confirm = await http_client.post(
+        "/api/channels/feishu/binding/confirm",
+        headers=member_headers,
+        json={"code": code},
+    )
+    assert confirm.status_code == 409
+    assert confirm.json()["detail"]["reason_code"] == "identity_bound_to_other_account"
+
+    binding_after = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=member_headers,
+    )
+    assert binding_after.status_code == 200
+    assert binding_after.json()["active_challenge"]["status"] == "verified"
+    assert binding_after.json()["active_challenge"]["verified_identity"] == "feishu:user-1"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_binding_challenge_creation_clamps_ttl(http_client, auth_headers_for, web_ctx) -> None:
+    member_headers = await auth_headers_for(
+        "alice-proof-ttl",
+        role="member",
+        tenant_id="tenant-proof-ttl",
+    )
+
+    created = await http_client.post(
+        "/api/channels/feishu/binding/challenges",
+        headers=member_headers,
+        json={"ttl_s": 999999},
+    )
+    assert created.status_code == 201
+
+    challenge = web_ctx.tenant_store.get_active_binding_challenge(
+        "alice-proof-ttl",
+        "tenant-proof-ttl",
+        "feishu",
+    )
+    assert challenge is not None
+    created_at = datetime.fromisoformat(challenge["created_at"])
+    expires_at = datetime.fromisoformat(challenge["expires_at"])
+    assert (expires_at - created_at).total_seconds() == 300
 
 
 @pytest.mark.integration
@@ -489,6 +769,162 @@ async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_
         json={"client_id": "new-client"},
     )
     assert system_update.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    class DummyWorkspaceChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg) -> None:
+            return None
+
+    alice_headers = await auth_headers_for("alice-byo", role="admin", tenant_id="tenant-byo-a")
+    bob_headers = await auth_headers_for("bob-byo", role="admin", tenant_id="tenant-byo-b")
+
+    update = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+        json={"app_id": "tenant-app-id", "app_secret": "tenant-app-secret"},
+    )
+    assert update.status_code == 200
+    update_body = update.json()
+    assert update_body["config_scope"] == "workspace"
+    assert update_body["runtime_scope"] == "tenant"
+    assert update_body["takes_effect"] == "restart"
+    assert "restart" in str(update_body.get("runtime_warning") or "").lower()
+    assert update_body["active_in_runtime"] is False
+    assert update_body["configured"] is True
+    assert update_body["config"]["app_id"] == "tenant-app-id"
+    assert update_body["config"]["app_secret"] == "****"
+
+    workspace_runtime = DummyWorkspaceChannel(config=None, bus=web_ctx.bus)
+    await workspace_runtime.start()
+    web_ctx.channel_manager.register_workspace_channel_runtime(
+        "tenant-byo-a",
+        "feishu",
+        workspace_runtime,
+        credential_config={"app_id": "tenant-app-id", "app_secret": "tenant-app-secret"},
+    )
+
+    alice_get = await http_client.get(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+    )
+    assert alice_get.status_code == 200
+    alice_body = alice_get.json()
+    assert alice_body["active_in_runtime"] is True
+    assert alice_body["config"]["app_id"] == "tenant-app-id"
+    assert alice_body["config"]["app_secret"] == "****"
+    assert alice_body["sensitive_has_value"]["app_secret"] is True
+
+    bob_get = await http_client.get(
+        "/api/channels/feishu/credentials",
+        headers=bob_headers,
+    )
+    assert bob_get.status_code == 200
+    bob_body = bob_get.json()
+    assert bob_body["configured"] is False
+    assert bob_body["config"]["app_id"] == ""
+    assert bob_body["config"]["app_secret"] == ""
+
+    tenant_cfg = _tenant_cfg(web_ctx, "tenant-byo-a")
+    assert tenant_cfg.workspace.channels.feishu.app_id == "tenant-app-id"
+    assert tenant_cfg.workspace.channels.feishu.app_secret == "tenant-app-secret"
+
+    system_cfg = _system_cfg(web_ctx)
+    assert system_cfg.channels.feishu.app_id == ""
+    assert system_cfg.channels.feishu.app_secret == ""
+
+    workspace_list = await http_client.get("/api/channels/workspace", headers=alice_headers)
+    assert workspace_list.status_code == 200
+    rows = {row["name"]: row for row in workspace_list.json()}
+    assert rows["feishu"]["byo_supported"] is True
+    assert rows["feishu"]["byo_configured"] is True
+    assert rows["feishu"]["active_in_runtime"] is True
+
+    drift = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+        json={"app_id": "tenant-app-id-v2", "app_secret": "****"},
+    )
+    assert drift.status_code == 200
+    assert drift.json()["active_in_runtime"] is False
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_credentials_preserve_existing_secret_on_blank_or_redacted_update(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    headers = await auth_headers_for("alice-byo-secret", role="admin", tenant_id="tenant-byo-secret")
+
+    initial = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-a", "client_secret": "secret-a"},
+    )
+    assert initial.status_code == 200
+
+    blank_update = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-b", "client_secret": ""},
+    )
+    assert blank_update.status_code == 200
+
+    redacted_update = await http_client.put(
+        "/api/channels/dingtalk/credentials",
+        headers=headers,
+        json={"client_id": "client-c", "client_secret": "****"},
+    )
+    assert redacted_update.status_code == 200
+
+    tenant_cfg = _tenant_cfg(web_ctx, "tenant-byo-secret")
+    assert tenant_cfg.workspace.channels.dingtalk.client_id == "client-c"
+    assert tenant_cfg.workspace.channels.dingtalk.client_secret == "secret-a"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_credentials_require_admin_and_reject_unsupported_channels(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for("alice-byo-admin", role="admin", tenant_id="tenant-byo-admin")
+    member_headers = await auth_headers_for(
+        "alice-byo-member",
+        role="member",
+        tenant_id="tenant-byo-member",
+    )
+
+    member_update = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=member_headers,
+        json={"app_id": "member-app"},
+    )
+    assert member_update.status_code == 403
+
+    unsupported_get = await http_client.get(
+        "/api/channels/telegram/credentials",
+        headers=admin_headers,
+    )
+    assert unsupported_get.status_code == 404
+
+    unsupported_put = await http_client.put(
+        "/api/channels/telegram/credentials",
+        headers=admin_headers,
+        json={"token": "not-supported"},
+    )
+    assert unsupported_put.status_code == 404
 
 
 @pytest.mark.integration

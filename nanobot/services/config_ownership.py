@@ -40,13 +40,13 @@ class ConfigOwnershipService:
 
     @staticmethod
     def check_channel_credentials_ownership(
-        *, runtime_mode: str, is_admin: bool
+        *, runtime_mode: str, is_owner: bool
     ) -> OwnershipDecision:
         mode = str(runtime_mode or "").strip().lower()
         if mode != "multi":
             return OwnershipDecision(allowed=True, scope=ConfigScope.SYSTEM)
 
-        if not bool(is_admin):
+        if not bool(is_owner):
             return OwnershipDecision(
                 allowed=False,
                 scope=ConfigScope.SYSTEM,
@@ -99,13 +99,30 @@ class ConfigOwnershipService:
         )
 
     @classmethod
+    def check_workspace_channel_credentials_ownership(
+        cls, *, runtime_mode: str, channel_name: str
+    ) -> OwnershipDecision:
+        normalized = normalize_workspace_routing_channel_name(channel_name)
+        if not is_workspace_routing_channel(normalized):
+            return OwnershipDecision(
+                allowed=False,
+                scope=ConfigScope.WORKSPACE,
+                reason_code="unsupported_workspace_channel",
+            )
+
+        return cls.check_workspace_config_ownership(
+            runtime_mode=runtime_mode,
+            config_key=f"workspace.channels.{normalized}.credentials",
+        )
+
+    @classmethod
     def validate_config_change(
         cls,
         *,
         config_key: str,
         new_value: object,
         runtime_mode: str,
-        is_admin: bool,
+        is_owner: bool,
     ) -> OwnershipDecision:
         del new_value  # Reserved for future validation (type/shape enforcement).
         mode = str(runtime_mode or "").strip().lower()
@@ -115,7 +132,7 @@ class ConfigOwnershipService:
             return OwnershipDecision(allowed=True, scope=ConfigScope.SESSION)
 
         if scope == ConfigScope.SYSTEM:
-            if mode == "multi" and not bool(is_admin):
+            if mode == "multi" and not bool(is_owner):
                 return OwnershipDecision(
                     allowed=False,
                     scope=ConfigScope.SYSTEM,

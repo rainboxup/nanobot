@@ -33,10 +33,22 @@ _CHANNEL_CONFIG_WRITE_BLOCK_DETAIL = "Only owner can modify system channel confi
 _WORKSPACE_ROUTING_SCOPE_WARNING = (
     "Workspace channel routing is tenant-scoped. Changes apply immediately and do not restart channel connections."
 )
+_WORKSPACE_CREDENTIALS_SCOPE_WARNING = (
+    "Workspace BYO channel credentials are tenant-scoped. Saving changes does not hot-swap live channel connections; "
+    "restart the service to load updated workspace runtimes. active_in_runtime reflects whether the current runtime matches the stored credentials."
+)
 _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
     "Workspace-scoped channel routing is unavailable in single-tenant runtime mode."
 )
+_WORKSPACE_CREDENTIALS_SINGLE_TENANT_DETAIL = (
+    "Workspace-scoped channel credentials are unavailable in single-tenant runtime mode."
+)
 _WORKSPACE_ROUTING_HELP_SLUG = "workspace-routing-and-binding"
+_WORKSPACE_CREDENTIALS_HELP_SLUG = "workspace-routing-and-binding"
+_WORKSPACE_CREDENTIALS_FIELDS: dict[str, tuple[str, ...]] = {
+    "feishu": ("app_id", "app_secret"),
+    "dingtalk": ("client_id", "client_secret"),
+}
 
 SENSITIVE_KEYS = {
     "token",
@@ -90,6 +102,24 @@ class WorkspaceRoutingUpdate(BaseModel):
     group_allow_from: list[str] | None = None
     allow_from: list[str] | None = None
     require_mention: bool | None = None
+
+
+class AccountBindingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sender_id: str
+
+
+class AccountBindingChallengeCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ttl_s: int | None = None
+
+
+class AccountBindingChallengeConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
 
 
 def _api_error_detail(
@@ -340,8 +370,23 @@ def _ensure_workspace_channel(name: str) -> str:
     return normalized
 
 
+def _workspace_channel_supports_credentials(name: str) -> bool:
+    return name in _WORKSPACE_CREDENTIALS_FIELDS
+
+
+def _ensure_workspace_credentials_channel(name: str) -> str:
+    normalized = _ensure_workspace_channel(name)
+    if not _workspace_channel_supports_credentials(normalized):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown workspace channel")
+    return normalized
+
+
 def _workspace_takes_effect() -> str:
     return "immediate"
+
+
+def _workspace_credentials_takes_effect() -> str:
+    return "restart"
 
 
 def _workspace_require_mention(policy: str) -> bool:
@@ -352,12 +397,96 @@ def _workspace_binding_instructions(name: str) -> str:
     normalized = _ensure_workspace_channel(name)
     channel_display = workspace_routing_channel_display_name(normalized)
     return (
-        "1. (Safety) Run `!link` in a private chat/DM to avoid leaking the one-time code in a group.\n"
-        "2. In any identity already linked to the workspace, send `!link` to generate a one-time code.\n"
-        f"3. In {channel_display}, send `!link <CODE>` to bind the current identity.\n"
-        "4. Run `!whoami` to verify the tenant_id and linked identities.\n"
-        "5. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
+        "1. Preferred: sign in to the dashboard with your workspace account and open Settings → Channels → Workspace Routing → Binding.\n"
+        f"2. For {channel_display}, start a short-lived verification challenge in the dashboard to generate a one-time code.\n"
+        "3. In the target private chat/DM, send `!prove <CODE>`, then return to the dashboard and confirm the verified identity.\n"
+        "4. Compatibility fallback: run `!link` in a private chat/DM to generate a one-time code, then use `!link <CODE>` in the target identity.\n"
+        "5. Run `!whoami` to verify the tenant_id and linked identities after binding."
     )
+
+
+def _current_account_id(user: dict[str, Any]) -> str:
+    return str(user.get("sub") or user.get("username") or "").strip().lower()
+
+
+def _user_has_admin_access(user: dict[str, Any]) -> bool:
+    role = str(user.get("role") or "").strip().lower()
+    return role in {"admin", "owner"}
+
+
+def _workspace_binding_challenge_payload(challenge: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(challenge, dict):
+        return None
+    code = str(challenge.get("code") or "").strip().upper()
+    status_value = str(challenge.get("status") or "pending")
+    payload = {
+        "code": code,
+        "status": status_value,
+        "expires_at": challenge.get("expires_at"),
+        "verified_identity": challenge.get("verified_identity"),
+        "verification_command": f"!prove {code}" if code else None,
+    }
+    return payload
+
+
+def _workspace_account_binding_conflict(reason_code: str) -> HTTPException:
+    message = (
+        "This identity is already bound to another workspace."
+        if reason_code == "identity_bound_to_other_tenant"
+        else (
+            "This identity is not linked to the current workspace yet. Use the compatibility binding flow first."
+            if reason_code == "identity_not_linked_to_workspace"
+            else (
+                "This identity is already claimed by another account in the workspace."
+                if reason_code == "identity_bound_to_other_account"
+                else "This account is already bound to another workspace."
+            )
+        )
+    )
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=_api_error_detail(reason_code, message),
+    )
+
+
+def _workspace_account_binding_payload(
+    request: Request,
+    *,
+    user: dict[str, Any],
+    tenant_id: str,
+    channel_name: str,
+) -> dict[str, Any]:
+    store = getattr(request.app.state, "tenant_store", None)
+    account_id = _current_account_id(user)
+    identities: list[str] = []
+    active_challenge: dict[str, Any] | None = None
+    if store is not None and account_id:
+        list_identities = getattr(store, "list_account_identities", None)
+        if callable(list_identities):
+            try:
+                identities = list_identities(account_id, channel=channel_name)
+            except Exception:
+                identities = []
+        get_active_challenge = getattr(store, "get_active_binding_challenge", None)
+        if callable(get_active_challenge):
+            try:
+                active_challenge = _workspace_binding_challenge_payload(
+                    get_active_challenge(account_id, tenant_id, channel_name)
+                )
+            except Exception:
+                active_challenge = None
+    payload = {
+        "name": channel_name,
+        "channel": channel_name,
+        "account_id": account_id,
+        "tenant_id": tenant_id,
+        "identities": identities,
+        "binding_supported": True,
+        "legacy_link_supported": True,
+        "proof_of_possession_supported": True,
+        "active_challenge": active_challenge,
+    }
+    return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
 
 def _channel_validation_error(
@@ -374,6 +503,8 @@ def _channel_validation_error(
 
 def _workspace_routing_ownership_error(decision) -> tuple[int, str, str]:
     reason_code = str(decision.reason_code or "workspace_routing_unavailable")
+    # Role gating is enforced by the route dependency. This helper only maps
+    # scope/runtime ownership conflicts returned by ConfigOwnershipService.
     if reason_code == "single_tenant_runtime_mode":
         return status.HTTP_409_CONFLICT, reason_code, _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL
     if reason_code == "system_scope":
@@ -387,12 +518,6 @@ def _workspace_routing_ownership_error(decision) -> tuple[int, str, str]:
             status.HTTP_409_CONFLICT,
             reason_code,
             "Workspace channel routing is session-scoped and cannot be persisted here.",
-        )
-    if reason_code == "insufficient_permissions":
-        return (
-            status.HTTP_403_FORBIDDEN,
-            reason_code,
-            "Only workspace admins can modify channel routing.",
         )
     return status.HTTP_409_CONFLICT, reason_code, "Workspace channel routing is unavailable."
 
@@ -430,9 +555,160 @@ def _workspace_runtime_meta(
     return payload
 
 
+def _workspace_credentials_ownership_error(decision) -> tuple[int, str, str]:
+    reason_code = str(decision.reason_code or "workspace_channel_credentials_unavailable")
+    if reason_code == "single_tenant_runtime_mode":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            _WORKSPACE_CREDENTIALS_SINGLE_TENANT_DETAIL,
+        )
+    if reason_code == "system_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel credentials are system-scoped and cannot be modified here.",
+        )
+    if reason_code == "session_scope":
+        return (
+            status.HTTP_409_CONFLICT,
+            reason_code,
+            "Workspace channel credentials are session-scoped and cannot be persisted here.",
+        )
+    return (
+        status.HTTP_409_CONFLICT,
+        reason_code,
+        "Workspace channel credentials are unavailable.",
+    )
+
+
+def _workspace_credentials_write_status(request: Request, *, channel_name: str) -> dict[str, Any]:
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if decision.allowed:
+        return {
+            "writable": True,
+            "write_block_reason_code": None,
+            "write_block_reason": None,
+        }
+    status_code, reason_code, reason = _workspace_credentials_ownership_error(decision)
+    del status_code
+    return {
+        "writable": False,
+        "write_block_reason_code": reason_code,
+        "write_block_reason": reason,
+    }
+
+
+def _workspace_credentials_runtime_meta(
+    request: Request, *, channel_name: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    payload["runtime_mode"] = _runtime_mode(request)
+    payload["runtime_scope"] = "tenant"
+    payload["config_scope"] = ConfigScope.WORKSPACE.value
+    payload["takes_effect"] = _workspace_credentials_takes_effect()
+    payload["runtime_warning"] = _WORKSPACE_CREDENTIALS_SCOPE_WARNING
+    payload["help_slug"] = _WORKSPACE_CREDENTIALS_HELP_SLUG
+    payload.update(_workspace_credentials_write_status(request, channel_name=channel_name))
+    return payload
+
+
+def _workspace_channel_credentials_fields(name: str) -> tuple[str, ...]:
+    return _WORKSPACE_CREDENTIALS_FIELDS.get(name, ())
+
+
+def _workspace_channel_credentials_config(name: str, routing: TenantChannelOverride) -> dict[str, Any]:
+    return {
+        field: getattr(routing, field, "") or ""
+        for field in _workspace_channel_credentials_fields(name)
+    }
+
+
+def _workspace_channel_credentials_configured(name: str, routing: TenantChannelOverride) -> bool:
+    config = _workspace_channel_credentials_config(name, routing)
+    fields = _workspace_channel_credentials_fields(name)
+    return bool(fields) and all(str(config.get(field) or "").strip() for field in fields)
+
+
+def _workspace_channel_runtime_active(
+    request: Request,
+    *,
+    tenant_id: str,
+    channel_name: str,
+    routing: TenantChannelOverride,
+) -> bool:
+    manager = getattr(request.app.state, "channel_manager", None)
+    if not tenant_id or manager is None:
+        return False
+    checker = getattr(manager, "is_workspace_channel_runtime_active", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(
+            checker(
+                tenant_id,
+                channel_name,
+                _workspace_channel_credentials_config(channel_name, routing),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _workspace_channel_credentials_summary(
+    request: Request,
+    *,
+    tenant_id: str,
+    name: str,
+    routing: TenantChannelOverride,
+) -> dict[str, Any]:
+    return {
+        "byo_supported": _workspace_channel_supports_credentials(name),
+        "byo_configured": _workspace_channel_credentials_configured(name, routing),
+        "active_in_runtime": _workspace_channel_runtime_active(
+            request,
+            tenant_id=tenant_id,
+            channel_name=name,
+            routing=routing,
+        ),
+    }
+
+
+def _workspace_credentials_payload(
+    request: Request,
+    *,
+    tenant_id: str,
+    name: str,
+    routing: TenantChannelOverride,
+) -> dict[str, Any]:
+    raw = _workspace_channel_credentials_config(name, routing)
+    redacted, sensitive_paths, sensitive_has_value = _redact_sensitive(raw)
+    payload = {
+        "name": name,
+        "channel": name,
+        "config": redacted,
+        "configured": _workspace_channel_credentials_configured(name, routing),
+        "byo_supported": True,
+        "active_in_runtime": _workspace_channel_runtime_active(
+            request,
+            tenant_id=tenant_id,
+            channel_name=name,
+            routing=routing,
+        ),
+        "redacted_value": _REDACTED_VALUE,
+        "sensitive_keys": sorted([field for field in raw if _is_sensitive_key(field)]),
+        "sensitive_paths": sorted(list(sensitive_paths)),
+        "sensitive_has_value": sensitive_has_value,
+    }
+    return _workspace_credentials_runtime_meta(request, channel_name=name, payload=payload)
+
+
 def _workspace_routing_payload(
     request: Request,
     *,
+    tenant_id: str,
     name: str,
     system_channel: BaseModel,
     routing: TenantChannelOverride,
@@ -451,6 +727,14 @@ def _workspace_routing_payload(
         "require_mention": _workspace_require_mention(routing.group_policy),
         "binding_supported": True,
     }
+    payload.update(
+        _workspace_channel_credentials_summary(
+            request,
+            tenant_id=tenant_id,
+            name=name,
+            routing=routing,
+        )
+    )
     return _workspace_runtime_meta(request, channel_name=name, payload=payload)
 
 
@@ -469,6 +753,22 @@ def _normalize_workspace_routing_update(
             )
         data["group_policy"] = derived_policy
     return data
+
+
+def _normalize_workspace_credentials_update(
+    channel_name: str,
+    update: dict[str, Any],
+) -> dict[str, Any]:
+    data = dict(update or {})
+    allowed_fields = set(_workspace_channel_credentials_fields(channel_name))
+    invalid_fields = sorted(key for key in data if key not in allowed_fields)
+    if invalid_fields:
+        raise _unprocessable_entity(
+            "workspace_channel_credentials_invalid",
+            "Workspace channel credentials update is invalid.",
+            details={"fields": invalid_fields},
+        )
+    return _prune_sensitive_updates(data)
 
 
 def _config_summary(name: str, cfg: BaseModel) -> dict[str, Any]:
@@ -700,20 +1000,27 @@ async def list_channels(
 async def list_workspace_channels(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
-    require_min_role(user, "admin")
-    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    require_min_role(user, "member")
+    tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
     system_cfg = _system_config(request)
 
     result: list[dict[str, Any]] = []
     for name in _workspace_channel_names():
-        result.append(
-            _workspace_routing_payload(
-                request,
-                name=name,
-                system_channel=getattr(system_cfg.channels, name),
-                routing=getattr(tenant_cfg.workspace.channels, name),
-            )
+        payload = _workspace_routing_payload(
+            request,
+            tenant_id=tenant_id,
+            name=name,
+            system_channel=getattr(system_cfg.channels, name),
+            routing=getattr(tenant_cfg.workspace.channels, name),
         )
+        if not _user_has_admin_access(user):
+            payload["writable"] = False
+            payload["write_block_reason_code"] = "admin_required"
+            payload["write_block_reason"] = (
+                "Workspace routing and BYO credential changes require admin access. "
+                "Binding remains available to workspace members."
+            )
+        result.append(payload)
     return result
 
 
@@ -721,7 +1028,7 @@ async def list_workspace_channels(
 async def get_channel_binding_instructions(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> dict[str, Any]:
-    require_min_role(user, "admin")
+    require_min_role(user, "member")
     channel_name = _ensure_workspace_channel(name)
     payload = {
         "name": channel_name,
@@ -731,6 +1038,320 @@ async def get_channel_binding_instructions(
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
 
+@router.get("/api/channels/{name}/binding")
+async def get_channel_account_binding(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, _store, _tenant_cfg = load_tenant_config(request, user)
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/challenges", status_code=status.HTTP_201_CREATED)
+async def create_channel_account_binding_challenge(
+    name: str,
+    payload: AccountBindingChallengeCreateRequest | None,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    ttl_s = 300 if payload is None or payload.ttl_s is None else min(300, max(1, int(payload.ttl_s)))
+    store.create_binding_challenge(
+        account_id=account_id,
+        tenant_id=tenant_id,
+        channel=channel_name,
+        ttl_s=ttl_s,
+    )
+    _audit(
+        request,
+        event="config.channel.binding.challenge.create",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/confirm")
+async def confirm_channel_account_binding(
+    name: str,
+    payload: AccountBindingChallengeConfirmRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    code = str(payload.code or "").strip().upper()
+    if not code:
+        raise _unprocessable_entity(
+            "workspace_account_binding_challenge_invalid",
+            "code is required",
+        )
+
+    challenge = store.get_binding_challenge(code)
+    if challenge is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_not_found",
+                "The specified binding challenge was not found or has expired.",
+            ),
+        )
+    if str(challenge.get("account_id") or "") != account_id or str(challenge.get("tenant_id") or "") != tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_mismatch",
+                "This binding challenge does not belong to the current account.",
+            ),
+        )
+    if str(challenge.get("channel") or "") != channel_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_channel_mismatch",
+                "This binding challenge belongs to a different channel.",
+            ),
+        )
+    if str(challenge.get("status") or "") != "verified":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_not_verified",
+                "This binding challenge has not been verified yet.",
+            ),
+        )
+
+    verified_identity = str(challenge.get("verified_identity") or "")
+    verified_channel, _, sender_id = verified_identity.partition(":")
+    if not sender_id or verified_channel != channel_name:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=_api_error_detail(
+                "workspace_account_binding_challenge_invalid_identity",
+                "The verified identity for this challenge is invalid.",
+            ),
+        )
+
+    try:
+        store.attach_account_identity(account_id, tenant_id, channel_name, sender_id)
+        store.consume_binding_challenge(code, account_id=account_id, tenant_id=tenant_id)
+    except ValueError as exc:
+        reason_code = str(exc) or "workspace_account_binding_invalid"
+        if reason_code in {
+            "identity_bound_to_other_tenant",
+            "identity_not_linked_to_workspace",
+            "identity_bound_to_other_account",
+            "account_bound_to_other_tenant",
+        }:
+            raise _workspace_account_binding_conflict(reason_code) from exc
+        if reason_code in {
+            "binding_challenge_not_found",
+            "binding_challenge_expired",
+            "binding_challenge_not_verified",
+            "binding_challenge_owned_by_other_account",
+            "binding_challenge_bound_to_other_tenant",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_api_error_detail(
+                    "workspace_account_binding_challenge_invalid",
+                    "The binding challenge can no longer be confirmed.",
+                ),
+            ) from exc
+        raise _unprocessable_entity(reason_code, "Account binding update is invalid.") from exc
+
+    _audit(
+        request,
+        event="config.channel.binding.confirm",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/attach")
+async def attach_channel_account_binding(
+    name: str,
+    update: AccountBindingUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    sender_id = str(update.sender_id or "").strip()
+    if not sender_id:
+        raise _unprocessable_entity(
+            "workspace_account_binding_invalid",
+            "sender_id is required",
+        )
+
+    try:
+        store.attach_account_identity(account_id, tenant_id, channel_name, sender_id)
+    except ValueError as exc:
+        reason_code = str(exc) or "workspace_account_binding_invalid"
+        if reason_code in {
+            "identity_bound_to_other_tenant",
+            "identity_not_linked_to_workspace",
+            "identity_bound_to_other_account",
+            "account_bound_to_other_tenant",
+        }:
+            raise _workspace_account_binding_conflict(reason_code) from exc
+        raise _unprocessable_entity(reason_code, "Account binding update is invalid.") from exc
+
+    _audit(
+        request,
+        event="config.channel.binding.attach",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/detach")
+async def detach_channel_account_binding(
+    name: str,
+    update: AccountBindingUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "member")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    sender_id = str(update.sender_id or "").strip()
+    if not sender_id:
+        raise _unprocessable_entity(
+            "workspace_account_binding_invalid",
+            "sender_id is required",
+        )
+
+    removed = bool(store.detach_account_identity(account_id, channel_name, sender_id))
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_api_error_detail(
+                "workspace_account_binding_not_found",
+                "The specified identity is not bound to the current account.",
+            ),
+        )
+
+    _audit(
+        request,
+        event="config.channel.binding.detach",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.get("/api/channels/{name}/credentials")
+async def get_workspace_channel_credentials(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_credentials_channel(name)
+    tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    return _workspace_credentials_payload(
+        request,
+        tenant_id=tenant_id,
+        name=channel_name,
+        routing=getattr(tenant_cfg.workspace.channels, channel_name),
+    )
+
+
+@router.put("/api/channels/{name}/credentials")
+async def update_workspace_channel_credentials(
+    name: str,
+    update: dict[str, Any],
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_credentials_channel(name)
+    decision = ConfigOwnershipService.check_workspace_channel_credentials_ownership(
+        runtime_mode=_runtime_mode(request),
+        channel_name=channel_name,
+    )
+    if not decision.allowed:
+        status_code, reason_code, reason = _workspace_credentials_ownership_error(decision)
+        raise HTTPException(
+            status_code=status_code,
+            detail=_api_error_detail(reason_code, reason),
+        )
+
+    tenant_id, store, tenant_cfg = load_tenant_config(request, user)
+    current = getattr(tenant_cfg.workspace.channels, channel_name)
+    data = _normalize_workspace_credentials_update(channel_name, update)
+    merged = current.model_dump()
+    merged.update(data)
+    try:
+        updated = TenantChannelOverride.model_validate(merged)
+    except ValidationError as exc:
+        raise _channel_validation_error(
+            "workspace_channel_credentials_invalid",
+            "Workspace channel credentials update is invalid.",
+            exc=exc,
+        ) from exc
+
+    setattr(tenant_cfg.workspace.channels, channel_name, updated)
+    await save_tenant_config(request, tenant_id, store, tenant_cfg)
+    _audit(
+        request,
+        event="config.channel.credentials.update",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name},
+    )
+    return _workspace_credentials_payload(
+        request,
+        tenant_id=tenant_id,
+        name=channel_name,
+        routing=updated,
+    )
+
+
 @router.get("/api/channels/{name}/routing")
 async def get_workspace_channel_routing(
     name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
@@ -738,9 +1359,11 @@ async def get_workspace_channel_routing(
     require_min_role(user, "admin")
     channel_name = _ensure_workspace_channel(name)
     _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    tenant_id = _tenant_id
     system_cfg = _system_config(request)
     return _workspace_routing_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         system_channel=getattr(system_cfg.channels, channel_name),
         routing=getattr(tenant_cfg.workspace.channels, channel_name),
@@ -794,6 +1417,7 @@ async def update_workspace_channel_routing(
     )
     return _workspace_routing_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         system_channel=getattr(system_cfg.channels, channel_name),
         routing=updated,

@@ -93,3 +93,41 @@ def test_apply_updates_only_mutates_requested_fields() -> None:
 
     changed_again = service.apply_updates(tenant_cfg, exec_enabled=True, web_enabled=False)
     assert changed_again is False
+
+
+def test_build_payload_respects_system_policy_override() -> None:
+    service = WorkspaceToolPolicyService()
+    system_cfg = Config()
+    system_cfg.tools.exec.enabled = True
+    system_cfg.tools.exec.whitelist = ["tenant-a"]
+    system_cfg.tools.web.enabled = True
+
+    tenant_cfg = Config()
+    tenant_cfg.tools.exec.enabled = True
+    tenant_cfg.tools.exec.whitelist = []
+    tenant_cfg.tools.web.enabled = True
+
+    payload = service.build_payload(
+        system_cfg=system_cfg,
+        tenant_cfg=tenant_cfg,
+        tenant_id="tenant-a",
+        identities=["web:alice", "tenant-a"],
+        role="owner",
+        runtime_mode="multi",
+        write_status={
+            "writable": True,
+            "write_block_reason_code": None,
+            "write_block_reason": None,
+        },
+        runtime_cache={},
+        system_policy_override={
+            "exec_enabled": False,
+            "exec_whitelist": [],
+            "web_enabled": False,
+        },
+    )
+
+    assert payload["effective"]["exec"]["enabled"] is False
+    assert "system_disabled" in payload["effective"]["exec"]["reason_codes"]
+    assert payload["effective"]["web"]["enabled"] is False
+    assert "system_disabled" in payload["effective"]["web"]["reason_codes"]

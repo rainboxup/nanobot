@@ -501,6 +501,7 @@ async def auth_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str,
     role = str(user.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
     return {
         "username": username,
+        "account_id": username,
         "tenant_id": str(user.get("tenant_id") or ""),
         "role": role,
         "is_beta_admin": bool(role == ROLE_OWNER and is_beta_admin(username)),

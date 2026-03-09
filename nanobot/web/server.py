@@ -744,6 +744,7 @@ def create_app(
             "role": role_out,
             "tenant_id": str(user_rec.get("tenant_id") or username),
             "username": username_out,
+            "account_id": username_out,
             "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
         }
         response = JSONResponse(content=response_payload)
@@ -753,6 +754,7 @@ def create_app(
     # Routers
     from nanobot.web.api.audit import router as audit_router
     from nanobot.web.api.auth import router as auth_router
+    from nanobot.web.api.baseline_rollout import router as baseline_rollout_router
     from nanobot.web.api.beta import router as beta_router
     from nanobot.web.api.channels import router as channels_router
     from nanobot.web.api.chat import router as chat_router
@@ -765,6 +767,7 @@ def create_app(
 
     app.include_router(auth_router)
     app.include_router(audit_router)
+    app.include_router(baseline_rollout_router)
     app.include_router(providers_router)
     app.include_router(channels_router)
     app.include_router(soul_router)

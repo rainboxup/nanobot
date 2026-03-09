@@ -331,7 +331,14 @@ def gateway(
             tenant_lock_ttl_seconds=config.traffic.tenant_lock_ttl_seconds,
             max_cached_runtimes=config.traffic.max_cached_tenant_runtimes,
         )
-        channels = ChannelManager(config, bus, session_manager=None, inbound_bus=ingress)
+        channels = ChannelManager(
+            config,
+            bus,
+            session_manager=None,
+            inbound_bus=ingress,
+            tenant_store=store,
+            runtime_mode="multi",
+        )
 
         web_server = None
         if enable_web:
@@ -344,6 +351,7 @@ def gateway(
                 bus,
                 channel_manager=channels,
                 session_manager=None,
+                tenant_store=store,
                 runtime_mode="multi",
                 web_tenant_claim_secret=web_tenant_claim_secret,
             )

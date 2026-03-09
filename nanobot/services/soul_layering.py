@@ -100,8 +100,13 @@ class SoulLayeringService:
         *,
         workspace: Path,
         session_overlay: str | None = None,
+        platform_base_override: str | None = None,
     ) -> EffectiveSoul:
-        platform_base = self.load_platform_base_soul()
+        platform_base = (
+            self.load_platform_base_soul()
+            if platform_base_override is None
+            else str(platform_base_override)
+        )
         workspace_soul = self.load_workspace_soul(workspace)
         return self.merge_soul_layers(
             platform_base=platform_base,

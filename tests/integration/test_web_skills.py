@@ -36,19 +36,29 @@ async def test_skills_openapi_declares_explicit_response_models(http_client) -> 
     assert "SkillInstallResponseModel" in schemas
 
     paths = payload.get("paths", {})
-    skills_schema = paths["/api/skills"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    skills_schema = paths["/api/skills"]["get"]["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
     assert skills_schema["items"]["$ref"].endswith("/SkillListItemModel")
 
-    catalog_schema = paths["/api/skills/catalog"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    catalog_schema = paths["/api/skills/catalog"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
     assert catalog_schema["items"]["$ref"].endswith("/SkillCatalogItemModel")
 
-    catalog_v2_schema = paths["/api/skills/catalog/v2"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    catalog_v2_schema = paths["/api/skills/catalog/v2"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
     assert catalog_v2_schema["$ref"].endswith("/SkillCatalogV2ResponseModel")
 
-    install_schema = paths["/api/skills/install"]["post"]["responses"]["201"]["content"]["application/json"]["schema"]
+    install_schema = paths["/api/skills/install"]["post"]["responses"]["201"]["content"][
+        "application/json"
+    ]["schema"]
     assert install_schema["$ref"].endswith("/SkillInstallResponseModel")
 
-    detail_schema = paths["/api/skills/{name}"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+    detail_schema = paths["/api/skills/{name}"]["get"]["responses"]["200"]["content"][
+        "application/json"
+    ]["schema"]
     assert detail_schema["$ref"].endswith("/SkillDetailModel")
 
 
@@ -81,18 +91,16 @@ async def test_managed_skill_layer_is_visible_in_list_and_detail(
     managed_skill_dir.mkdir(parents=True, exist_ok=True)
     marker = "managed-layer-content"
     (managed_skill_dir / "SKILL.md").write_text(
-        "---\n"
-        "description: Managed layer skill\n"
-        "---\n"
-        "\n"
-        f"{marker}\n",
+        f"---\ndescription: Managed layer skill\n---\n\n{marker}\n",
         encoding="utf-8",
     )
 
     list_resp = await http_client.get("/api/skills", headers=auth_headers)
     assert list_resp.status_code == 200
     list_items = list_resp.json()
-    managed_item = next((item for item in list_items if item.get("name") == "managed-layer-skill"), None)
+    managed_item = next(
+        (item for item in list_items if item.get("name") == "managed-layer-skill"), None
+    )
     assert managed_item is not None
     assert managed_item.get("source") == "managed"
     assert managed_item.get("origin_source") == "store"
@@ -131,11 +139,7 @@ async def test_skill_catalog_clawhub_source_uses_local_installed_state(
     installed_dir = tenant_ctx.workspace / "skills" / "remote-installed-skill"
     installed_dir.mkdir(parents=True, exist_ok=True)
     (installed_dir / "SKILL.md").write_text(
-        "---\n"
-        "description: already installed\n"
-        "---\n"
-        "\n"
-        "Installed from local tenant workspace.\n",
+        "---\ndescription: already installed\n---\n\nInstalled from local tenant workspace.\n",
         encoding="utf-8",
     )
 
@@ -173,7 +177,9 @@ async def test_skill_catalog_clawhub_source_uses_local_installed_state(
     items = catalog.json()
     assert isinstance(items, list)
 
-    installed_item = next((item for item in items if item.get("name") == "remote-installed-skill"), None)
+    installed_item = next(
+        (item for item in items if item.get("name") == "remote-installed-skill"), None
+    )
     fresh_item = next((item for item in items if item.get("name") == "remote-fresh-skill"), None)
     assert installed_item is not None
     assert fresh_item is not None
@@ -253,7 +259,10 @@ async def test_skill_catalog_clawhub_source_ignores_store_metadata_flag(
     )
     assert catalog_v2.status_code == 200
     payload = catalog_v2.json()
-    v2_item = next((entry for entry in list(payload.get("items") or []) if entry.get("name") == remote_name), None)
+    v2_item = next(
+        (entry for entry in list(payload.get("items") or []) if entry.get("name") == remote_name),
+        None,
+    )
     assert v2_item is not None
     assert v2_item.get("source") == "clawhub"
     assert "store_metadata" not in v2_item
@@ -318,11 +327,7 @@ async def test_skill_catalog_source_all_deduplicates_same_name_with_local_preced
     local_dir = tenant_ctx.workspace / "skills" / shared_name
     local_dir.mkdir(parents=True, exist_ok=True)
     (local_dir / "SKILL.md").write_text(
-        "---\n"
-        "description: Local duplicate source\n"
-        "---\n"
-        "\n"
-        "local dedupe marker\n",
+        "---\ndescription: Local duplicate source\n---\n\nlocal dedupe marker\n",
         encoding="utf-8",
     )
 
@@ -382,11 +387,7 @@ async def test_skill_install_from_clawhub_zip_and_read_detail(
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr(
             "SKILL.md",
-            "---\n"
-            "description: Remote zip skill\n"
-            "---\n"
-            "\n"
-            f"{marker}\n",
+            f"---\ndescription: Remote zip skill\n---\n\n{marker}\n",
         )
         archive.writestr("README.md", "remote skill readme")
     zip_bytes = zip_buffer.getvalue()
@@ -442,7 +443,9 @@ async def test_skill_install_from_clawhub_zip_and_read_detail(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_skill_install_local_source_rejects_slug_or_version(http_client, auth_headers) -> None:
+async def test_skill_install_local_source_rejects_slug_or_version(
+    http_client, auth_headers
+) -> None:
     bad = await http_client.post(
         "/api/skills/install",
         headers=auth_headers,
@@ -502,7 +505,8 @@ async def test_skill_catalog_and_install(http_client, auth_headers) -> None:
         (
             item
             for item in items
-            if not bool(item.get("installed")) and str(item.get("source") or "").lower() != "clawhub"
+            if not bool(item.get("installed"))
+            and str(item.get("source") or "").lower() != "clawhub"
         ),
         None,
     )
@@ -551,11 +555,7 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     store_skill.mkdir(parents=True, exist_ok=True)
     marker = "This skill is installed from tenant skill store."
     (store_skill / "SKILL.md").write_text(
-        "---\n"
-        "description: Store only skill\n"
-        "---\n"
-        "\n"
-        f"{marker}\n",
+        f"---\ndescription: Store only skill\n---\n\n{marker}\n",
         encoding="utf-8",
     )
 
@@ -570,7 +570,9 @@ async def test_skill_catalog_includes_store_skill_and_can_install(
     assert bool(target.get("installed")) is False
     assert target.get("store_metadata") is None
 
-    detail_before_install = await http_client.get("/api/skills/store-only-skill", headers=auth_headers)
+    detail_before_install = await http_client.get(
+        "/api/skills/store-only-skill", headers=auth_headers
+    )
     assert detail_before_install.status_code == 200
     detail_before_body = detail_before_install.json()
     assert detail_before_body.get("source") == "managed"
@@ -706,7 +708,8 @@ async def test_skill_uninstall_success_and_404(http_client, auth_headers) -> Non
         (
             item
             for item in catalog.json()
-            if not bool(item.get("installed")) and str(item.get("source") or "").lower() != "clawhub"
+            if not bool(item.get("installed"))
+            and str(item.get("source") or "").lower() != "clawhub"
         ),
         None,
     )
@@ -752,7 +755,9 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
 
     non_object = await http_client.post(
         "/api/skills/install",
-        headers=await auth_headers_for("admin-skill-non-object", role="admin", tenant_id="admin-skill-non-object"),
+        headers=await auth_headers_for(
+            "admin-skill-non-object", role="admin", tenant_id="admin-skill-non-object"
+        ),
         json=[],
     )
     assert non_object.status_code == 422
@@ -761,7 +766,9 @@ async def test_skill_install_validation_and_permissions(http_client, auth_header
 
     unknown_fields = await http_client.post(
         "/api/skills/install",
-        headers=await auth_headers_for("admin-skill-extra", role="admin", tenant_id="admin-skill-extra"),
+        headers=await auth_headers_for(
+            "admin-skill-extra", role="admin", tenant_id="admin-skill-extra"
+        ),
         json={"name": "not-exists-skill", "unexpected_field": True},
     )
     assert unknown_fields.status_code == 422
@@ -812,7 +819,10 @@ async def test_mcp_catalog_and_install(http_client, auth_headers) -> None:
     catalog_after = await http_client.get("/api/mcp/catalog", headers=auth_headers)
     assert catalog_after.status_code == 200
     after_items = catalog_after.json()
-    assert any(item.get("id") == "filesystem" and bool(item.get("installed")) is True for item in after_items)
+    assert any(
+        item.get("id") == "filesystem" and bool(item.get("installed")) is True
+        for item in after_items
+    )
 
 
 @pytest.mark.integration
@@ -825,7 +835,9 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
         json={"preset": "filesystem"},
     )
     assert denied.status_code == 403
-    denied_uninstall = await http_client.delete("/api/mcp/servers/filesystem", headers=member_headers)
+    denied_uninstall = await http_client.delete(
+        "/api/mcp/servers/filesystem", headers=member_headers
+    )
     assert denied_uninstall.status_code == 403
 
     bad_name = await http_client.post(
@@ -839,7 +851,9 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
 
     non_object = await http_client.post(
         "/api/mcp/install",
-        headers=await auth_headers_for("admin-mcp-non-object", role="admin", tenant_id="admin-mcp-non-object"),
+        headers=await auth_headers_for(
+            "admin-mcp-non-object", role="admin", tenant_id="admin-mcp-non-object"
+        ),
         json=[],
     )
     assert non_object.status_code == 422
@@ -858,7 +872,9 @@ async def test_mcp_install_validation_and_permissions(http_client, auth_headers_
 
     unknown_fields = await http_client.post(
         "/api/mcp/install",
-        headers=await auth_headers_for("admin-mcp-extra", role="admin", tenant_id="admin-mcp-extra"),
+        headers=await auth_headers_for(
+            "admin-mcp-extra", role="admin", tenant_id="admin-mcp-extra"
+        ),
         json={"preset": "missing-preset", "unexpected_field": True},
     )
     assert unknown_fields.status_code == 422
@@ -902,13 +918,17 @@ async def test_mcp_uninstall_success_and_404(http_client, auth_headers) -> None:
     assert servers.status_code == 200
     assert not any(item.get("name") == "filesystem-to-remove" for item in servers.json())
 
-    remove_again = await http_client.delete("/api/mcp/servers/filesystem-to-remove", headers=auth_headers)
+    remove_again = await http_client.delete(
+        "/api/mcp/servers/filesystem-to-remove", headers=auth_headers
+    )
     assert remove_again.status_code == 404
 
 
 @pytest.mark.integration
 @pytest.mark.asyncio
-async def test_tools_policy_layering_can_be_more_restrictive(http_client, auth_headers, web_ctx) -> None:
+async def test_tools_policy_layering_can_be_more_restrictive(
+    http_client, auth_headers, web_ctx
+) -> None:
     web_ctx.app.state.config.tools.exec.enabled = True
     web_ctx.app.state.config.tools.exec.whitelist = ["admin"]
     web_ctx.app.state.config.tools.web.enabled = True
@@ -951,7 +971,9 @@ async def test_tools_policy_cannot_exceed_system_cap(http_client, auth_headers, 
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_tools_policy_get_requires_admin(http_client, auth_headers_for) -> None:
-    member_headers = await auth_headers_for("policy-member", role="member", tenant_id="policy-member")
+    member_headers = await auth_headers_for(
+        "policy-member", role="member", tenant_id="policy-member"
+    )
     denied = await http_client.get("/api/tools/policy", headers=member_headers)
     assert denied.status_code == 403
 
@@ -1015,8 +1037,12 @@ async def test_tools_policy_redacts_system_whitelist_for_non_owner(
 async def test_tools_policy_redacts_subject_identities_for_non_owner(
     http_client, auth_headers_for
 ) -> None:
-    admin_headers = await auth_headers_for("policy-admin-subject", role="admin", tenant_id="tenant-a")
-    owner_headers = await auth_headers_for("policy-owner-subject", role="owner", tenant_id="tenant-a")
+    admin_headers = await auth_headers_for(
+        "policy-admin-subject", role="admin", tenant_id="tenant-a"
+    )
+    owner_headers = await auth_headers_for(
+        "policy-owner-subject", role="owner", tenant_id="tenant-a"
+    )
 
     as_admin = await http_client.get("/api/tools/policy", headers=admin_headers)
     assert as_admin.status_code == 200
@@ -1078,7 +1104,14 @@ async def test_tools_policy_effective_contract_matches_runtime_resolver(
     async def _fake_process_message(inbound: InboundMessage) -> OutboundMessage:
         return OutboundMessage(channel=inbound.channel, chat_id=inbound.chat_id, content="ok")
 
-    def _fake_runtime_factory(_tenant, _tenant_cfg, *, enable_exec: bool, enable_web: bool = True):
+    def _fake_runtime_factory(
+        _tenant,
+        _tenant_cfg,
+        *,
+        enable_exec: bool,
+        enable_web: bool = True,
+        **_kwargs,
+    ):
         observed["exec"] = bool(enable_exec)
         observed["web"] = bool(enable_web)
         return SimpleNamespace(agent=SimpleNamespace(_process_message=_fake_process_message))
@@ -1121,7 +1154,9 @@ async def test_tools_policy_effective_contract_matches_runtime_resolver(
 async def test_tools_policy_put_response_redacts_subject_identities_for_non_owner(
     http_client, auth_headers_for
 ) -> None:
-    admin_headers = await auth_headers_for("policy-admin-put-subject", role="admin", tenant_id="tenant-a")
+    admin_headers = await auth_headers_for(
+        "policy-admin-put-subject", role="admin", tenant_id="tenant-a"
+    )
     updated = await http_client.put(
         "/api/tools/policy",
         headers=admin_headers,
@@ -1147,7 +1182,9 @@ async def test_tools_policy_exposes_runtime_and_write_metadata_in_single_mode(
     http_client, auth_headers_for, web_ctx
 ) -> None:
     web_ctx.app.state.runtime_mode = "single"
-    admin_headers = await auth_headers_for("policy-admin-single", role="admin", tenant_id="tenant-single")
+    admin_headers = await auth_headers_for(
+        "policy-admin-single", role="admin", tenant_id="tenant-single"
+    )
 
     resp = await http_client.get("/api/tools/policy", headers=admin_headers)
     assert resp.status_code == 200
@@ -1178,7 +1215,9 @@ async def test_tools_policy_exposes_web_session_cache_runtime_metadata_for_owner
     web_ctx.app.state.tenant_session_manager_max_entries = 11
     web_ctx.app.state.tenant_session_managers = {"t1": object(), "t2": object()}
     web_ctx.app.state.tenant_session_manager_evictions_total = 4
-    owner_headers = await auth_headers_for("policy-owner-runtime-cache", role="owner", tenant_id="tenant-cache")
+    owner_headers = await auth_headers_for(
+        "policy-owner-runtime-cache", role="owner", tenant_id="tenant-cache"
+    )
 
     resp = await http_client.get("/api/tools/policy", headers=owner_headers)
     assert resp.status_code == 200
@@ -1200,7 +1239,9 @@ async def test_tools_policy_redacts_web_session_cache_runtime_metadata_for_admin
     web_ctx.app.state.tenant_session_manager_max_entries = 11
     web_ctx.app.state.tenant_session_managers = {"t1": object(), "t2": object()}
     web_ctx.app.state.tenant_session_manager_evictions_total = 4
-    admin_headers = await auth_headers_for("policy-admin-runtime-cache", role="admin", tenant_id="tenant-cache")
+    admin_headers = await auth_headers_for(
+        "policy-admin-runtime-cache", role="admin", tenant_id="tenant-cache"
+    )
 
     resp = await http_client.get("/api/tools/policy", headers=admin_headers)
     assert resp.status_code == 200
@@ -1219,7 +1260,9 @@ async def test_tools_policy_redacts_web_session_cache_runtime_metadata_for_admin
 @pytest.mark.asyncio
 async def test_tools_policy_effective_reason_codes(http_client, auth_headers_for, web_ctx) -> None:
     tenant_id = "tenant-policy-reasons"
-    admin_headers = await auth_headers_for("policy-admin-reasons", role="admin", tenant_id=tenant_id)
+    admin_headers = await auth_headers_for(
+        "policy-admin-reasons", role="admin", tenant_id=tenant_id
+    )
 
     web_ctx.app.state.config.tools.exec.enabled = True
     web_ctx.app.state.config.tools.exec.whitelist = [tenant_id]
@@ -1278,7 +1321,7 @@ async def test_skills_api_paths_are_sanitized(web_ctx, http_client, auth_headers
     assert isinstance(rows, list)
     assert rows
 
-    allowed_prefixes = ("workspace://", "builtin://", "store://", "managed://")
+    allowed_prefixes = ("workspace://", "bundled://", "store://", "managed://")
     workspace_path_text = str(web_ctx.workspace_dir).lower()
 
     first_name = str(rows[0].get("name") or "")
@@ -1308,7 +1351,8 @@ async def test_skill_install_is_tenant_isolated(http_client, auth_headers_for) -
         (
             item
             for item in alice_catalog.json()
-            if not bool(item.get("installed")) and str(item.get("source") or "").lower() != "clawhub"
+            if not bool(item.get("installed"))
+            and str(item.get("source") or "").lower() != "clawhub"
         ),
         None,
     )
@@ -1328,12 +1372,30 @@ async def test_skill_install_is_tenant_isolated(http_client, auth_headers_for) -
     assert alice_skills.status_code == 200
     assert bob_skills.status_code == 200
 
-    alice_item = next((item for item in alice_skills.json() if item.get("name") == skill_name), None)
+    alice_item = next(
+        (item for item in alice_skills.json() if item.get("name") == skill_name), None
+    )
     bob_item = next((item for item in bob_skills.json() if item.get("name") == skill_name), None)
     assert alice_item is not None
     assert bob_item is not None
     assert alice_item.get("source") == "workspace"
-    assert bob_item.get("source") == "builtin"
+    assert bob_item.get("source") == "bundled"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_skill_catalog_uses_bundled_as_public_term(http_client, auth_headers) -> None:
+    response = await http_client.get("/api/skills/catalog", headers=auth_headers)
+    assert response.status_code == 200
+    items = response.json()
+    assert items
+
+    bundled_item = next(
+        (item for item in items if str(item.get("source") or "") == "bundled"),
+        None,
+    )
+    assert bundled_item is not None
+    assert bundled_item.get("origin_source") == "builtin"
 
 
 @pytest.mark.integration
@@ -1345,11 +1407,7 @@ async def test_skill_catalog_includes_workspace_only_installed_skill(
     skill_dir = tenant_ctx.workspace / "skills" / "tenant-only-skill"
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(
-        "---\n"
-        "description: Tenant only skill\n"
-        "---\n"
-        "\n"
-        "This skill exists only in tenant workspace.\n",
+        "---\ndescription: Tenant only skill\n---\n\nThis skill exists only in tenant workspace.\n",
         encoding="utf-8",
     )
 
@@ -1363,14 +1421,15 @@ async def test_skill_catalog_includes_workspace_only_installed_skill(
     assert item.get("source") == "workspace"
 
 
-
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_skill_and_mcp_writes_are_blocked_in_single_mode(
     http_client, auth_headers_for, web_ctx
 ) -> None:
     web_ctx.app.state.runtime_mode = "single"
-    admin_headers = await auth_headers_for("single-mode-admin", role="admin", tenant_id="tenant-single")
+    admin_headers = await auth_headers_for(
+        "single-mode-admin", role="admin", tenant_id="tenant-single"
+    )
 
     blocked_skill = await http_client.post(
         "/api/skills/install",
@@ -1395,7 +1454,9 @@ async def test_skill_and_mcp_writes_are_blocked_in_single_mode(
     blocked_mcp_detail = dict(blocked_mcp.json().get("detail") or {})
     assert blocked_mcp_detail.get("reason_code") == "single_tenant_runtime_mode"
 
-    blocked_mcp_delete = await http_client.delete("/api/mcp/servers/filesystem", headers=admin_headers)
+    blocked_mcp_delete = await http_client.delete(
+        "/api/mcp/servers/filesystem", headers=admin_headers
+    )
     assert blocked_mcp_delete.status_code == 409
     blocked_mcp_delete_detail = dict(blocked_mcp_delete.json().get("detail") or {})
     assert blocked_mcp_delete_detail.get("reason_code") == "single_tenant_runtime_mode"

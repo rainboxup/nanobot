@@ -82,6 +82,8 @@ def test_default_registry_uses_bundled_help_docs_that_match_repo_docs() -> None:
     bundled_store = (bundled_dir / "managed-skill-store-integrity.md").read_text(encoding="utf-8")
     repo_store = (repo_root / "docs/howto/managed-skill-store-integrity.md").read_text(encoding="utf-8")
     assert bundled_store == repo_store
+    assert "bundled 技能：`source=bundled`" in repo_store
+    assert "bundled 技能：`source=builtin`" not in repo_store
 
     store_doc = registry.get_doc("managed-skill-store-integrity")
     assert store_doc is not None

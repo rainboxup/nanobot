@@ -7,14 +7,81 @@ from typing import TYPE_CHECKING, Any
 
 from loguru import logger
 
-from nanobot.bus.events import OutboundMessage
+from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config, TenantChannelOverride
+from nanobot.services.channel_routing import normalize_sender_id
 from nanobot.utils.message_splitter import split_markdown
 
 if TYPE_CHECKING:
     from nanobot.session.manager import SessionManager
+
+
+_WORKSPACE_CHANNEL_CREDENTIAL_FIELDS: dict[str, tuple[str, ...]] = {
+    "feishu": ("app_id", "app_secret"),
+    "dingtalk": ("client_id", "client_secret"),
+}
+
+
+def _workspace_channel_credentials(name: str, source: Any) -> dict[str, str]:
+    fields = _WORKSPACE_CHANNEL_CREDENTIAL_FIELDS.get(name, ())
+    if isinstance(source, dict):
+        return {field: str(source.get(field, "") or "") for field in fields}
+    return {field: str(getattr(source, field, "") or "") for field in fields}
+
+
+def _workspace_channel_credentials_complete(name: str, source: Any) -> bool:
+    credentials = _workspace_channel_credentials(name, source)
+    return bool(credentials) and all(value.strip() for value in credentials.values())
+
+
+def _canonical_sender_id(msg: InboundMessage) -> str:
+    if isinstance(msg.metadata, dict) and "user_id" in msg.metadata:
+        try:
+            return normalize_sender_id(str(int(msg.metadata["user_id"])))
+        except Exception:
+            return normalize_sender_id(msg.metadata["user_id"])
+    sender = str(msg.sender_id or "")
+    return normalize_sender_id(sender.split("|", 1)[0] if sender else "")
+
+
+class _TenantBoundInboundBus:
+    def __init__(self, bus: Any, tenant_store: Any, tenant_id: str, channel_name: str):
+        self._bus = bus
+        self._tenant_store = tenant_store
+        self._tenant_id = str(tenant_id)
+        self._channel_name = str(channel_name)
+
+    async def publish_inbound(self, msg: InboundMessage) -> Any:
+        if not isinstance(msg.metadata, dict):
+            msg.metadata = {}
+        msg.metadata["tenant_id"] = self._tenant_id
+
+        canonical_sender = _canonical_sender_id(msg)
+        if canonical_sender:
+            try:
+                await asyncio.to_thread(
+                    self._tenant_store.link_identity,
+                    self._tenant_id,
+                    self._channel_name,
+                    canonical_sender,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to pre-link workspace runtime identity tenant={} channel={} sender={}: {}",
+                    self._tenant_id,
+                    self._channel_name,
+                    canonical_sender,
+                    e,
+                )
+                return False
+            msg.metadata["canonical_sender_id"] = canonical_sender
+
+        return await self._bus.publish_inbound(msg)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._bus, name)
 
 
 class ChannelManager:
@@ -33,6 +100,8 @@ class ChannelManager:
         bus: MessageBus,
         session_manager: "SessionManager | None" = None,
         inbound_bus: Any | None = None,
+        tenant_store: Any | None = None,
+        runtime_mode: str = "single",
     ):
         self.config = config
         # The shared bus is used for outbound delivery. For inbound publishing we may wrap it
@@ -40,10 +109,174 @@ class ChannelManager:
         self.bus = bus
         self.inbound_bus = inbound_bus or bus
         self.session_manager = session_manager
+        self.tenant_store = tenant_store
+        self.runtime_mode = "multi" if str(runtime_mode or "").strip().lower() == "multi" else "single"
         self.channels: dict[str, BaseChannel] = {}
+        self._workspace_channels: dict[str, dict[str, BaseChannel]] = {}
+        self._workspace_runtime_credentials: dict[tuple[str, str], dict[str, str]] = {}
         self._dispatch_task: asyncio.Task | None = None
 
         self._init_channels()
+
+    def _iter_all_channels(self) -> list[tuple[str, BaseChannel]]:
+        rows = list(self.channels.items())
+        for name, tenant_rows in self._workspace_channels.items():
+            for tenant_id, channel in tenant_rows.items():
+                rows.append((f"{name}@{tenant_id}", channel))
+        return rows
+
+    def _workspace_channel_config(self, channel_name: str, routing: TenantChannelOverride) -> Any | None:
+        base_config = getattr(self.config.channels, channel_name, None)
+        if base_config is None:
+            return None
+        config = base_config.model_copy(deep=True)
+        config.enabled = True
+        for field, value in _workspace_channel_credentials(channel_name, routing).items():
+            setattr(config, field, value)
+        return config
+
+    def _workspace_inbound_bus(self, tenant_id: str, channel_name: str) -> Any:
+        if self.tenant_store is None:
+            return self.inbound_bus
+        return _TenantBoundInboundBus(self.inbound_bus, self.tenant_store, tenant_id, channel_name)
+
+    def _create_workspace_channel(self, channel_name: str, config: Any, inbound_bus: Any) -> BaseChannel | None:
+        try:
+            if channel_name == "feishu":
+                from nanobot.channels.feishu import FeishuChannel
+
+                return FeishuChannel(config, inbound_bus)
+            if channel_name == "dingtalk":
+                from nanobot.channels.dingtalk import DingTalkChannel
+
+                return DingTalkChannel(config, inbound_bus)
+        except ImportError as e:
+            logger.warning("{} workspace runtime unavailable: {}", channel_name, e)
+            return None
+        return None
+
+    async def _remove_workspace_channel_runtime(self, tenant_id: str, channel_name: str) -> None:
+        runtime = self._workspace_channels.get(channel_name, {}).pop(tenant_id, None)
+        self._workspace_runtime_credentials.pop((channel_name, tenant_id), None)
+        if runtime is None:
+            return
+        try:
+            await runtime.stop()
+        except Exception as e:
+            logger.error("Error stopping {} workspace runtime for {}: {}", channel_name, tenant_id, e)
+        if not self._workspace_channels.get(channel_name):
+            self._workspace_channels.pop(channel_name, None)
+
+    async def refresh_workspace_channel_runtimes(self) -> None:
+        if self.runtime_mode != "multi" or self.tenant_store is None:
+            return
+
+        desired: dict[tuple[str, str], tuple[TenantChannelOverride, dict[str, str]]] = {}
+        tenant_ids = await asyncio.to_thread(self.tenant_store.list_tenant_ids)
+        for tenant_id in tenant_ids:
+            try:
+                tenant_cfg = await asyncio.to_thread(
+                    self.tenant_store.load_runtime_tenant_config,
+                    tenant_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Skipping workspace channel runtime refresh for tenant {}: {}",
+                    tenant_id,
+                    e,
+                )
+                continue
+            for channel_name in _WORKSPACE_CHANNEL_CREDENTIAL_FIELDS:
+                routing = getattr(tenant_cfg.workspace.channels, channel_name, None)
+                if not isinstance(routing, TenantChannelOverride):
+                    continue
+                if not _workspace_channel_credentials_complete(channel_name, routing):
+                    continue
+                desired[(channel_name, tenant_id)] = (
+                    routing,
+                    _workspace_channel_credentials(channel_name, routing),
+                )
+
+        existing_keys = {
+            (channel_name, tenant_id)
+            for channel_name, tenant_rows in self._workspace_channels.items()
+            for tenant_id in tenant_rows
+        }
+
+        for channel_name, tenant_id in sorted(existing_keys - set(desired.keys())):
+            await self._remove_workspace_channel_runtime(tenant_id, channel_name)
+
+        for (channel_name, tenant_id), (routing, credentials) in desired.items():
+            current = self._workspace_runtime_credentials.get((channel_name, tenant_id))
+            if current == credentials and tenant_id in self._workspace_channels.get(channel_name, {}):
+                continue
+
+            await self._remove_workspace_channel_runtime(tenant_id, channel_name)
+            channel_config = self._workspace_channel_config(channel_name, routing)
+            if channel_config is None:
+                continue
+
+            runtime = self._create_workspace_channel(
+                channel_name,
+                channel_config,
+                self._workspace_inbound_bus(tenant_id, channel_name),
+            )
+            if runtime is None:
+                continue
+
+            self.register_workspace_channel_runtime(
+                tenant_id,
+                channel_name,
+                runtime,
+                credential_config=credentials,
+            )
+
+    def register_workspace_channel_runtime(
+        self,
+        tenant_id: str,
+        channel_name: str,
+        channel: BaseChannel,
+        *,
+        credential_config: dict[str, str] | None = None,
+    ) -> None:
+        tenant_key = str(tenant_id)
+        self._workspace_channels.setdefault(channel_name, {})[tenant_key] = channel
+        self._workspace_runtime_credentials[(channel_name, tenant_key)] = {
+            key: str(value or "")
+            for key, value in (
+                credential_config or _workspace_channel_credentials(channel_name, getattr(channel, "config", None))
+            ).items()
+        }
+
+    def get_workspace_channel_runtime(self, tenant_id: str, channel_name: str) -> BaseChannel | None:
+        return self._workspace_channels.get(channel_name, {}).get(str(tenant_id))
+
+    def is_workspace_channel_runtime_active(
+        self,
+        tenant_id: str,
+        channel_name: str,
+        credential_config: dict[str, Any],
+    ) -> bool:
+        current = {
+            key: str(value or "")
+            for key, value in _workspace_channel_credentials(channel_name, credential_config).items()
+        }
+        if not current or not all(value.strip() for value in current.values()):
+            return False
+        runtime = self.get_workspace_channel_runtime(tenant_id, channel_name)
+        if runtime is None or not runtime.is_running:
+            return False
+        return self._workspace_runtime_credentials.get((channel_name, str(tenant_id))) == current
+
+    def _resolve_outbound_channel(self, msg: OutboundMessage) -> BaseChannel | None:
+        tenant_id = ""
+        if isinstance(msg.metadata, dict):
+            tenant_id = str(msg.metadata.get("tenant_id") or "").strip()
+        if tenant_id:
+            tenant_channel = self.get_workspace_channel_runtime(tenant_id, msg.channel)
+            if tenant_channel is not None:
+                return tenant_channel
+        return self.channels.get(msg.channel)
 
     def _init_channels(self) -> None:
         """Initialize channels based on config."""
@@ -174,7 +407,10 @@ class ChannelManager:
 
     async def start_all(self) -> None:
         """Start all channels and the outbound dispatcher."""
-        if not self.channels:
+        await self.refresh_workspace_channel_runtimes()
+
+        channels = self._iter_all_channels()
+        if not channels:
             logger.warning("No channels enabled")
             return
 
@@ -182,7 +418,7 @@ class ChannelManager:
         self._dispatch_task = asyncio.create_task(self._dispatch_outbound())
         # Start channels
         tasks = []
-        for name, channel in self.channels.items():
+        for name, channel in channels:
             logger.info("Starting {} channel...", name)
             tasks.append(asyncio.create_task(self._start_channel(name, channel)))
 
@@ -202,7 +438,7 @@ class ChannelManager:
                 pass
 
         # Stop all channels
-        for name, channel in self.channels.items():
+        for name, channel in self._iter_all_channels():
             try:
                 await channel.stop()
                 logger.info("Stopped {} channel", name)
@@ -230,7 +466,7 @@ class ChannelManager:
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
 
-                channel = self.channels.get(msg.channel)
+                channel = self._resolve_outbound_channel(msg)
                 if not channel:
                     logger.warning("Unknown channel: {}", msg.channel)
                     continue

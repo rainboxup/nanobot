@@ -25,10 +25,12 @@ class ContextBuilder:
         workspace: Path,
         *,
         platform_base_soul_path: Path | None = None,
+        platform_base_soul_content: str | None = None,
         managed_skills_dir: Path | None = None,
     ):
         self.workspace = workspace
         self.platform_base_soul_path = platform_base_soul_path
+        self.platform_base_soul_content = platform_base_soul_content
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, managed_skills_dir=managed_skills_dir)
 
@@ -45,11 +47,12 @@ class ContextBuilder:
         *,
         channel: str | None = None,
         chat_id: str | None = None,
+        session_overlay: str | None = None,
     ) -> str:
         """Build the system prompt from identity, bootstrap files, memory, and skills."""
         parts = [self._get_identity()]
 
-        bootstrap = self._load_bootstrap_files()
+        bootstrap = self._load_bootstrap_files(session_overlay=session_overlay)
         if bootstrap:
             parts.append(bootstrap)
 
@@ -112,7 +115,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
-    def _load_bootstrap_files(self) -> str:
+    def _load_bootstrap_files(self, *, session_overlay: str | None = None) -> str:
         """Load all bootstrap files from workspace."""
         parts = []
         try:
@@ -122,7 +125,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         for filename in self.BOOTSTRAP_FILES:
             if filename == "SOUL.md":
-                content = self._load_layered_soul()
+                content = self._load_layered_soul(session_overlay=session_overlay)
                 if content:
                     parts.append(f"## {filename}\n\n{content}")
                 continue
@@ -143,9 +146,13 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         return "\n\n".join(parts) if parts else ""
 
-    def _load_layered_soul(self) -> str:
+    def _load_layered_soul(self, *, session_overlay: str | None = None) -> str:
         svc = SoulLayeringService(platform_base_soul_path=self.platform_base_soul_path)
-        effective = svc.generate_effective_preview(workspace=self.workspace, session_overlay=None)
+        effective = svc.generate_effective_preview(
+            workspace=self.workspace,
+            session_overlay=session_overlay,
+            platform_base_override=self.platform_base_soul_content,
+        )
         return str(effective.merged_content or "").strip()
 
     def build_messages(
@@ -156,12 +163,18 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         media: list[str] | None = None,
         channel: str | None = None,
         chat_id: str | None = None,
+        session_overlay: str | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         return [
             {
                 "role": "system",
-                "content": self.build_system_prompt(skill_names, channel=channel, chat_id=chat_id),
+                "content": self.build_system_prompt(
+                    skill_names,
+                    channel=channel,
+                    chat_id=chat_id,
+                    session_overlay=session_overlay,
+                ),
             },
             *history,
             {"role": "user", "content": self._build_runtime_context(channel, chat_id)},

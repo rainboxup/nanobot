@@ -71,6 +71,10 @@ def _make_link_code(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _normalize_account_id(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class LinkTarget:
     tenant_id: str
@@ -478,6 +482,384 @@ class TenantStore:
             if not isinstance(tenants, dict):
                 return 0
             return len(tenants)
+
+    def list_tenant_ids(self) -> list[str]:
+        """Return the current tenant ids in stable order."""
+        with self._index_lock:
+            data = self._load()
+            tenants = data.get("tenants") or {}
+            if not isinstance(tenants, dict):
+                return []
+            return sorted(str(tenant_id) for tenant_id in tenants.keys())
+
+    def ensure_account(self, account_id: str, tenant_id: str) -> dict[str, Any]:
+        """Ensure an account record exists for a tenant."""
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if isinstance(account, dict):
+                current_tenant = str(account.get("tenant_id") or "")
+                if current_tenant and current_tenant != tenant_id:
+                    raise ValueError("account_bound_to_other_tenant")
+            else:
+                account = {"tenant_id": tenant_id, "identities": []}
+                data["accounts"][normalized_account] = account
+
+            account["tenant_id"] = tenant_id
+            identities = account.get("identities") or []
+            account["identities"] = [str(x) for x in identities]
+            self._save(data)
+
+        self.ensure_tenant_files(tenant_id)
+        return {
+            "account_id": normalized_account,
+            "tenant_id": tenant_id,
+            "identities": sorted(account["identities"]),
+        }
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return None
+        with self._index_lock:
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if not isinstance(account, dict):
+                return None
+            return {
+                "account_id": normalized_account,
+                "tenant_id": str(account.get("tenant_id") or ""),
+                "identities": sorted(str(x) for x in (account.get("identities") or [])),
+            }
+
+    def list_account_identities(self, account_id: str, *, channel: str | None = None) -> list[str]:
+        account = self.get_account(account_id)
+        if not account:
+            return []
+        identities = [str(x) for x in account.get("identities") or []]
+        if channel is None:
+            return identities
+        prefix = f"{channel}:"
+        return [identity for identity in identities if identity.startswith(prefix)]
+
+    def attach_account_identity(
+        self,
+        account_id: str,
+        tenant_id: str,
+        channel: str,
+        sender_id: str,
+    ) -> dict[str, Any]:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+        identity_key = f"{channel}:{sender_id}"
+
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if isinstance(account, dict):
+                current_tenant = str(account.get("tenant_id") or "")
+                if current_tenant and current_tenant != tenant_id:
+                    raise ValueError("account_bound_to_other_tenant")
+            else:
+                account = {"tenant_id": tenant_id, "identities": []}
+                data["accounts"][normalized_account] = account
+
+            current_identity_tenant = str(data["identity_to_tenant"].get(identity_key) or "")
+            if not current_identity_tenant:
+                raise ValueError("identity_not_linked_to_workspace")
+            if current_identity_tenant != tenant_id:
+                raise ValueError("identity_bound_to_other_tenant")
+            for existing_account_id, existing_account in data["accounts"].items():
+                if existing_account_id == normalized_account or not isinstance(existing_account, dict):
+                    continue
+                existing_identities = [str(x) for x in (existing_account.get("identities") or [])]
+                if identity_key in existing_identities:
+                    raise ValueError("identity_bound_to_other_account")
+
+            account["tenant_id"] = tenant_id
+            identities = [str(x) for x in (account.get("identities") or [])]
+            if identity_key not in identities:
+                identities.append(identity_key)
+            account["identities"] = identities
+            self._save(data)
+
+        self.ensure_tenant_files(tenant_id)
+        return {
+            "account_id": normalized_account,
+            "tenant_id": tenant_id,
+            "identities": sorted(account["identities"]),
+        }
+
+    def detach_account_identity(self, account_id: str, channel: str, sender_id: str) -> bool:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return False
+        identity_key = f"{channel}:{sender_id}"
+
+        removed = False
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if not isinstance(account, dict):
+                return False
+
+            identities = [str(x) for x in (account.get("identities") or [])]
+            if identity_key in identities:
+                identities = [identity for identity in identities if identity != identity_key]
+                account["identities"] = identities
+                removed = True
+
+            if removed and not account["identities"]:
+                data["accounts"].pop(normalized_account, None)
+
+            self._save(data)
+
+        return removed
+
+    def create_binding_challenge(
+        self,
+        account_id: str,
+        tenant_id: str,
+        channel: str,
+        ttl_s: int = 5 * 60,
+    ) -> dict[str, Any]:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+        normalized_channel = str(channel or "").strip().lower()
+        if not normalized_channel:
+            raise ValueError("channel required")
+
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            now = _utc_now()
+            codes_to_remove: list[str] = []
+            for existing_code, existing in list(challenges.items()):
+                if not isinstance(existing, dict):
+                    codes_to_remove.append(existing_code)
+                    continue
+                status = str(existing.get("status") or "pending")
+                expires_raw = str(existing.get("expires_at") or "")
+                try:
+                    expires_at = _dt_from_iso(expires_raw)
+                except Exception:
+                    codes_to_remove.append(existing_code)
+                    continue
+                if now >= expires_at or status == "consumed":
+                    codes_to_remove.append(existing_code)
+                    continue
+                if (
+                    str(existing.get("account_id") or "") == normalized_account
+                    and str(existing.get("channel") or "") == normalized_channel
+                ):
+                    codes_to_remove.append(existing_code)
+
+            for existing_code in codes_to_remove:
+                challenges.pop(existing_code, None)
+
+            code = _make_link_code()
+            while code in challenges:
+                code = _make_link_code()
+
+            challenge = {
+                "account_id": normalized_account,
+                "tenant_id": tenant_id,
+                "channel": normalized_channel,
+                "status": "pending",
+                "created_at": _dt_to_iso(now),
+                "expires_at": _dt_to_iso(now + timedelta(seconds=ttl_s)),
+                "verified_identity": None,
+                "verified_at": None,
+                "consumed_at": None,
+            }
+            challenges[code] = challenge
+            self._save(data)
+            return {"code": code, **challenge}
+
+    def get_binding_challenge(self, code: str) -> dict[str, Any] | None:
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            raw = challenges.get(code)
+            if not isinstance(raw, dict):
+                if code in challenges:
+                    challenges.pop(code, None)
+                    self._save(data)
+                return None
+
+            try:
+                expires_at = _dt_from_iso(str(raw.get("expires_at") or ""))
+            except Exception:
+                challenges.pop(code, None)
+                self._save(data)
+                return None
+
+            if _utc_now() >= expires_at or str(raw.get("status") or "") == "consumed":
+                challenges.pop(code, None)
+                self._save(data)
+                return None
+
+            return {"code": code, **raw}
+
+    def get_active_binding_challenge(
+        self,
+        account_id: str,
+        tenant_id: str,
+        channel: str,
+    ) -> dict[str, Any] | None:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return None
+        tenant_id = validate_tenant_id(tenant_id)
+        normalized_channel = str(channel or "").strip().lower()
+        if not normalized_channel:
+            return None
+
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            now = _utc_now()
+            active: dict[str, Any] | None = None
+            dirty = False
+
+            for code, raw in list(challenges.items()):
+                if not isinstance(raw, dict):
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                try:
+                    expires_at = _dt_from_iso(str(raw.get("expires_at") or ""))
+                except Exception:
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                status = str(raw.get("status") or "")
+                if now >= expires_at or status == "consumed":
+                    challenges.pop(code, None)
+                    dirty = True
+                    continue
+
+                if (
+                    str(raw.get("account_id") or "") == normalized_account
+                    and str(raw.get("tenant_id") or "") == tenant_id
+                    and str(raw.get("channel") or "") == normalized_channel
+                ):
+                    candidate = {"code": code, **raw}
+                    if active is None or str(candidate.get("created_at") or "") > str(
+                        active.get("created_at") or ""
+                    ):
+                        active = candidate
+
+            if dirty:
+                self._save(data)
+
+            return active
+
+    def verify_binding_challenge(
+        self,
+        code: str,
+        channel: str,
+        sender_id: str,
+    ) -> dict[str, Any]:
+        normalized_channel = str(channel or "").strip().lower()
+        if not normalized_channel:
+            raise ValueError("channel required")
+        identity_key = f"{normalized_channel}:{sender_id}"
+
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            raw = challenges.get(code)
+            if not isinstance(raw, dict):
+                raise ValueError("binding_challenge_not_found")
+
+            try:
+                expires_at = _dt_from_iso(str(raw.get("expires_at") or ""))
+            except Exception:
+                challenges.pop(code, None)
+                self._save(data)
+                raise ValueError("binding_challenge_not_found")
+
+            if _utc_now() >= expires_at:
+                challenges.pop(code, None)
+                self._save(data)
+                raise ValueError("binding_challenge_expired")
+
+            if str(raw.get("status") or "") != "pending":
+                raise ValueError("binding_challenge_not_pending")
+            if str(raw.get("channel") or "") != normalized_channel:
+                raise ValueError("binding_challenge_channel_mismatch")
+
+            tenant_id = str(raw.get("tenant_id") or "")
+            current_identity_tenant = str(data["identity_to_tenant"].get(identity_key) or "")
+            if not current_identity_tenant:
+                raise ValueError("identity_not_linked_to_workspace")
+            if current_identity_tenant != tenant_id:
+                raise ValueError("identity_bound_to_other_tenant")
+
+            raw["status"] = "verified"
+            raw["verified_identity"] = identity_key
+            raw["verified_at"] = _dt_to_iso(_utc_now())
+            challenges[code] = raw
+            self._save(data)
+            return {"code": code, **raw}
+
+    def consume_binding_challenge(
+        self,
+        code: str,
+        *,
+        account_id: str,
+        tenant_id: str,
+    ) -> dict[str, Any]:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+
+        with self._index_mutation_lock():
+            data = self._load()
+            challenges = data["binding_challenges"]
+            raw = challenges.get(code)
+            if not isinstance(raw, dict):
+                raise ValueError("binding_challenge_not_found")
+
+            try:
+                expires_at = _dt_from_iso(str(raw.get("expires_at") or ""))
+            except Exception:
+                challenges.pop(code, None)
+                self._save(data)
+                raise ValueError("binding_challenge_not_found")
+
+            now = _utc_now()
+            if now >= expires_at:
+                challenges.pop(code, None)
+                self._save(data)
+                raise ValueError("binding_challenge_expired")
+
+            if str(raw.get("status") or "") != "verified":
+                raise ValueError("binding_challenge_not_verified")
+            if str(raw.get("account_id") or "") != normalized_account:
+                raise ValueError("binding_challenge_owned_by_other_account")
+            if str(raw.get("tenant_id") or "") != tenant_id:
+                raise ValueError("binding_challenge_bound_to_other_tenant")
+            if not str(raw.get("verified_identity") or ""):
+                raise ValueError("binding_challenge_not_verified")
+
+            consumed = {**raw, "status": "consumed", "consumed_at": _dt_to_iso(now)}
+            challenges.pop(code, None)
+            self._save(data)
+            return {"code": code, **consumed}
 
     def create_link_code(self, tenant_id: str, ttl_s: int = 10 * 60) -> str:
         tenant_id = validate_tenant_id(tenant_id)
@@ -905,7 +1287,14 @@ class TenantStore:
     # -------------------------
 
     def _empty_index(self) -> dict[str, Any]:
-        return {"version": 1, "tenants": {}, "identity_to_tenant": {}, "link_codes": {}}
+        return {
+            "version": 1,
+            "tenants": {},
+            "identity_to_tenant": {},
+            "link_codes": {},
+            "binding_challenges": {},
+            "accounts": {},
+        }
 
     def _quarantine_corrupted_index(self) -> Path | None:
         """Move a corrupted index file aside for forensics."""
@@ -955,6 +1344,8 @@ class TenantStore:
         data.setdefault("tenants", {})
         data.setdefault("identity_to_tenant", {})
         data.setdefault("link_codes", {})
+        data.setdefault("binding_challenges", {})
+        data.setdefault("accounts", {})
 
         if not isinstance(data["tenants"], dict):
             quarantined = self._quarantine_corrupted_index()
@@ -969,11 +1360,23 @@ class TenantStore:
                 "Tenant index field 'identity_to_tenant' must be an object: "
                 f"{self.index_path}{suffix}"
             )
+        if not isinstance(data["accounts"], dict):
+            quarantined = self._quarantine_corrupted_index()
+            suffix = f" (quarantined: {quarantined})" if quarantined else ""
+            raise TenantStoreCorruptionError(
+                f"Tenant index field 'accounts' must be an object: {self.index_path}{suffix}"
+            )
         if not isinstance(data["link_codes"], dict):
             quarantined = self._quarantine_corrupted_index()
             suffix = f" (quarantined: {quarantined})" if quarantined else ""
             raise TenantStoreCorruptionError(
                 f"Tenant index field 'link_codes' must be an object: {self.index_path}{suffix}"
+            )
+        if not isinstance(data["binding_challenges"], dict):
+            quarantined = self._quarantine_corrupted_index()
+            suffix = f" (quarantined: {quarantined})" if quarantined else ""
+            raise TenantStoreCorruptionError(
+                f"Tenant index field 'binding_challenges' must be an object: {self.index_path}{suffix}"
             )
 
         return data

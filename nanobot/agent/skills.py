@@ -93,7 +93,7 @@ class SkillsLoader:
                 skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "managed"})
                 existing_names.add(skill_dir.name)
 
-        # Built-in skills
+        # Built-in skills (public web/API term: bundled)
         for skill_dir in self._iter_skill_dirs(self.builtin_skills):
             skill_file = self._safe_skill_file(self.builtin_skills, skill_dir.name)
             if skill_file is not None and skill_dir.name not in existing_names:

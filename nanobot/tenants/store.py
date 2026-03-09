@@ -479,6 +479,15 @@ class TenantStore:
                 return 0
             return len(tenants)
 
+    def list_tenant_ids(self) -> list[str]:
+        """Return the current tenant ids in stable order."""
+        with self._index_lock:
+            data = self._load()
+            tenants = data.get("tenants") or {}
+            if not isinstance(tenants, dict):
+                return []
+            return sorted(str(tenant_id) for tenant_id in tenants.keys())
+
     def create_link_code(self, tenant_id: str, ttl_s: int = 10 * 60) -> str:
         tenant_id = validate_tenant_id(tenant_id)
         with self._index_mutation_lock():

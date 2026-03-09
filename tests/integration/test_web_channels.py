@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from nanobot.channels.base import BaseChannel
 from nanobot.config.loader import load_config, save_config
 from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError
 from nanobot.tenants.validation import (
@@ -496,6 +497,18 @@ async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_
 async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     http_client, auth_headers_for, web_ctx
 ) -> None:
+    class DummyWorkspaceChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg) -> None:
+            return None
+
     alice_headers = await auth_headers_for("alice-byo", role="admin", tenant_id="tenant-byo-a")
     bob_headers = await auth_headers_for("bob-byo", role="admin", tenant_id="tenant-byo-b")
 
@@ -508,10 +521,21 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     update_body = update.json()
     assert update_body["config_scope"] == "workspace"
     assert update_body["runtime_scope"] == "tenant"
+    assert update_body["takes_effect"] == "restart"
+    assert "restart" in str(update_body.get("runtime_warning") or "").lower()
     assert update_body["active_in_runtime"] is False
     assert update_body["configured"] is True
     assert update_body["config"]["app_id"] == "tenant-app-id"
     assert update_body["config"]["app_secret"] == "****"
+
+    workspace_runtime = DummyWorkspaceChannel(config=None, bus=web_ctx.bus)
+    await workspace_runtime.start()
+    web_ctx.channel_manager.register_workspace_channel_runtime(
+        "tenant-byo-a",
+        "feishu",
+        workspace_runtime,
+        credential_config={"app_id": "tenant-app-id", "app_secret": "tenant-app-secret"},
+    )
 
     alice_get = await http_client.get(
         "/api/channels/feishu/credentials",
@@ -519,6 +543,7 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     )
     assert alice_get.status_code == 200
     alice_body = alice_get.json()
+    assert alice_body["active_in_runtime"] is True
     assert alice_body["config"]["app_id"] == "tenant-app-id"
     assert alice_body["config"]["app_secret"] == "****"
     assert alice_body["sensitive_has_value"]["app_secret"] is True
@@ -546,7 +571,15 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     rows = {row["name"]: row for row in workspace_list.json()}
     assert rows["feishu"]["byo_supported"] is True
     assert rows["feishu"]["byo_configured"] is True
-    assert rows["feishu"]["active_in_runtime"] is False
+    assert rows["feishu"]["active_in_runtime"] is True
+
+    drift = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=alice_headers,
+        json={"app_id": "tenant-app-id-v2", "app_secret": "****"},
+    )
+    assert drift.status_code == 200
+    assert drift.json()["active_in_runtime"] is False
 
 
 @pytest.mark.integration

@@ -81,6 +81,15 @@ def test_count_tenants_reflects_current_index(tmp_path: Path) -> None:
 
     assert store.count_tenants() == 2
 
+
+def test_list_tenant_ids_reflects_current_index(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+
+    tenant_b = store.ensure_tenant("telegram", "u-1")
+    tenant_a = store.ensure_tenant("discord", "u-2")
+
+    assert store.list_tenant_ids() == sorted([tenant_a, tenant_b])
+
 def test_corrupted_index_is_quarantined_and_raises(tmp_path: Path) -> None:
     tenants_dir = tmp_path / "tenants"
     tenants_dir.mkdir(parents=True, exist_ok=True)

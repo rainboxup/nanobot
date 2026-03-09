@@ -34,8 +34,8 @@ _WORKSPACE_ROUTING_SCOPE_WARNING = (
     "Workspace channel routing is tenant-scoped. Changes apply immediately and do not restart channel connections."
 )
 _WORKSPACE_CREDENTIALS_SCOPE_WARNING = (
-    "Workspace BYO channel credentials are tenant-scoped, but they are stored only for now. "
-    "They will not activate channel connections until workspace-specific runtime support lands."
+    "Workspace BYO channel credentials are tenant-scoped. Saving changes does not hot-swap live channel connections; "
+    "restart the service to load updated workspace runtimes. active_in_runtime reflects whether the current runtime matches the stored credentials."
 )
 _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
     "Workspace-scoped channel routing is unavailable in single-tenant runtime mode."
@@ -368,7 +368,7 @@ def _workspace_takes_effect() -> str:
 
 
 def _workspace_credentials_takes_effect() -> str:
-    return "stored_only"
+    return "restart"
 
 
 def _workspace_require_mention(policy: str) -> bool:
@@ -530,17 +530,54 @@ def _workspace_channel_credentials_configured(name: str, routing: TenantChannelO
     return bool(fields) and all(str(config.get(field) or "").strip() for field in fields)
 
 
-def _workspace_channel_credentials_summary(name: str, routing: TenantChannelOverride) -> dict[str, Any]:
+def _workspace_channel_runtime_active(
+    request: Request,
+    *,
+    tenant_id: str,
+    channel_name: str,
+    routing: TenantChannelOverride,
+) -> bool:
+    manager = getattr(request.app.state, "channel_manager", None)
+    if not tenant_id or manager is None:
+        return False
+    checker = getattr(manager, "is_workspace_channel_runtime_active", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(
+            checker(
+                tenant_id,
+                channel_name,
+                _workspace_channel_credentials_config(channel_name, routing),
+            )
+        )
+    except Exception:
+        return False
+
+
+def _workspace_channel_credentials_summary(
+    request: Request,
+    *,
+    tenant_id: str,
+    name: str,
+    routing: TenantChannelOverride,
+) -> dict[str, Any]:
     return {
         "byo_supported": _workspace_channel_supports_credentials(name),
         "byo_configured": _workspace_channel_credentials_configured(name, routing),
-        "active_in_runtime": False,
+        "active_in_runtime": _workspace_channel_runtime_active(
+            request,
+            tenant_id=tenant_id,
+            channel_name=name,
+            routing=routing,
+        ),
     }
 
 
 def _workspace_credentials_payload(
     request: Request,
     *,
+    tenant_id: str,
     name: str,
     routing: TenantChannelOverride,
 ) -> dict[str, Any]:
@@ -552,7 +589,12 @@ def _workspace_credentials_payload(
         "config": redacted,
         "configured": _workspace_channel_credentials_configured(name, routing),
         "byo_supported": True,
-        "active_in_runtime": False,
+        "active_in_runtime": _workspace_channel_runtime_active(
+            request,
+            tenant_id=tenant_id,
+            channel_name=name,
+            routing=routing,
+        ),
         "redacted_value": _REDACTED_VALUE,
         "sensitive_keys": sorted([field for field in raw if _is_sensitive_key(field)]),
         "sensitive_paths": sorted(list(sensitive_paths)),
@@ -564,6 +606,7 @@ def _workspace_credentials_payload(
 def _workspace_routing_payload(
     request: Request,
     *,
+    tenant_id: str,
     name: str,
     system_channel: BaseModel,
     routing: TenantChannelOverride,
@@ -582,7 +625,14 @@ def _workspace_routing_payload(
         "require_mention": _workspace_require_mention(routing.group_policy),
         "binding_supported": True,
     }
-    payload.update(_workspace_channel_credentials_summary(name, routing))
+    payload.update(
+        _workspace_channel_credentials_summary(
+            request,
+            tenant_id=tenant_id,
+            name=name,
+            routing=routing,
+        )
+    )
     return _workspace_runtime_meta(request, channel_name=name, payload=payload)
 
 
@@ -849,7 +899,7 @@ async def list_workspace_channels(
     request: Request, user: dict[str, Any] = Depends(get_current_user)
 ) -> list[dict[str, Any]]:
     require_min_role(user, "admin")
-    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
     system_cfg = _system_config(request)
 
     result: list[dict[str, Any]] = []
@@ -857,6 +907,7 @@ async def list_workspace_channels(
         result.append(
             _workspace_routing_payload(
                 request,
+                tenant_id=tenant_id,
                 name=name,
                 system_channel=getattr(system_cfg.channels, name),
                 routing=getattr(tenant_cfg.workspace.channels, name),
@@ -885,9 +936,10 @@ async def get_workspace_channel_credentials(
 ) -> dict[str, Any]:
     require_min_role(user, "admin")
     channel_name = _ensure_workspace_credentials_channel(name)
-    _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
     return _workspace_credentials_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         routing=getattr(tenant_cfg.workspace.channels, channel_name),
     )
@@ -939,6 +991,7 @@ async def update_workspace_channel_credentials(
     )
     return _workspace_credentials_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         routing=updated,
     )
@@ -951,9 +1004,11 @@ async def get_workspace_channel_routing(
     require_min_role(user, "admin")
     channel_name = _ensure_workspace_channel(name)
     _tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    tenant_id = _tenant_id
     system_cfg = _system_config(request)
     return _workspace_routing_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         system_channel=getattr(system_cfg.channels, channel_name),
         routing=getattr(tenant_cfg.workspace.channels, channel_name),
@@ -1007,6 +1062,7 @@ async def update_workspace_channel_routing(
     )
     return _workspace_routing_payload(
         request,
+        tenant_id=tenant_id,
         name=channel_name,
         system_channel=getattr(system_cfg.channels, channel_name),
         routing=updated,

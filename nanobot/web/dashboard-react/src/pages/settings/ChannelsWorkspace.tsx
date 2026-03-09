@@ -322,7 +322,7 @@ export function ChannelsWorkspace() {
                     <div>{String(channel.takes_effect || "immediate")}</div>
                     {channel.byo_supported && (
                       <div>
-                        BYO {channel.byo_configured ? "stored" : "not configured"} · runtime {channel.active_in_runtime ? "active" : "inactive"}
+                        BYO {channel.byo_configured ? "configured" : "not configured"} · runtime {channel.active_in_runtime ? "active" : "inactive"}
                       </div>
                     )}
                     {!channel.writable && channel.write_block_reason && <div>{channel.write_block_reason}</div>}
@@ -454,7 +454,7 @@ export function ChannelsWorkspace() {
         isOpen={Boolean(credentialsEditing)}
         onClose={() => setCredentialsEditing(null)}
         title={credentialsEditing ? `${credentialsEditing.name} BYO credentials` : "Workspace BYO credentials"}
-        description="Stored per workspace for future channel runtime support. These credentials are not active yet."
+        description="Stored per workspace. Restart the service to load updated workspace runtimes; active_in_runtime reflects whether the current runtime matches the stored credentials."
         footer={
           <>
             <Button variant="outline" onClick={() => setCredentialsEditing(null)} disabled={credentialSaving}>
@@ -472,7 +472,10 @@ export function ChannelsWorkspace() {
         {credentialsEditing && (
           <div className="space-y-4">
             <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-              {String(credentialsEditing.runtime_warning || "Stored only. Workspace-specific channel runtimes are not active yet.")}
+              {String(
+                credentialsEditing.runtime_warning ||
+                  "Restart required. active_in_runtime reflects whether the current workspace runtime matches the stored credentials."
+              )}
             </div>
             {!credentialsEditing.writable && credentialsEditing.write_block_reason && (
               <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
@@ -485,7 +488,7 @@ export function ChannelsWorkspace() {
               </div>
             )}
             <div className="rounded-md border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
-              Saving here only stores tenant-scoped credentials for future BYO runtime support. Current channel connections still use the system owner-managed credentials.
+              Saving here updates tenant-scoped credentials. New values take effect after service restart; until then, existing channel connections continue using the currently loaded runtime.
             </div>
             {(WORKSPACE_CREDENTIAL_FIELDS[credentialsEditing.name] || []).map((field) => {
               const hasStoredSecret = Boolean(credentialsEditing.sensitive_has_value?.[field.name])

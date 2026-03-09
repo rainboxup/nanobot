@@ -131,6 +131,115 @@ def test_attach_account_identity_rejects_identity_owned_by_other_account(tmp_pat
     with pytest.raises(ValueError, match="identity_bound_to_other_account"):
         store.attach_account_identity("bob", tenant_id, "feishu", "fs-1")
 
+
+def test_channel_binding_challenge_roundtrip(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    created = store.create_binding_challenge(
+        account_id="alice",
+        tenant_id=tenant_id,
+        channel="feishu",
+        ttl_s=300,
+    )
+
+    reloaded = TenantStore(base_dir=tmp_path / "tenants")
+    fetched = reloaded.get_binding_challenge(created["code"])
+    assert fetched is not None
+    assert fetched["status"] == "pending"
+    assert fetched["account_id"] == "alice"
+    assert fetched["channel"] == "feishu"
+
+
+def test_get_binding_challenge_prunes_expired_entries(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    created = store.create_binding_challenge(
+        account_id="alice",
+        tenant_id=tenant_id,
+        channel="feishu",
+        ttl_s=0,
+    )
+
+    assert store.get_binding_challenge(created["code"]) is None
+    reloaded = TenantStore(base_dir=tmp_path / "tenants")
+    assert reloaded.get_binding_challenge(created["code"]) is None
+
+
+def test_verify_binding_challenge_marks_verified_identity(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+    store.link_identity(tenant_id, "feishu", "user-1")
+
+    created = store.create_binding_challenge(
+        account_id="alice",
+        tenant_id=tenant_id,
+        channel="feishu",
+        ttl_s=300,
+    )
+
+    verified = store.verify_binding_challenge(created["code"], "feishu", "user-1")
+    assert verified["status"] == "verified"
+    assert verified["verified_identity"] == "feishu:user-1"
+
+
+def test_verify_binding_challenge_rejects_wrong_channel(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+    store.link_identity(tenant_id, "feishu", "user-1")
+    created = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+
+    with pytest.raises(ValueError, match="binding_challenge_channel_mismatch"):
+        store.verify_binding_challenge(created["code"], "dingtalk", "user-1")
+
+
+def test_verify_binding_challenge_rejects_identity_from_other_tenant(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+    other_tenant_id = store.ensure_tenant("web", "bob")
+    store.link_identity(other_tenant_id, "feishu", "user-2")
+    created = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+
+    with pytest.raises(ValueError, match="identity_bound_to_other_tenant"):
+        store.verify_binding_challenge(created["code"], "feishu", "user-2")
+
+
+def test_create_binding_challenge_replaces_existing_active_challenge(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    first = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+    second = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+
+    assert first["code"] != second["code"]
+    assert store.get_binding_challenge(first["code"]) is None
+
+
+def test_consume_binding_challenge_removes_consumed_entry(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+    store.link_identity(tenant_id, "feishu", "user-1")
+
+    created = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+    store.verify_binding_challenge(created["code"], "feishu", "user-1")
+
+    consumed = store.consume_binding_challenge(created["code"], account_id="alice", tenant_id=tenant_id)
+
+    assert consumed["status"] == "consumed"
+    assert store.get_binding_challenge(created["code"]) is None
+
+
+def test_consume_binding_challenge_rejects_wrong_account(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+    store.link_identity(tenant_id, "feishu", "user-1")
+    created = store.create_binding_challenge(account_id="alice", tenant_id=tenant_id, channel="feishu")
+    store.verify_binding_challenge(created["code"], "feishu", "user-1")
+
+    with pytest.raises(ValueError, match="binding_challenge_owned_by_other_account"):
+        store.consume_binding_challenge(created["code"], account_id="bob", tenant_id=tenant_id)
+
 def test_corrupted_index_is_quarantined_and_raises(tmp_path: Path) -> None:
     tenants_dir = tmp_path / "tenants"
     tenants_dir.mkdir(parents=True, exist_ok=True)
@@ -180,4 +289,7 @@ def test_tenant_dir_rejects_invalid_tenant_id(tmp_path: Path, tenant_id: str) ->
     store = TenantStore(base_dir=tmp_path / "tenants")
     with pytest.raises(ValueError):
         _ = store.tenant_dir(tenant_id)
+
+
+
 

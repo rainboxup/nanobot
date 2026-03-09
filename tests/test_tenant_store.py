@@ -90,6 +90,47 @@ def test_list_tenant_ids_reflects_current_index(tmp_path: Path) -> None:
 
     assert store.list_tenant_ids() == sorted([tenant_a, tenant_b])
 
+
+def test_account_binding_tracks_multiple_channel_identities(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    store.link_identity(tenant_id, "telegram", "tg-1")
+    store.link_identity(tenant_id, "discord", "dc-1")
+    store.attach_account_identity("alice", tenant_id, "telegram", "tg-1")
+    store.attach_account_identity("alice", tenant_id, "discord", "dc-1")
+
+    account = store.get_account("alice")
+    assert account is not None
+    assert account["tenant_id"] == tenant_id
+    assert set(store.list_account_identities("alice")) == {"telegram:tg-1", "discord:dc-1"}
+    assert store.resolve_tenant("telegram", "tg-1") == tenant_id
+    assert store.resolve_tenant("discord", "dc-1") == tenant_id
+
+
+def test_detach_account_identity_removes_account_and_tenant_mapping(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    store.link_identity(tenant_id, "feishu", "fs-1")
+    store.attach_account_identity("alice", tenant_id, "feishu", "fs-1")
+    removed = store.detach_account_identity("alice", "feishu", "fs-1")
+
+    assert removed is True
+    assert store.resolve_tenant("feishu", "fs-1") == tenant_id
+    assert store.list_account_identities("alice") == []
+
+
+def test_attach_account_identity_rejects_identity_owned_by_other_account(tmp_path: Path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = store.ensure_tenant("web", "alice")
+
+    store.link_identity(tenant_id, "feishu", "fs-1")
+    store.attach_account_identity("alice", tenant_id, "feishu", "fs-1")
+
+    with pytest.raises(ValueError, match="identity_bound_to_other_account"):
+        store.attach_account_identity("bob", tenant_id, "feishu", "fs-1")
+
 def test_corrupted_index_is_quarantined_and_raises(tmp_path: Path) -> None:
     tenants_dir = tmp_path / "tenants"
     tenants_dir.mkdir(parents=True, exist_ok=True)

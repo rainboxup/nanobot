@@ -452,10 +452,80 @@ async def test_workspace_routing_binding_instructions_are_readable(
     assert body.get("help_slug") == "workspace-routing-and-binding"
 
     instructions = str(body["instructions"] or "")
+    assert "account" in instructions.lower() or "dashboard" in instructions.lower()
     assert "!link" in instructions
     assert "!whoami" in instructions
     assert "dm" in instructions.lower() or "private" in instructions.lower()
     assert body["config_scope"] == "workspace"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_account_binding_attach_and_detach_identities_for_current_account(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    admin_headers = await auth_headers_for("alice-account", role="admin", tenant_id="tenant-account")
+    peer_admin_headers = await auth_headers_for("charlie-account", role="admin", tenant_id="tenant-account")
+    member_headers = await auth_headers_for(
+        "bob-account",
+        role="member",
+        tenant_id="tenant-account-member",
+    )
+
+    web_ctx.tenant_store.link_identity("tenant-account", "feishu", "feishu-user-1")
+
+    binding_before = await http_client.get(
+        "/api/channels/feishu/binding",
+        headers=admin_headers,
+    )
+    assert binding_before.status_code == 200
+    before_body = binding_before.json()
+    assert before_body["account_id"] == "alice-account"
+    assert before_body["tenant_id"] == "tenant-account"
+    assert before_body["identities"] == []
+
+    member_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=member_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert member_attach.status_code == 403
+
+    unlinked_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-2"},
+    )
+    assert unlinked_attach.status_code == 409
+
+    attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert attach.status_code == 200
+    attach_body = attach.json()
+    assert attach_body["account_id"] == "alice-account"
+    assert attach_body["tenant_id"] == "tenant-account"
+    assert attach_body["identities"] == ["feishu:feishu-user-1"]
+    assert web_ctx.tenant_store.resolve_tenant("feishu", "feishu-user-1") == "tenant-account"
+
+    peer_attach = await http_client.post(
+        "/api/channels/feishu/binding/attach",
+        headers=peer_admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert peer_attach.status_code == 409
+
+    detach = await http_client.post(
+        "/api/channels/feishu/binding/detach",
+        headers=admin_headers,
+        json={"sender_id": "feishu-user-1"},
+    )
+    assert detach.status_code == 200
+    detach_body = detach.json()
+    assert detach_body["identities"] == []
+    assert web_ctx.tenant_store.resolve_tenant("feishu", "feishu-user-1") == "tenant-account"
 
 
 @pytest.mark.integration

@@ -744,6 +744,7 @@ def create_app(
             "role": role_out,
             "tenant_id": str(user_rec.get("tenant_id") or username),
             "username": username_out,
+            "account_id": username_out,
             "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
         }
         response = JSONResponse(content=response_payload)

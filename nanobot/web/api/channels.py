@@ -104,6 +104,12 @@ class WorkspaceRoutingUpdate(BaseModel):
     require_mention: bool | None = None
 
 
+class AccountBindingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sender_id: str
+
+
 def _api_error_detail(
     reason_code: str,
     message: str,
@@ -379,12 +385,45 @@ def _workspace_binding_instructions(name: str) -> str:
     normalized = _ensure_workspace_channel(name)
     channel_display = workspace_routing_channel_display_name(normalized)
     return (
-        "1. (Safety) Run `!link` in a private chat/DM to avoid leaking the one-time code in a group.\n"
-        "2. In any identity already linked to the workspace, send `!link` to generate a one-time code.\n"
-        f"3. In {channel_display}, send `!link <CODE>` to bind the current identity.\n"
-        "4. Run `!whoami` to verify the tenant_id and linked identities.\n"
+        "1. Preferred: sign in to the dashboard with your workspace account and use Binding to attach/detach identities for this workspace.\n"
+        f"2. For {channel_display}, attach the current sender identity from the dashboard after you confirm the sender_id.\n"
+        "3. Run `!whoami` to verify the tenant_id and linked identities.\n"
+        "4. Compatibility fallback: run `!link` in a private chat/DM to generate a one-time code, then use `!link <CODE>` in the target identity.\n"
         "5. After binding, the workspace shares memory and skills, while sessions stay isolated per channel identity."
     )
+
+
+def _current_account_id(user: dict[str, Any]) -> str:
+    return str(user.get("sub") or user.get("username") or "").strip().lower()
+
+
+def _workspace_account_binding_payload(
+    request: Request,
+    *,
+    user: dict[str, Any],
+    tenant_id: str,
+    channel_name: str,
+) -> dict[str, Any]:
+    store = getattr(request.app.state, "tenant_store", None)
+    account_id = _current_account_id(user)
+    identities: list[str] = []
+    if store is not None and account_id:
+        list_identities = getattr(store, "list_account_identities", None)
+        if callable(list_identities):
+            try:
+                identities = list_identities(account_id, channel=channel_name)
+            except Exception:
+                identities = []
+    payload = {
+        "name": channel_name,
+        "channel": channel_name,
+        "account_id": account_id,
+        "tenant_id": tenant_id,
+        "identities": identities,
+        "binding_supported": True,
+        "legacy_link_supported": True,
+    }
+    return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
 
 def _channel_validation_error(
@@ -928,6 +967,131 @@ async def get_channel_binding_instructions(
         "instructions": _workspace_binding_instructions(channel_name),
     }
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
+
+
+@router.get("/api/channels/{name}/binding")
+async def get_channel_account_binding(
+    name: str, request: Request, user: dict[str, Any] = Depends(get_current_user)
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, _store, _tenant_cfg = load_tenant_config(request, user)
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/attach")
+async def attach_channel_account_binding(
+    name: str,
+    update: AccountBindingUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    sender_id = str(update.sender_id or "").strip()
+    if not sender_id:
+        raise _unprocessable_entity(
+            "workspace_account_binding_invalid",
+            "sender_id is required",
+        )
+
+    try:
+        store.attach_account_identity(account_id, tenant_id, channel_name, sender_id)
+    except ValueError as exc:
+        reason_code = str(exc) or "workspace_account_binding_invalid"
+        if reason_code in {
+            "identity_bound_to_other_tenant",
+            "identity_not_linked_to_workspace",
+            "identity_bound_to_other_account",
+            "account_bound_to_other_tenant",
+        }:
+            message = (
+                "This identity is already bound to another workspace."
+                if reason_code == "identity_bound_to_other_tenant"
+                else (
+                    "This identity is not linked to the current workspace yet. Use the compatibility binding flow first."
+                    if reason_code == "identity_not_linked_to_workspace"
+                    else (
+                        "This identity is already claimed by another account in the workspace."
+                        if reason_code == "identity_bound_to_other_account"
+                        else "This account is already bound to another workspace."
+                    )
+                )
+            )
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=_api_error_detail(
+                    reason_code,
+                    message,
+                ),
+            ) from exc
+        raise _unprocessable_entity(reason_code, "Account binding update is invalid.") from exc
+
+    _audit(
+        request,
+        event="config.channel.binding.attach",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
+
+
+@router.post("/api/channels/{name}/binding/detach")
+async def detach_channel_account_binding(
+    name: str,
+    update: AccountBindingUpdate,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, store, _tenant_cfg = load_tenant_config(request, user)
+    account_id = _current_account_id(user)
+    sender_id = str(update.sender_id or "").strip()
+    if not sender_id:
+        raise _unprocessable_entity(
+            "workspace_account_binding_invalid",
+            "sender_id is required",
+        )
+
+    removed = bool(store.detach_account_identity(account_id, channel_name, sender_id))
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_api_error_detail(
+                "workspace_account_binding_not_found",
+                "The specified identity is not bound to the current account.",
+            ),
+        )
+
+    _audit(
+        request,
+        event="config.channel.binding.detach",
+        user=user,
+        tenant_id=tenant_id,
+        config_scope=ConfigScope.WORKSPACE.value,
+        metadata={"channel": channel_name, "sender_id": sender_id},
+    )
+    return _workspace_account_binding_payload(
+        request,
+        user=user,
+        tenant_id=tenant_id,
+        channel_name=channel_name,
+    )
 
 
 @router.get("/api/channels/{name}/credentials")

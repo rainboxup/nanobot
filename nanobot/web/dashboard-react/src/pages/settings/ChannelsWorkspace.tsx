@@ -55,6 +55,16 @@ interface BindingInstructionsResponse {
   help_url?: string
 }
 
+interface WorkspaceAccountBindingDetail {
+  name: string
+  channel: string
+  account_id: string
+  tenant_id: string
+  identities: string[]
+  writable?: boolean
+  write_block_reason?: string | null
+}
+
 function toTextareaValue(items?: string[] | null) {
   return Array.isArray(items) ? items.join("\n") : ""
 }
@@ -97,6 +107,9 @@ export function ChannelsWorkspace() {
   const [bindingChannel, setBindingChannel] = useState<string | null>(null)
   const [bindingInstructions, setBindingInstructions] = useState("")
   const [bindingError, setBindingError] = useState("")
+  const [bindingDetail, setBindingDetail] = useState<WorkspaceAccountBindingDetail | null>(null)
+  const [bindingSenderId, setBindingSenderId] = useState("")
+  const [bindingSaving, setBindingSaving] = useState(false)
   const [credentialsEditing, setCredentialsEditing] = useState<WorkspaceChannelCredentialsDetail | null>(null)
   const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
   const [credentialError, setCredentialError] = useState("")
@@ -174,14 +187,61 @@ export function ChannelsWorkspace() {
     setBindingChannel(name)
     setBindingInstructions("")
     setBindingError("")
+    setBindingDetail(null)
+    setBindingSenderId("")
     try {
       const detail = await api.get<BindingInstructionsResponse>(
         `/api/channels/${encodeURIComponent(name)}/binding-instructions`
       )
+      const accountBinding = await api.get<WorkspaceAccountBindingDetail>(
+        `/api/channels/${encodeURIComponent(name)}/binding`
+      )
       setBindingInstructions(String(detail.instructions || ""))
+      setBindingDetail(accountBinding)
     } catch (err) {
       const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Load failed")
       setBindingError(message)
+    }
+  }
+
+  async function attachBindingIdentity() {
+    if (!bindingChannel) return
+    setBindingSaving(true)
+    setBindingError("")
+    try {
+      const detail = await api.post<WorkspaceAccountBindingDetail>(
+        `/api/channels/${encodeURIComponent(bindingChannel)}/binding/attach`,
+        { sender_id: bindingSenderId }
+      )
+      setBindingDetail(detail)
+      setBindingSenderId("")
+      setBindingInstructions((prev) => prev)
+      addToast({ type: "success", message: `${bindingChannel} identity attached` })
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Attach failed")
+      setBindingError(message)
+    } finally {
+      setBindingSaving(false)
+    }
+  }
+
+  async function detachBindingIdentity(identity: string) {
+    if (!bindingChannel) return
+    const senderId = identity.includes(":") ? identity.split(":").slice(1).join(":") : identity
+    setBindingSaving(true)
+    setBindingError("")
+    try {
+      const detail = await api.post<WorkspaceAccountBindingDetail>(
+        `/api/channels/${encodeURIComponent(bindingChannel)}/binding/detach`,
+        { sender_id: senderId }
+      )
+      setBindingDetail(detail)
+      addToast({ type: "success", message: `${bindingChannel} identity detached` })
+    } catch (err) {
+      const message = err instanceof ApiError ? err.detail : String((err as any)?.message || "Detach failed")
+      setBindingError(message)
+    } finally {
+      setBindingSaving(false)
     }
   }
 
@@ -521,7 +581,7 @@ export function ChannelsWorkspace() {
         isOpen={Boolean(bindingChannel)}
         onClose={() => setBindingChannel(null)}
         title={bindingChannel ? `${bindingChannel} binding instructions` : "Binding instructions"}
-        description="Use !link to bind the current identity to an existing workspace."
+        description="Preferred: manage channel identities with the current signed-in account. !link remains available as a compatibility fallback."
         footer={
           <>
             <Button variant="outline" onClick={() => setBindingChannel(null)}>
@@ -535,6 +595,50 @@ export function ChannelsWorkspace() {
         }
       >
         <div className="space-y-3">
+          {bindingDetail && (
+            <div className="rounded-md border bg-muted/20 p-3 text-sm space-y-2">
+              <div>Account: {bindingDetail.account_id || "-"}</div>
+              <div>Tenant: {bindingDetail.tenant_id || "-"}</div>
+              <div className="space-y-2">
+                <div className="font-medium">Attached identities</div>
+                {bindingDetail.identities.length === 0 ? (
+                  <div className="text-muted-foreground">No identities attached yet.</div>
+                ) : (
+                  <div className="space-y-2">
+                    {bindingDetail.identities.map((identity) => (
+                      <div key={identity} className="flex items-center justify-between gap-2 rounded-md border bg-background px-3 py-2">
+                        <span className="font-mono text-xs">{identity}</span>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={bindingSaving}
+                          onClick={() => detachBindingIdentity(identity).catch(() => {})}
+                        >
+                          Detach
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div className="space-y-2">
+                <label className="text-sm font-medium">Sender ID</label>
+                <input
+                  className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+                  value={bindingSenderId}
+                  onChange={(e) => setBindingSenderId(e.target.value)}
+                  placeholder="Enter the channel sender_id to attach"
+                  disabled={bindingSaving}
+                />
+                <Button
+                  onClick={() => attachBindingIdentity().catch(() => {})}
+                  disabled={bindingSaving || !bindingSenderId.trim()}
+                >
+                  Attach Identity
+                </Button>
+              </div>
+            </div>
+          )}
           {bindingError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
               {bindingError}

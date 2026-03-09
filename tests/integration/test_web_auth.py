@@ -127,6 +127,7 @@ async def test_refresh_token_flow(http_client) -> None:
     )
     assert r_me.status_code == 200
     assert r_me.json().get("username") == "admin"
+    assert r_me.json().get("account_id") == "admin"
 
 
 @pytest.mark.integration

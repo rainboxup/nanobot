@@ -71,6 +71,10 @@ def _make_link_code(length: int = 8) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _normalize_account_id(value: str | None) -> str:
+    return str(value or "").strip().lower()
+
+
 @dataclass(frozen=True)
 class LinkTarget:
     tenant_id: str
@@ -487,6 +491,137 @@ class TenantStore:
             if not isinstance(tenants, dict):
                 return []
             return sorted(str(tenant_id) for tenant_id in tenants.keys())
+
+    def ensure_account(self, account_id: str, tenant_id: str) -> dict[str, Any]:
+        """Ensure an account record exists for a tenant."""
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if isinstance(account, dict):
+                current_tenant = str(account.get("tenant_id") or "")
+                if current_tenant and current_tenant != tenant_id:
+                    raise ValueError("account_bound_to_other_tenant")
+            else:
+                account = {"tenant_id": tenant_id, "identities": []}
+                data["accounts"][normalized_account] = account
+
+            account["tenant_id"] = tenant_id
+            identities = account.get("identities") or []
+            account["identities"] = [str(x) for x in identities]
+            self._save(data)
+
+        self.ensure_tenant_files(tenant_id)
+        return {
+            "account_id": normalized_account,
+            "tenant_id": tenant_id,
+            "identities": sorted(account["identities"]),
+        }
+
+    def get_account(self, account_id: str) -> dict[str, Any] | None:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return None
+        with self._index_lock:
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if not isinstance(account, dict):
+                return None
+            return {
+                "account_id": normalized_account,
+                "tenant_id": str(account.get("tenant_id") or ""),
+                "identities": sorted(str(x) for x in (account.get("identities") or [])),
+            }
+
+    def list_account_identities(self, account_id: str, *, channel: str | None = None) -> list[str]:
+        account = self.get_account(account_id)
+        if not account:
+            return []
+        identities = [str(x) for x in account.get("identities") or []]
+        if channel is None:
+            return identities
+        prefix = f"{channel}:"
+        return [identity for identity in identities if identity.startswith(prefix)]
+
+    def attach_account_identity(
+        self,
+        account_id: str,
+        tenant_id: str,
+        channel: str,
+        sender_id: str,
+    ) -> dict[str, Any]:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            raise ValueError("account_id required")
+        tenant_id = validate_tenant_id(tenant_id)
+        identity_key = f"{channel}:{sender_id}"
+
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if isinstance(account, dict):
+                current_tenant = str(account.get("tenant_id") or "")
+                if current_tenant and current_tenant != tenant_id:
+                    raise ValueError("account_bound_to_other_tenant")
+            else:
+                account = {"tenant_id": tenant_id, "identities": []}
+                data["accounts"][normalized_account] = account
+
+            current_identity_tenant = str(data["identity_to_tenant"].get(identity_key) or "")
+            if not current_identity_tenant:
+                raise ValueError("identity_not_linked_to_workspace")
+            if current_identity_tenant != tenant_id:
+                raise ValueError("identity_bound_to_other_tenant")
+            for existing_account_id, existing_account in data["accounts"].items():
+                if existing_account_id == normalized_account or not isinstance(existing_account, dict):
+                    continue
+                existing_identities = [str(x) for x in (existing_account.get("identities") or [])]
+                if identity_key in existing_identities:
+                    raise ValueError("identity_bound_to_other_account")
+
+            account["tenant_id"] = tenant_id
+            identities = [str(x) for x in (account.get("identities") or [])]
+            if identity_key not in identities:
+                identities.append(identity_key)
+            account["identities"] = identities
+            self._save(data)
+
+        self.ensure_tenant_files(tenant_id)
+        return {
+            "account_id": normalized_account,
+            "tenant_id": tenant_id,
+            "identities": sorted(account["identities"]),
+        }
+
+    def detach_account_identity(self, account_id: str, channel: str, sender_id: str) -> bool:
+        normalized_account = _normalize_account_id(account_id)
+        if not normalized_account:
+            return False
+        identity_key = f"{channel}:{sender_id}"
+
+        removed = False
+        with self._index_mutation_lock():
+            data = self._load()
+            account = data["accounts"].get(normalized_account)
+            if not isinstance(account, dict):
+                return False
+
+            identities = [str(x) for x in (account.get("identities") or [])]
+            if identity_key in identities:
+                identities = [identity for identity in identities if identity != identity_key]
+                account["identities"] = identities
+                removed = True
+
+            if removed and not account["identities"]:
+                data["accounts"].pop(normalized_account, None)
+
+            self._save(data)
+
+        return removed
 
     def create_link_code(self, tenant_id: str, ttl_s: int = 10 * 60) -> str:
         tenant_id = validate_tenant_id(tenant_id)
@@ -914,7 +1049,13 @@ class TenantStore:
     # -------------------------
 
     def _empty_index(self) -> dict[str, Any]:
-        return {"version": 1, "tenants": {}, "identity_to_tenant": {}, "link_codes": {}}
+        return {
+            "version": 1,
+            "tenants": {},
+            "identity_to_tenant": {},
+            "link_codes": {},
+            "accounts": {},
+        }
 
     def _quarantine_corrupted_index(self) -> Path | None:
         """Move a corrupted index file aside for forensics."""
@@ -964,6 +1105,7 @@ class TenantStore:
         data.setdefault("tenants", {})
         data.setdefault("identity_to_tenant", {})
         data.setdefault("link_codes", {})
+        data.setdefault("accounts", {})
 
         if not isinstance(data["tenants"], dict):
             quarantined = self._quarantine_corrupted_index()
@@ -977,6 +1119,12 @@ class TenantStore:
             raise TenantStoreCorruptionError(
                 "Tenant index field 'identity_to_tenant' must be an object: "
                 f"{self.index_path}{suffix}"
+            )
+        if not isinstance(data["accounts"], dict):
+            quarantined = self._quarantine_corrupted_index()
+            suffix = f" (quarantined: {quarantined})" if quarantined else ""
+            raise TenantStoreCorruptionError(
+                f"Tenant index field 'accounts' must be an object: {self.index_path}{suffix}"
             )
         if not isinstance(data["link_codes"], dict):
             quarantined = self._quarantine_corrupted_index()

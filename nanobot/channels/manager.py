@@ -208,7 +208,12 @@ class ChannelManager:
 
         for (channel_name, tenant_id), (routing, credentials) in desired.items():
             current = self._workspace_runtime_credentials.get((channel_name, tenant_id))
-            if current == credentials and tenant_id in self._workspace_channels.get(channel_name, {}):
+            existing_runtime = self._workspace_channels.get(channel_name, {}).get(tenant_id)
+            if (
+                current == credentials
+                and existing_runtime is not None
+                and existing_runtime.is_running
+            ):
                 continue
 
             await self._remove_workspace_channel_runtime(tenant_id, channel_name)

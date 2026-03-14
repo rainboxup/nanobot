@@ -592,13 +592,32 @@ class ChannelManager:
 
     def get_workspace_runtime_status(self) -> dict[str, list[dict[str, Any]]]:
         """Return tenant-scoped runtime status without exposing credential values."""
-        return {
-            channel_name: [
-                {"tenant_id": tenant_id, "running": bool(channel.is_running)}
-                for tenant_id, channel in sorted(tenant_rows.items())
-            ]
-            for channel_name, tenant_rows in sorted(self._workspace_channels.items())
-        }
+        payload: dict[str, list[dict[str, Any]]] = {}
+        for channel_name, tenant_rows in sorted(self._workspace_channels.items()):
+            rows: list[dict[str, Any]] = []
+            for tenant_id, channel in sorted(tenant_rows.items()):
+                running = bool(channel.is_running)
+                active_in_runtime = running
+                if self.tenant_store is not None:
+                    try:
+                        tenant_cfg = self.tenant_store.load_runtime_tenant_config(tenant_id)
+                        routing = getattr(tenant_cfg.workspace.channels, channel_name, None)
+                        active_in_runtime = self.is_workspace_channel_runtime_active(
+                            tenant_id,
+                            channel_name,
+                            routing,
+                        )
+                    except Exception:
+                        active_in_runtime = False
+                rows.append(
+                    {
+                        "tenant_id": tenant_id,
+                        "running": running,
+                        "active_in_runtime": active_in_runtime,
+                    }
+                )
+            payload[channel_name] = rows
+        return payload
 
     @property
     def enabled_channels(self) -> list[str]:

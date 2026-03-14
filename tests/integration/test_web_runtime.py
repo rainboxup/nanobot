@@ -149,7 +149,7 @@ async def test_web_ops_runtime_endpoint_exposes_workspace_runtime_summary(
     body = response.json()
     channels = ((body.get("runtime") or {}).get("channels") or {})
     assert channels.get("workspace_status") == {
-        "feishu": [{"tenant_id": "tenant-runtime", "running": True}]
+        "feishu": [{"tenant_id": "tenant-runtime", "running": True, "active_in_runtime": True}]
     }
 
 

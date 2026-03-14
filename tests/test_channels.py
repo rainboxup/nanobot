@@ -459,5 +459,49 @@ def test_get_workspace_runtime_status_exposes_running_state_without_secrets() ->
     )
 
     assert manager.get_workspace_runtime_status() == {
-        "feishu": [{"tenant_id": "tenant-a", "running": True}]
+        "feishu": [{"tenant_id": "tenant-a", "running": True, "active_in_runtime": True}]
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_workspace_runtime_status_marks_runtime_inactive_when_credentials_drift(
+    tmp_path,
+) -> None:
+    bus = MessageBus()
+    tenant_store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = tenant_store.ensure_tenant("web", "owner")
+    tenant_cfg = tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
+    tenant_cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    manager = ChannelManager(Config(), bus, tenant_store=tenant_store, runtime_mode="multi")
+
+    class DummyChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    runtime = DummyChannel(config=None, bus=bus)
+    runtime._running = True
+    manager.register_workspace_channel_runtime(
+        tenant_id,
+        "feishu",
+        runtime,
+        credential_config={"app_id": "tenant-app", "app_secret": "tenant-secret"},
+    )
+
+    tenant_cfg = tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.app_secret = "rotated-secret"
+    tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    assert manager.get_workspace_runtime_status() == {
+        "feishu": [{"tenant_id": tenant_id, "running": True, "active_in_runtime": False}]
     }

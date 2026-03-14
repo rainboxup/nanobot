@@ -8,6 +8,7 @@
 
 - Workspace Routing + 绑定（`!link`）+ 排障：`docs/howto/workspace-routing-and-binding.md`
 - Explainability：Effective Policy + Soul：`docs/howto/effective-policy-and-soul.md`
+- 多实例运行时路径：`docs/howto/multi-instance-runtime-layout.md`
 
 ---
 
@@ -15,8 +16,8 @@
 
 | Scope | 谁能改 | 存在哪 | 什么时候生效 | 典型内容 |
 |---|---|---|---|---|
-| **System（系统级）** | 运维/Owner | 默认 `~/.nanobot/config.json` + 环境变量 `NANOBOT_*` | **需重启**（影响全局） | `channels.*`, `gateway.*`, `traffic.*` |
-| **Workspace（工作区/租户级）** | Admin/Owner（Dashboard）或用户（聊天命令） | 默认 `~/.nanobot/tenants/<tenant_id>/config.json` | **立即生效**（仅影响当前租户） | `providers.*`, `agents.*`, `tools.*`, `workspace.*`（含 workspace routing） |
+| **System（系统级）** | 运维/Owner | 默认 `~/.nanobot/config.json`，或由 `--config` 选定的实例配置文件 + 环境变量 `NANOBOT_*` | **需重启**（影响全局） | `channels.*`, `gateway.*`, `traffic.*` |
+| **Workspace（工作区/租户级）** | Admin/Owner（Dashboard）或用户（聊天命令） | 当前实例根下的 `tenants/<tenant_id>/config.json` | **立即生效**（仅影响当前租户） | `providers.*`, `agents.*`, `tools.*`, `workspace.*`（含 workspace routing） |
 | **Session（会话级）** | 当前会话 | 仅内存/请求 metadata | 立即生效（不持久化） | `session.*`（例如 overlay、临时开关） |
 
 > “Effective（实际生效）”通常指：**系统基线（System baseline）** + **工作区覆盖（Workspace overrides）** + **会话临时项（Session metadata）** 合并后的结果，并且会被 Policy 规则进一步约束。

@@ -8,7 +8,9 @@
 
 ## Build, Test, and Development Commands
 - `pip install -e .[dev]` — install Nanobot in editable mode with test/lint tooling.
-- `nanobot onboard` — initialize local config and workspace under `~/.nanobot/`.
+- `nanobot onboard` — initialize the default local config and workspace under `~/.nanobot/`.
+- `nanobot gateway --config /path/to/config.json` — start a specific runtime instance rooted at that config directory.
+- `nanobot agent --config /path/to/config.json -m "Hello"` — quick smoke test against a specific runtime instance.
 - `nanobot gateway` — start the gateway service.
 - `nanobot agent -m "Hello"` — quick CLI smoke test.
 - `pytest -q` — run all Python tests.
@@ -33,7 +35,7 @@
 
 ## Security & Configuration Tips
 - Never commit API keys, tokens, or tenant secrets.
-- Keep sensitive config in `~/.nanobot/config.json` and tenant files under `~/.nanobot/tenants/`.
+- Keep sensitive config in the active config file (default `~/.nanobot/config.json`) and tenant files under the selected instance root.
 - For new file writes, preserve restrictive permissions and least-privilege defaults.
 
 ## Upstream Sync Workflow

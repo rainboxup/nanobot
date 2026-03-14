@@ -4,7 +4,8 @@ import asyncio
 import ipaddress
 import os
 import secrets
-from contextlib import nullcontext
+import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,18 +31,86 @@ except Exception:  # pragma: no cover - optional dependency guard
 _PROMPT_SESSION = None
 _UVICORN_WS_BACKENDS = {"auto", "none", "websockets", "wsproto"}
 
+
+class _SafeConsoleStream:
+    """Wrap stdout/stderr and degrade unsupported Unicode on legacy consoles."""
+
+    def __init__(self, stream):
+        self._stream_getter = stream if callable(stream) else lambda: stream
+
+    @property
+    def _stream(self):
+        return self._stream_getter()
+
+    @property
+    def encoding(self):
+        return getattr(self._stream, "encoding", None)
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            text = str(text)
+        if self.encoding:
+            text = text.encode(self.encoding, errors="replace").decode(self.encoding)
+        return self._stream.write(text)
+
+    def flush(self) -> None:
+        flush = getattr(self._stream, "flush", None)
+        if callable(flush):
+            flush()
+
+    def isatty(self) -> bool:
+        isatty = getattr(self._stream, "isatty", None)
+        return bool(isatty()) if callable(isatty) else False
+
+    def fileno(self) -> int:
+        fileno = getattr(self._stream, "fileno", None)
+        if callable(fileno):
+            return fileno()
+        raise OSError("stream does not expose fileno()")
+
+    def __getattr__(self, name: str):
+        return getattr(self._stream, name)
+
+
+def _console_supports(text: str, current_console: Console | None = None) -> bool:
+    stream = (current_console or console).file
+    encoding = getattr(stream, "encoding", None)
+    if not encoding:
+        return True
+    try:
+        text.encode(encoding)
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def _cli_brand() -> str:
+    return f"{__logo__} nanobot" if _console_supports(__logo__) else "nanobot"
+
+
+def _ok_text() -> str:
+    return "[green]✓[/green]" if _console_supports("✓") else "[green]OK[/green]"
+
+
+def _fail_text() -> str:
+    return "[red]✗[/red]" if _console_supports("✗") else "[red]X[/red]"
+
+
+def _bool_status_text(enabled: bool) -> str:
+    return "enabled" if enabled else "disabled"
+
 app = typer.Typer(
     name="nanobot",
-    help=f"{__logo__} nanobot - Personal AI Assistant",
+    help="nanobot - Personal AI Assistant",
     no_args_is_help=True,
 )
 
-console = Console()
+console = Console(file=_SafeConsoleStream(lambda: sys.stdout), safe_box=True)
 
 
 def version_callback(value: bool):
     if value:
-        console.print(f"{__logo__} nanobot v{__version__}")
+        console.print(f"{_cli_brand()} v{__version__}")
         raise typer.Exit()
 
 
@@ -53,6 +122,32 @@ def _uvicorn_ws_backend() -> str:
     return "wsproto"
 
 
+@contextmanager
+def _runtime_config_context(config_path: Path | None = None):
+    """Apply a config-path override for the current CLI invocation."""
+    from nanobot.config.loader import get_data_dir, reset_config_path, set_config_path
+    from nanobot.utils.permissions import harden_sensitive_permissions
+
+    token = set_config_path(config_path) if config_path is not None else None
+    try:
+        harden_sensitive_permissions(get_data_dir())
+        yield
+    finally:
+        if token is not None:
+            reset_config_path(token)
+
+
+def _load_cli_config(*, workspace: str | None = None):
+    """Load config after CLI path overrides have been applied."""
+    from nanobot.config.loader import load_config
+    from nanobot.config.paths import get_workspace_path as resolve_workspace_path
+
+    config = load_config()
+    if workspace is not None:
+        config.agents.defaults.workspace = str(resolve_workspace_path(workspace))
+    return config
+
+
 @app.callback()
 def main(
     version: bool = typer.Option(None, "--version", "-v", callback=version_callback, is_eager=True),
@@ -62,12 +157,6 @@ def main(
     from nanobot.utils.log_redaction import install_log_redaction
 
     install_log_redaction()
-
-    # Best-effort: repair permissions for existing configs/tenant files.
-    from nanobot.config.loader import get_data_dir
-    from nanobot.utils.permissions import harden_sensitive_permissions
-
-    harden_sensitive_permissions(get_data_dir())
 
 
 # ============================================================================
@@ -92,19 +181,19 @@ def onboard():
 
     if not config_exists:
         save_config(Config())
-        console.print(f"[green]✓[/green] Created config at {config_path}")
+        console.print(f"{_ok_text()} Created config at {config_path}")
     elif overwrite:
         save_config(Config())
-        console.print("[green]✓[/green] Config reset to defaults")
+        console.print(f"{_ok_text()} Config reset to defaults")
     else:
-        console.print("[green]✓[/green] Config refreshed (existing values preserved)")
+        console.print(f"{_ok_text()} Config refreshed (existing values preserved)")
 
     # Create workspace
     workspace = get_workspace_path()
     workspace_existed = workspace.exists()
     if not workspace_existed:
         workspace.mkdir(parents=True, exist_ok=True)
-        console.print(f"[green]✓[/green] Created workspace at {workspace}")
+        console.print(f"{_ok_text()} Created workspace at {workspace}")
 
     # Create default bootstrap files
     from nanobot.utils.workspace import create_workspace_templates
@@ -117,13 +206,13 @@ def onboard():
         except Exception:
             console.print(f"  [dim]Created {p}[/dim]")
 
-    console.print(f"\n{__logo__} nanobot is ready!")
+    console.print(f"\n{_cli_brand()} is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.nanobot/config.json[/cyan]")
+    console.print(f"  1. Add your API key to [cyan]{config_path}[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print('  2. Chat: [cyan]nanobot agent -m "Hello!"[/cyan]')
     console.print(
-        "\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
+        "\n[dim]Want Telegram/WhatsApp/QQ? See: https://github.com/HKUDS/nanobot#-chat-apps[/dim]"
     )
 
 
@@ -143,8 +232,9 @@ def _init_prompt_session() -> None:
     if PromptSession is None or FileHistory is None:
         raise RuntimeError("prompt-toolkit is required for interactive mode")
 
-    history_path = Path.home() / ".nanobot" / "cli_history"
-    history_path.parent.mkdir(parents=True, exist_ok=True)
+    from nanobot.config.paths import get_cli_history_path
+
+    history_path = get_cli_history_path()
     _PROMPT_SESSION = PromptSession(
         history=FileHistory(str(history_path)),
         multiline=False,
@@ -164,6 +254,7 @@ async def _read_interactive_input_async() -> str:
 
 def _make_provider(config):
     """Create LiteLLMProvider from config. Exits if no API key found."""
+    from nanobot.config.loader import get_config_path
     from nanobot.providers.litellm_provider import LiteLLMProvider
 
     model = config.agents.defaults.model
@@ -171,7 +262,7 @@ def _make_provider(config):
     p = config.get_provider(model)
     if not (p and p.api_key) and not model.startswith("bedrock/"):
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.nanobot/config.json under providers section")
+        console.print(f"Set one in {get_config_path()} under providers section")
         raise typer.Exit(1)
 
     api_base = config.get_api_base(model)
@@ -245,16 +336,40 @@ def _emit_provider_health_warning(provider_name: str | None, api_base: str | Non
 
 @app.command()
 def gateway(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory override"
+    ),
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     multi_tenant: bool = typer.Option(False, "--multi-tenant", help="Enable multi-tenant mode"),
     enable_web: bool = typer.Option(False, "--enable-web", help="Enable web dashboard"),
 ):
     """Start the nanobot gateway."""
+    with _runtime_config_context(config_path):
+        _gateway_impl(
+            port=port,
+            verbose=verbose,
+            multi_tenant=multi_tenant,
+            enable_web=enable_web,
+            workspace=workspace,
+        )
+
+
+def _gateway_impl(
+    *,
+    port: int,
+    verbose: bool,
+    multi_tenant: bool,
+    enable_web: bool,
+    workspace: str | None,
+) -> None:
+    """Gateway implementation with runtime config context already applied."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.config.loader import get_data_dir
+    from nanobot.config.paths import get_skill_store_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -265,9 +380,9 @@ def gateway(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
+    console.print(f"{_cli_brand()} Starting gateway on port {port}...")
 
-    config = load_config()
+    config = _load_cli_config(workspace=workspace)
     bus = MessageBus(
         inbound_queue_size=config.traffic.inbound_queue_size,
         outbound_queue_size=config.traffic.outbound_queue_size,
@@ -281,6 +396,7 @@ def gateway(
         from nanobot.agent.multi_tenant import MultiTenantAgentLoop
         from nanobot.bus.broker import TenantIngressBroker
         from nanobot.config.loader import get_data_dir
+        from nanobot.config.paths import get_skill_store_dir
         from nanobot.tenants.store import TenantStore
         from nanobot.utils.disk_janitor import DiskJanitor
         from nanobot.utils.metrics import METRICS
@@ -322,7 +438,7 @@ def gateway(
             bus=bus,
             system_config=config,
             store=store,
-            skill_store_dir=get_data_dir() / "store" / "skills",
+            skill_store_dir=get_skill_store_dir(),
             store_lock=store_lock,
             ingress=ingress,
             web_tenant_claim_secret=web_tenant_claim_secret,
@@ -364,14 +480,10 @@ def gateway(
                     ws=_uvicorn_ws_backend(),
                 )
             )
-            console.print(
-                f"[green]✓[/green] Web dashboard available at http://{web_host}:{web_port}/"
-            )
+            console.print(f"{_ok_text()} Web dashboard available at http://{web_host}:{web_port}/")
 
         if channels.enabled_channels:
-            console.print(
-                f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}"
-            )
+            console.print(f"{_ok_text()} Channels enabled: {', '.join(channels.enabled_channels)}")
         else:
             console.print("[yellow]Warning: No channels enabled[/yellow]")
 
@@ -457,26 +569,48 @@ def gateway(
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
-        managed_skills_dir=get_data_dir() / "store" / "skills",
+        managed_skills_dir=get_skill_store_dir(),
     )
 
     # Set cron callback (needs agent)
     async def on_cron_job(job: CronJob) -> str | None:
         """Execute a cron job through the agent."""
-        response = await agent.process_direct(
-            job.payload.message,
-            session_key=f"cron:{job.id}",
-            channel=job.payload.channel or "cli",
-            chat_id=job.payload.to or "direct",
+        from nanobot.agent.tools.cron import CronTool
+        from nanobot.agent.tools.message import MessageTool
+
+        reminder_note = (
+            "[Scheduled Task] Timer finished.\n\n"
+            f"Task '{job.name}' has been triggered.\n"
+            f"Scheduled instruction: {job.payload.message}"
         )
-        if job.payload.deliver and job.payload.to:
+
+        cron_tool = agent.tools.get("cron")
+        cron_token = None
+        if isinstance(cron_tool, CronTool):
+            cron_token = cron_tool.set_cron_context(True)
+        try:
+            response = await agent.process_direct(
+                reminder_note,
+                session_key=f"cron:{job.id}",
+                channel=job.payload.channel or "cli",
+                chat_id=job.payload.to or "direct",
+            )
+        finally:
+            if isinstance(cron_tool, CronTool) and cron_token is not None:
+                cron_tool.reset_cron_context(cron_token)
+
+        message_tool = agent.tools.get("message")
+        if isinstance(message_tool, MessageTool) and message_tool._sent_in_turn:
+            return response
+
+        if job.payload.deliver and job.payload.to and response:
             from nanobot.bus.events import OutboundMessage
 
             await bus.publish_outbound(
                 OutboundMessage(
                     channel=job.payload.channel or "cli",
                     chat_id=job.payload.to,
-                    content=response or "",
+                    content=response,
                 )
             )
         return response
@@ -557,18 +691,18 @@ def gateway(
                 ws=_uvicorn_ws_backend(),
             )
         )
-        console.print(f"[green]✓[/green] Web dashboard available at http://{web_host}:{web_port}/")
+        console.print(f"{_ok_text()} Web dashboard available at http://{web_host}:{web_port}/")
 
     if channels.enabled_channels:
-        console.print(f"[green]✓[/green] Channels enabled: {', '.join(channels.enabled_channels)}")
+        console.print(f"{_ok_text()} Channels enabled: {', '.join(channels.enabled_channels)}")
     else:
         console.print("[yellow]Warning: No channels enabled[/yellow]")
 
     cron_status = cron.status()
     if cron_status["jobs"] > 0:
-        console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+        console.print(f"{_ok_text()} Cron: {cron_status['jobs']} scheduled jobs")
 
-    console.print("[green]✓[/green] Heartbeat: every 30m")
+    console.print(f"{_ok_text()} Heartbeat: every 30m")
 
     async def run():
         try:
@@ -646,7 +780,7 @@ def serve(
 
     web_host = str(host or getattr(config.gateway, "host", "0.0.0.0"))
     web_port = int(port or getattr(config.gateway, "port", 18790))
-    console.print(f"[green]✓[/green] Web dashboard available at http://{web_host}:{web_port}/")
+    console.print(f"{_ok_text()} Web dashboard available at http://{web_host}:{web_port}/")
 
     import uvicorn
 
@@ -680,15 +814,25 @@ def serve(
 
 @app.command()
 def agent(
+    config_path: Path | None = typer.Option(None, "--config", "-c", help="Path to config file"),
+    workspace: str | None = typer.Option(
+        None, "--workspace", "-w", help="Workspace directory override"
+    ),
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:default", "--session", "-s", help="Session ID"),
 ):
     """Interact with the agent directly."""
+    with _runtime_config_context(config_path):
+        _agent_impl(message=message, session_id=session_id, workspace=workspace)
+
+
+def _agent_impl(*, message: str | None, session_id: str, workspace: str | None) -> None:
+    """Agent implementation with runtime config context already applied."""
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.loader import get_data_dir, load_config
+    from nanobot.config.paths import get_skill_store_dir
 
-    config = load_config()
+    config = _load_cli_config(workspace=workspace)
 
     bus = MessageBus(
         inbound_queue_size=config.traffic.inbound_queue_size,
@@ -706,19 +850,19 @@ def agent(
         filesystem_config=config.tools.filesystem,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
-        managed_skills_dir=get_data_dir() / "store" / "skills",
+        managed_skills_dir=get_skill_store_dir(),
     )
 
     if message:
         # Single message mode
         async def run_once():
             response = await agent_loop.process_direct(message, session_id)
-            console.print(f"\n{__logo__} {response}")
+            console.print(f"\n{_cli_brand()} {response}")
 
         asyncio.run(run_once())
     else:
         # Interactive mode
-        console.print(f"{__logo__} Interactive mode (Ctrl+C to exit)\n")
+        console.print(f"{_cli_brand()} Interactive mode (Ctrl+C to exit)\n")
 
         async def run_interactive():
             while True:
@@ -728,7 +872,7 @@ def agent(
                         continue
 
                     response = await agent_loop.process_direct(user_input, session_id)
-                    console.print(f"\n{__logo__} {response}\n")
+                    console.print(f"\n{_cli_brand()} {response}\n")
                 except KeyboardInterrupt:
                     console.print("\nGoodbye!")
                     break
@@ -759,15 +903,23 @@ def channels_status():
 
     # WhatsApp
     wa = config.channels.whatsapp
-    table.add_row("WhatsApp", "✓" if wa.enabled else "✗", wa.bridge_url)
+    table.add_row("WhatsApp", _bool_status_text(wa.enabled), wa.bridge_url)
 
     dc = config.channels.discord
-    table.add_row("Discord", "✓" if dc.enabled else "✗", dc.gateway_url)
+    table.add_row("Discord", _bool_status_text(dc.enabled), dc.gateway_url)
 
     # Telegram
     tg = config.channels.telegram
     tg_config = f"token: {tg.token[:10]}..." if tg.token else "[dim]not configured[/dim]"
-    table.add_row("Telegram", "✓" if tg.enabled else "✗", tg_config)
+    table.add_row("Telegram", _bool_status_text(tg.enabled), tg_config)
+
+    qq = config.channels.qq
+    qq_config = (
+        f"app_id: {qq.app_id}, secret: configured"
+        if qq.app_id and qq.secret
+        else "[dim]not configured[/dim]"
+    )
+    table.add_row("QQ", _bool_status_text(qq.enabled), qq_config)
 
     console.print(table)
 
@@ -777,8 +929,10 @@ def _get_bridge_dir() -> Path:
     import shutil
     import subprocess
 
+    from nanobot.config.paths import get_bridge_install_dir
+
     # User's bridge location
-    user_bridge = Path.home() / ".nanobot" / "bridge"
+    user_bridge = get_bridge_install_dir()
 
     # Check if already built
     if (user_bridge / "dist" / "index.js").exists():
@@ -804,7 +958,7 @@ def _get_bridge_dir() -> Path:
         console.print("Try reinstalling: pip install --force-reinstall nanobot")
         raise typer.Exit(1)
 
-    console.print(f"{__logo__} Setting up bridge...")
+    console.print(f"{_cli_brand()} Setting up bridge...")
 
     # Copy to user directory
     user_bridge.parent.mkdir(parents=True, exist_ok=True)
@@ -820,7 +974,7 @@ def _get_bridge_dir() -> Path:
         console.print("  Building...")
         subprocess.run(["npm", "run", "build"], cwd=user_bridge, check=True, capture_output=True)
 
-        console.print("[green]✓[/green] Bridge ready\n")
+        console.print(f"{_ok_text()} Bridge ready\n")
     except subprocess.CalledProcessError as e:
         console.print(f"[red]Build failed: {e}[/red]")
         if e.stderr:
@@ -837,7 +991,7 @@ def channels_login():
 
     bridge_dir = _get_bridge_dir()
 
-    console.print(f"{__logo__} Starting bridge...")
+    console.print(f"{_cli_brand()} Starting bridge...")
     console.print("Scan the QR code to connect.\n")
 
     try:
@@ -955,7 +1109,7 @@ def cron_add(
         console.print(f"[red]Error: {e}[/red]")
         raise typer.Exit(1) from e
 
-    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+    console.print(f"{_ok_text()} Added job '{job.name}' ({job.id})")
 
 
 @cron_app.command("remove")
@@ -970,7 +1124,7 @@ def cron_remove(
     service = CronService(store_path)
 
     if service.remove_job(job_id):
-        console.print(f"[green]✓[/green] Removed job {job_id}")
+        console.print(f"{_ok_text()} Removed job {job_id}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
 
@@ -990,7 +1144,7 @@ def cron_enable(
     job = service.enable_job(job_id, enabled=not disable)
     if job:
         status = "disabled" if disable else "enabled"
-        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+        console.print(f"{_ok_text()} Job '{job.name}' {status}")
     else:
         console.print(f"[red]Job {job_id} not found[/red]")
 
@@ -1022,9 +1176,9 @@ def cron_run(
         console.print(f"[yellow]![/yellow] Job skipped{detail}")
     elif status == "error":
         detail = f": {last_error}" if last_error else ""
-        console.print(f"[red]✗[/red] Job failed{detail}")
+        console.print(f"{_fail_text()} Job failed{detail}")
     else:
-        console.print("[green]✓[/green] Job executed")
+        console.print(f"{_ok_text()} Job executed")
 
 
 # ============================================================================
@@ -1041,13 +1195,13 @@ def status():
     config = load_config()
     workspace = config.workspace_path
 
-    console.print(f"{__logo__} nanobot Status\n")
+    console.print(f"{_cli_brand()} Status\n")
 
     console.print(
-        f"Config: {config_path} {'[green]✓[/green]' if config_path.exists() else '[red]✗[/red]'}"
+        f"Config: {config_path} {_ok_text() if config_path.exists() else _fail_text()}"
     )
     console.print(
-        f"Workspace: {workspace} {'[green]✓[/green]' if workspace.exists() else '[red]✗[/red]'}"
+        f"Workspace: {workspace} {_ok_text() if workspace.exists() else _fail_text()}"
     )
 
     if config_path.exists():
@@ -1063,13 +1217,13 @@ def status():
             if spec.is_local:
                 # Local deployments show api_base instead of api_key
                 if p.api_base:
-                    console.print(f"{spec.label}: [green]✓ {p.api_base}[/green]")
+                    console.print(f"{spec.label}: {_ok_text()} {p.api_base}")
                 else:
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
                 console.print(
-                    f"{spec.label}: {'[green]✓[/green]' if has_key else '[dim]not set[/dim]'}"
+                    f"{spec.label}: {_ok_text() if has_key else '[dim]not set[/dim]'}"
                 )
 
 

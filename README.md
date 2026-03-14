@@ -118,7 +118,8 @@ pip install nanobot-ai
 ## 🚀 Quick Start
 
 > [!TIP]
-> Set your API key in `~/.nanobot/config.json`.
+> By default, set your API key in `~/.nanobot/config.json`.
+> To run multiple instances, use `nanobot agent --config /path/to/config.json` or `nanobot gateway --config /path/to/config.json`; runtime state follows that config directory.
 > Get API keys: [OpenRouter](https://openrouter.ai/keys) (Global) · [Brave Search](https://brave.com/search/api/) (optional, for web search)
 
 **1. Initialize**
@@ -127,7 +128,9 @@ pip install nanobot-ai
 nanobot onboard
 ```
 
-**2. Configure** (`~/.nanobot/config.json`)
+**2. Configure** (default `~/.nanobot/config.json`)
+
+Need separate runtime roots or a custom workspace? See `docs/howto/multi-instance-runtime-layout.md`.
 
 Add or merge these **two parts** into your config (other options have defaults).
 
@@ -648,7 +651,7 @@ Simply send the command above to your nanobot (via CLI or any chat channel), and
 
 ## ⚙️ Configuration
 
-Config file: `~/.nanobot/config.json`
+Config file: default `~/.nanobot/config.json` (or the file passed via `--config`)
 
 ### Providers
 
@@ -923,9 +926,9 @@ nanobot cron remove <job_id>
 <details>
 <summary><b>Heartbeat (Periodic Tasks)</b></summary>
 
-The gateway wakes up every 30 minutes and checks `HEARTBEAT.md` in your workspace (`~/.nanobot/workspace/HEARTBEAT.md`). If the file has tasks, the agent executes them and delivers results to your most recently active chat channel.
+The gateway wakes up every 30 minutes and checks `HEARTBEAT.md` in your workspace (default `~/.nanobot/workspace/HEARTBEAT.md`). If the file has tasks, the agent executes them and delivers results to your most recently active chat channel.
 
-**Setup:** edit `~/.nanobot/workspace/HEARTBEAT.md` (created automatically by `nanobot onboard`):
+**Setup:** edit your workspace `HEARTBEAT.md` (default `~/.nanobot/workspace/HEARTBEAT.md`, created automatically by `nanobot onboard`):
 
 ```markdown
 ## Periodic Tasks

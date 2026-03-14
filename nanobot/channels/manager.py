@@ -585,6 +585,16 @@ class ChannelManager:
             for name, channel in self.channels.items()
         }
 
+    def get_workspace_runtime_status(self) -> dict[str, list[dict[str, Any]]]:
+        """Return tenant-scoped runtime status without exposing credential values."""
+        return {
+            channel_name: [
+                {"tenant_id": tenant_id, "running": bool(channel.is_running)}
+                for tenant_id, channel in sorted(tenant_rows.items())
+            ]
+            for channel_name, tenant_rows in sorted(self._workspace_channels.items())
+        }
+
     @property
     def enabled_channels(self) -> list[str]:
         """Get list of enabled channel names."""

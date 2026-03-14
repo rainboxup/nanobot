@@ -1013,7 +1013,7 @@ async def list_workspace_channels(
             system_channel=getattr(system_cfg.channels, name),
             routing=getattr(tenant_cfg.workspace.channels, name),
         )
-        if not _user_has_admin_access(user):
+        if not _user_has_admin_access(user) and payload.get("writable", False):
             payload["writable"] = False
             payload["write_block_reason_code"] = "admin_required"
             payload["write_block_reason"] = (

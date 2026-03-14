@@ -1045,6 +1045,27 @@ async def test_workspace_routing_single_runtime_mode_returns_structured_conflict
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_workspace_routing_member_list_preserves_single_runtime_block_reason(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.runtime_mode = "single"
+    member_headers = await auth_headers_for(
+        "member-routing-single",
+        role="member",
+        tenant_id="tenant-routing-single-member",
+    )
+
+    response = await http_client.get("/api/channels/workspace", headers=member_headers)
+
+    assert response.status_code == 200
+    rows = {row["name"]: row for row in response.json()}
+    assert rows["feishu"]["writable"] is False
+    assert rows["feishu"]["write_block_reason_code"] == "single_tenant_runtime_mode"
+    assert "single-tenant runtime mode" in str(rows["feishu"]["write_block_reason"]).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_workspace_routing_conflicting_flags_return_structured_422(
     http_client, auth_headers_for
 ) -> None:

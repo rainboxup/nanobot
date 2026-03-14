@@ -374,3 +374,33 @@ def test_get_status_preserves_global_channel_key_shape() -> None:
     )
 
     assert list(manager.get_status().keys()) == ["feishu"]
+
+
+def test_get_workspace_runtime_status_exposes_running_state_without_secrets() -> None:
+    bus = MessageBus()
+    manager = ChannelManager(Config(), bus, runtime_mode="multi")
+
+    class DummyChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    runtime = DummyChannel(config=None, bus=bus)
+    runtime._running = True
+    manager.register_workspace_channel_runtime(
+        "tenant-a",
+        "feishu",
+        runtime,
+        credential_config={"app_id": "tenant-app", "app_secret": "tenant-secret"},
+    )
+
+    assert manager.get_workspace_runtime_status() == {
+        "feishu": [{"tenant_id": "tenant-a", "running": True}]
+    }

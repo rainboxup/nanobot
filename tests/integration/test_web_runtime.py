@@ -1,5 +1,8 @@
 import pytest
 
+from nanobot.bus.events import OutboundMessage
+from nanobot.channels.base import BaseChannel
+
 
 @pytest.mark.integration
 @pytest.mark.asyncio
@@ -113,6 +116,41 @@ async def test_web_ops_runtime_endpoint_normalizes_web_session_cache_metrics(
     assert int(web_cache.get("current_cached_tenant_session_managers") or 0) == 0
     assert int(web_cache.get("evictions_total") or 0) == 0
     assert float(web_cache.get("utilization", 1.0)) == 0.0
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_web_ops_runtime_endpoint_exposes_workspace_runtime_summary(
+    http_client, auth_headers, web_ctx
+) -> None:
+    class DummyWorkspaceChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    runtime = DummyWorkspaceChannel(config=None, bus=web_ctx.bus)
+    runtime._running = True
+    web_ctx.channel_manager.register_workspace_channel_runtime(
+        "tenant-runtime",
+        "feishu",
+        runtime,
+        credential_config={"app_id": "tenant-app", "app_secret": "tenant-secret"},
+    )
+
+    response = await http_client.get("/api/ops/runtime", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    channels = ((body.get("runtime") or {}).get("channels") or {})
+    assert channels.get("workspace_status") == {
+        "feishu": [{"tenant_id": "tenant-runtime", "running": True}]
+    }
 
 
 @pytest.mark.integration

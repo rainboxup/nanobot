@@ -578,6 +578,9 @@ def create_app(
                     if channel_manager is not None
                     else [],
                     "status": channel_manager.get_status() if channel_manager is not None else {},
+                    "workspace_status": channel_manager.get_workspace_runtime_status()
+                    if channel_manager is not None
+                    else {},
                     "active_web_connections": active_web_connections,
                 },
                 "web_session_cache": web_session_cache,

@@ -22,6 +22,7 @@ from nanobot.agent.loop import AgentLoop
 from nanobot.bus.broker import get_tenant_id_from_metadata
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.paths import get_skill_store_dir
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.services.baseline_rollout import BaselineRolloutService
@@ -32,7 +33,6 @@ from nanobot.tenants.commands import configure_link_throttle, try_handle
 from nanobot.tenants.policy import allowlist_match, resolve_exec_effective, resolve_web_effective
 from nanobot.tenants.store import TenantStore
 from nanobot.tenants.types import TenantContext
-from nanobot.utils.helpers import get_data_path
 from nanobot.utils.whitelist import parse_str_list, to_set
 
 
@@ -98,7 +98,7 @@ class MultiTenantAgentLoop:
         self.store = store or TenantStore()
         if hasattr(self.store, "bind_system_config"):
             self.store.bind_system_config(system_config)
-        self.skill_store_dir = skill_store_dir or (get_data_path() / "store" / "skills")
+        self.skill_store_dir = skill_store_dir or get_skill_store_dir()
         self.max_inflight = max(1, int(max_inflight))
         self.ingress = ingress
         self.web_tenant_claim_secret = str(web_tenant_claim_secret or "").strip()

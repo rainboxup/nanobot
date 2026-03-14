@@ -88,11 +88,9 @@ def resolve_audit_log_path(
     raw = str(os.getenv("NANOBOT_WEB_AUDIT_LOG_PATH") or "").strip()
     if raw:
         return Path(raw).expanduser()
-    if config_path is not None:
-        return Path(config_path).expanduser().parent / "web_audit.log"
-    if workspace_path is not None:
-        return Path(workspace_path).expanduser().parent / "web_audit.log"
-    return Path.home() / ".nanobot" / "web_audit.log"
+    from nanobot.config.paths import resolve_runtime_file
+
+    return resolve_runtime_file("web_audit.log", config_path=config_path)
 
 
 def request_ip(request) -> str:

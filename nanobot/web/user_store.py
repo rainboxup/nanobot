@@ -115,11 +115,9 @@ def resolve_auth_state_path(
     raw = str(os.getenv("NANOBOT_WEB_AUTH_STATE_PATH") or "").strip()
     if raw:
         return Path(raw).expanduser()
-    if config_path is not None:
-        return Path(config_path).expanduser().parent / "web_auth_state.json"
-    if workspace_path is not None:
-        return Path(workspace_path).expanduser().parent / "web_auth_state.json"
-    return Path.home() / ".nanobot" / "web_auth_state.json"
+    from nanobot.config.paths import resolve_runtime_file
+
+    return resolve_runtime_file("web_auth_state.json", config_path=config_path)
 
 
 class UserStore:

@@ -40,6 +40,7 @@ from nanobot.config.loader import (
     load_config,
     migrate_config_data,
 )
+from nanobot.config.paths import get_tenants_dir
 from nanobot.config.schema import Config, TenantChannelOverride
 from nanobot.tenants.types import TenantContext
 from nanobot.tenants.validation import (
@@ -48,7 +49,7 @@ from nanobot.tenants.validation import (
     validate_tenant_id,
     workspace_routing_channel_names,
 )
-from nanobot.utils.helpers import ensure_dir, get_data_path, safe_filename
+from nanobot.utils.helpers import ensure_dir, safe_filename
 from nanobot.utils.workspace import create_workspace_templates
 
 
@@ -365,7 +366,7 @@ class TenantStore:
     """A tiny JSON store for tenant identities and link codes."""
 
     def __init__(self, base_dir: Path | None = None, system_config: Config | None = None):
-        data_dir = base_dir or (get_data_path() / "tenants")
+        data_dir = base_dir or get_tenants_dir()
         self.base_dir = ensure_dir(data_dir)
         self.index_path = self.base_dir / "index.json"
         self._index_lock = threading.RLock()

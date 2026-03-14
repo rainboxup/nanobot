@@ -48,11 +48,9 @@ def resolve_beta_state_path(
     raw = str(os.getenv("NANOBOT_WEB_BETA_STATE_PATH") or "").strip()
     if raw:
         return Path(raw).expanduser()
-    if config_path is not None:
-        return Path(config_path).expanduser().parent / "web_beta_access.json"
-    if workspace_path is not None:
-        return Path(workspace_path).expanduser().parent / "web_beta_access.json"
-    return Path.home() / ".nanobot" / "web_beta_access.json"
+    from nanobot.config.paths import resolve_runtime_file
+
+    return resolve_runtime_file("web_beta_access.json", config_path=config_path)
 
 
 class BetaAccessStore:

@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 from collections.abc import Mapping
+from contextvars import ContextVar, Token
 from pathlib import Path
 from types import UnionType
 from typing import Any, Union, get_args, get_origin
@@ -24,6 +25,8 @@ from nanobot.config.schema import (
     TrafficConfig,
     WorkspaceConfig,
 )
+
+_ACTIVE_CONFIG_PATH: ContextVar[Path | None] = ContextVar("nanobot_active_config_path", default=None)
 
 
 def build_config_without_env(data: dict[str, Any], *, strict_section_types: bool = False) -> Config:
@@ -54,14 +57,28 @@ def build_config_without_env(data: dict[str, Any], *, strict_section_types: bool
 
 def get_config_path() -> Path:
     """Get the default configuration file path."""
+    active_path = _ACTIVE_CONFIG_PATH.get()
+    if active_path is not None:
+        return active_path
     return Path.home() / ".nanobot" / "config.json"
 
 
 def get_data_dir() -> Path:
     """Get the nanobot data directory."""
-    from nanobot.utils.helpers import get_data_path
+    from nanobot.config.paths import get_data_dir as resolve_data_dir
 
-    return get_data_path()
+    return resolve_data_dir()
+
+
+def set_config_path(path: Path | str | None) -> Token:
+    """Set the active config path for the current execution context."""
+    resolved = Path(path).expanduser() if path is not None else None
+    return _ACTIVE_CONFIG_PATH.set(resolved)
+
+
+def reset_config_path(token: Token) -> None:
+    """Restore the previous active config path."""
+    _ACTIVE_CONFIG_PATH.reset(token)
 
 
 def _strip_optional_annotation(annotation: Any) -> Any:

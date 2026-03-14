@@ -14,13 +14,16 @@ def ensure_dir(path: Path) -> Path:
 
 def get_data_path() -> Path:
     """~/.nanobot data directory."""
-    return ensure_dir(Path.home() / ".nanobot")
+    from nanobot.config.paths import get_data_dir
+
+    return get_data_dir()
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
     """Resolve and ensure workspace path. Defaults to ~/.nanobot/workspace."""
-    path = Path(workspace).expanduser() if workspace else Path.home() / ".nanobot" / "workspace"
-    return ensure_dir(path)
+    from nanobot.config.paths import get_workspace_path as resolve_workspace_path
+
+    return resolve_workspace_path(workspace)
 
 
 def timestamp() -> str:

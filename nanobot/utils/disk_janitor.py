@@ -3,8 +3,8 @@
 Nanobot runs on small VPS machines in MVP mode; disk is limited and we may cache:
 - exec exports under workspace/exports/<task_id> (single-tenant)
 - exec exports under tenants/*/workspace/exports/<task_id> (multi-tenant)
-- inbound media downloads under ~/.nanobot/media
-- scratch files under ~/.nanobot/temp
+- inbound media downloads under the active instance `media/` directory
+- scratch files under the active instance `temp/` directory
 
 This module provides a single janitor class to clean these locations on a fixed TTL.
 """
@@ -45,7 +45,7 @@ class DiskJanitorReport:
 
 
 class DiskJanitor:
-    """TTL-based disk cleanup for exports/media/temp."""
+    """TTL-based disk cleanup for instance-scoped exports/media/temp."""
 
     def __init__(
         self,

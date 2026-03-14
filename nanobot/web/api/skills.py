@@ -12,13 +12,13 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nanobot.agent.skills import SkillsLoader
+from nanobot.config.paths import get_skill_store_dir
 from nanobot.services.workspace_mcp import WorkspaceMCPError, WorkspaceMCPService
 from nanobot.services.workspace_skill_installs import (
     WorkspaceSkillInstallError,
     WorkspaceSkillInstallService,
 )
 from nanobot.services.workspace_tool_policy import WorkspaceToolPolicyService
-from nanobot.utils.helpers import get_data_path
 from nanobot.web.api.baseline_rollout import (
     baseline_metadata_from_resolution,
     resolve_baseline_for_tenant,
@@ -383,7 +383,7 @@ def _resolve_skill_store_dir(request: Request) -> Path:
     raw = getattr(request.app.state, "skill_store_dir", None)
     if raw:
         return Path(str(raw)).expanduser()
-    return get_data_path() / "store" / "skills"
+    return get_skill_store_dir()
 
 
 def get_clawhub_client(request: Request) -> ClawHubClient:

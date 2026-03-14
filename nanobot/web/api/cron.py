@@ -20,13 +20,9 @@ router = APIRouter()
 
 def resolve_cron_store_path(*, config_path: Path | None, workspace_path: Path | None) -> Path:
     """Resolve cron jobs store path for web APIs."""
-    if config_path is not None:
-        return config_path.parent / "cron" / "jobs.json"
-    if workspace_path is not None:
-        return Path(workspace_path).parent / "cron" / "jobs.json"
-    from nanobot.config.loader import get_data_dir
+    from nanobot.config.paths import resolve_runtime_file
 
-    return get_data_dir() / "cron" / "jobs.json"
+    return resolve_runtime_file("cron/jobs.json", config_path=config_path)
 
 
 def _now_ms() -> int:

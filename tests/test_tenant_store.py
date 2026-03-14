@@ -28,6 +28,14 @@ def test_ensure_tenant_creates_dirs_and_templates(tmp_path: Path) -> None:
     assert store.resolve_tenant("telegram", "123") == tenant_id
 
 
+def test_default_tenant_store_base_dir_uses_runtime_helper(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("nanobot.tenants.store.get_tenants_dir", lambda: tmp_path / "runtime-tenants")
+
+    store = TenantStore()
+
+    assert store.base_dir == tmp_path / "runtime-tenants"
+
+
 def test_link_code_roundtrip(tmp_path: Path) -> None:
     store = TenantStore(base_dir=tmp_path / "tenants")
     tenant_id = store.ensure_tenant("telegram", "123")

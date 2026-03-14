@@ -489,9 +489,22 @@ class TenantStore:
         with self._index_lock:
             data = self._load()
             tenants = data.get("tenants") or {}
-            if not isinstance(tenants, dict):
-                return []
-            return sorted(str(tenant_id) for tenant_id in tenants.keys())
+            tenant_ids: set[str] = set()
+            if isinstance(tenants, dict):
+                tenant_ids.update(str(tenant_id) for tenant_id in tenants.keys())
+
+            try:
+                for path in self.base_dir.iterdir():
+                    if not path.is_dir():
+                        continue
+                    try:
+                        tenant_ids.add(validate_tenant_id(path.name))
+                    except ValueError:
+                        continue
+            except OSError:
+                pass
+
+            return sorted(tenant_ids)
 
     def ensure_account(self, account_id: str, tenant_id: str) -> dict[str, Any]:
         """Ensure an account record exists for a tenant."""

@@ -178,6 +178,36 @@ async def test_web_ops_runtime_endpoint_lists_configured_workspace_runtime_witho
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_web_ops_runtime_endpoint_lists_web_only_workspace_tenant_configs(
+    http_client, auth_headers_for, auth_headers, web_ctx
+) -> None:
+    web_ctx.channel_manager.tenant_store = web_ctx.tenant_store
+    web_ctx.channel_manager.runtime_mode = "multi"
+
+    tenant_id = "tenant-web-only-runtime"
+    tenant_headers = await auth_headers_for(
+        "alice-web-only-runtime",
+        role="admin",
+        tenant_id=tenant_id,
+    )
+    update = await http_client.put(
+        "/api/channels/feishu/credentials",
+        headers=tenant_headers,
+        json={"app_id": "tenant-app", "app_secret": "tenant-secret"},
+    )
+    assert update.status_code == 200
+
+    response = await http_client.get("/api/ops/runtime", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    channels = ((body.get("runtime") or {}).get("channels") or {})
+    assert channels.get("workspace_status") == {
+        "feishu": [{"tenant_id": tenant_id, "running": False, "active_in_runtime": False}]
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_web_ops_runtime_endpoint_is_owner_only(http_client, auth_headers_for) -> None:
     alice_headers = await auth_headers_for("alice-runtime", role="admin")
     response = await http_client.get("/api/ops/runtime", headers=alice_headers)

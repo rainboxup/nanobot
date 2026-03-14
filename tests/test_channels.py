@@ -342,6 +342,53 @@ async def test_refresh_workspace_channel_runtimes_rebuilds_stopped_runtime_with_
 
 
 @pytest.mark.asyncio
+async def test_refresh_workspace_channel_runtimes_loads_web_only_tenant_configs(
+    tmp_path,
+) -> None:
+    class DummyChannel(BaseChannel):
+        name = "feishu"
+
+        async def start(self) -> None:
+            self._running = True
+
+        async def stop(self) -> None:
+            self._running = False
+
+        async def send(self, msg: OutboundMessage) -> None:
+            return None
+
+    tenant_store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = "tenant-web-only"
+    tenant_cfg = tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
+    tenant_cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    manager = ChannelManager(
+        Config(),
+        MessageBus(),
+        tenant_store=tenant_store,
+        runtime_mode="multi",
+    )
+
+    created: list[DummyChannel] = []
+
+    def build_workspace_channel(name, config, inbound_bus):
+        assert name == "feishu"
+        runtime = DummyChannel(config=config, bus=inbound_bus)
+        created.append(runtime)
+        return runtime
+
+    manager._create_workspace_channel = build_workspace_channel  # type: ignore[attr-defined]
+
+    await manager.refresh_workspace_channel_runtimes()
+
+    runtime = manager.get_workspace_channel_runtime(tenant_id, "feishu")
+    assert created
+    assert runtime is created[0]
+
+
+@pytest.mark.asyncio
 async def test_workspace_runtime_inbound_fails_closed_when_prelink_fails(tmp_path) -> None:
     sink_messages: list[InboundMessage] = []
 

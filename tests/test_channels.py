@@ -505,3 +505,23 @@ async def test_get_workspace_runtime_status_marks_runtime_inactive_when_credenti
     assert manager.get_workspace_runtime_status() == {
         "feishu": [{"tenant_id": tenant_id, "running": True, "active_in_runtime": False}]
     }
+
+
+def test_get_workspace_runtime_status_includes_configured_tenant_without_runtime(tmp_path) -> None:
+    tenant_store = TenantStore(base_dir=tmp_path / "tenants")
+    tenant_id = tenant_store.ensure_tenant("web", "owner")
+    tenant_cfg = tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
+    tenant_cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    manager = ChannelManager(
+        Config(),
+        MessageBus(),
+        tenant_store=tenant_store,
+        runtime_mode="multi",
+    )
+
+    assert manager.get_workspace_runtime_status() == {
+        "feishu": [{"tenant_id": tenant_id, "running": False, "active_in_runtime": False}]
+    }

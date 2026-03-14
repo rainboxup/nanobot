@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 
-from nanobot.agent.tools.web import _validate_url, _validate_url_async
+from nanobot.agent.tools.web import WebSearchTool, _validate_url, _validate_url_async
 
 
 def test_validate_url_rejects_non_http_scheme():
@@ -53,3 +53,14 @@ async def test_validate_url_async_blocks_hostname_resolving_to_private_ips():
         ok, msg = await _validate_url_async("https://example.com/", allow_private_network=False)
         assert ok is False
         assert "non-public" in msg.lower()
+
+
+@pytest.mark.asyncio
+async def test_web_search_missing_api_key_mentions_active_config_path(monkeypatch, tmp_path):
+    config_path = tmp_path / "instance-a" / "config.json"
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: config_path)
+
+    result = await WebSearchTool(api_key=None).execute("nanobot")
+
+    assert str(config_path) in result
+    assert "tools.web.search.apiKey" in result

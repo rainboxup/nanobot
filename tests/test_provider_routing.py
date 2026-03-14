@@ -48,3 +48,62 @@ def test_parse_response_preserves_reasoning_content() -> None:
     parsed = provider._parse_response(response)
     assert parsed.content == "ok"
     assert parsed.reasoning_content == "internal chain"
+
+
+def test_sanitize_messages_normalizes_tool_call_ids_consistently() -> None:
+    provider = LiteLLMProvider(api_key="sk-test")
+    raw_id = "tool-call-id-that-is-way-too-long"
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": raw_id,
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": raw_id,
+            "name": "read_file",
+            "content": "ok",
+        },
+    ]
+
+    sanitized = provider._sanitize_messages(messages)
+    normalized_call_id = sanitized[0]["tool_calls"][0]["id"]
+
+    assert normalized_call_id == sanitized[1]["tool_call_id"]
+    assert len(normalized_call_id) == 9
+    assert normalized_call_id.isalnum()
+
+
+def test_parse_response_merges_tool_calls_from_multiple_choices() -> None:
+    provider = LiteLLMProvider(api_key="sk-test")
+    tool_call = SimpleNamespace(
+        function=SimpleNamespace(name="read_file", arguments='{"path":"README.md"}')
+    )
+    first = SimpleNamespace(content=None, tool_calls=None, reasoning_content=None, thinking_blocks=None)
+    second = SimpleNamespace(
+        content=None,
+        tool_calls=[tool_call],
+        reasoning_content=None,
+        thinking_blocks=None,
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(message=first, finish_reason="length"),
+            SimpleNamespace(message=second, finish_reason="tool_calls"),
+        ],
+        usage=None,
+    )
+
+    parsed = provider._parse_response(response)
+
+    assert parsed.finish_reason == "tool_calls"
+    assert len(parsed.tool_calls) == 1
+    assert parsed.tool_calls[0].name == "read_file"
+    assert parsed.tool_calls[0].arguments == {"path": "README.md"}

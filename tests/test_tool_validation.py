@@ -83,6 +83,12 @@ def test_validate_params_nested_object_and_array() -> None:
     assert any("meta.flags[0] should be string" in e for e in errors)
 
 
+def test_validate_params_rejects_non_object_input() -> None:
+    tool = SampleTool()
+    errors = tool.validate_params(["bad"])
+    assert errors == ["parameters must be an object, got list"]
+
+
 def test_validate_params_ignores_unknown_fields() -> None:
     tool = SampleTool()
     errors = tool.validate_params({"query": "hi", "count": 2, "extra": "x"})
@@ -94,6 +100,13 @@ async def test_registry_returns_validation_error() -> None:
     reg.register(SampleTool())
     result = await reg.execute("sample", {"query": "hi"})
     assert "Invalid parameters" in result
+
+
+async def test_registry_returns_validation_error_for_non_object_input() -> None:
+    reg = ToolRegistry()
+    reg.register(SampleTool())
+    result = await reg.execute("sample", ["bad"])  # type: ignore[arg-type]
+    assert "parameters must be an object" in result
 
 
 def test_exec_extract_absolute_paths_keeps_full_windows_path() -> None:

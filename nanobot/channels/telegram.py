@@ -15,6 +15,7 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import TelegramConfig
 
 if TYPE_CHECKING:
@@ -122,6 +123,29 @@ class TelegramChannel(BaseChannel):
         self._chat_ids: OrderedDict[str, int] = OrderedDict()
         self._chat_ids_limit = 10_000
         self._typing_tasks: dict[str, asyncio.Task] = {}  # chat_id -> typing loop task
+
+    def is_allowed(self, sender_id: str) -> bool:
+        """Preserve safe legacy Telegram id|username allowlist matching."""
+        if super().is_allowed(sender_id):
+            return True
+
+        allow_list = getattr(self.config, "allow_from", [])
+        if not allow_list or "*" in allow_list:
+            return False
+
+        sender_str = str(sender_id)
+        if sender_str.count("|") != 1:
+            return False
+
+        numeric_id, username = sender_str.split("|", 1)
+        if not numeric_id.isdigit() or not username:
+            return False
+
+        return numeric_id in allow_list or username in allow_list
+
+    def _media_dir(self) -> Path:
+        """Return the Telegram media download directory."""
+        return get_media_dir("telegram")
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
@@ -398,13 +422,7 @@ class TelegramChannel(BaseChannel):
                 file = await self._app.bot.get_file(media_file.file_id)
                 ext = self._get_extension(media_type, getattr(media_file, "mime_type", None))
 
-                # Save to workspace/media/
-                from pathlib import Path
-
-                media_dir = Path.home() / ".nanobot" / "media"
-                media_dir.mkdir(parents=True, exist_ok=True)
-
-                file_path = media_dir / f"{media_file.file_id[:16]}{ext}"
+                file_path = self._media_dir() / f"{media_file.file_id[:16]}{ext}"
                 await file.download_to_drive(str(file_path))
 
                 media_paths.append(str(file_path))

@@ -12,6 +12,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import DiscordConfig
 
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -41,6 +42,10 @@ class DiscordChannel(BaseChannel):
         self._heartbeat_task: asyncio.Task | None = None
         self._typing_tasks: dict[str, asyncio.Task] = {}
         self._http: httpx.AsyncClient | None = None
+
+    def _media_dir(self) -> Path:
+        """Return the Discord attachment download directory."""
+        return get_media_dir("discord")
 
     async def start(self) -> None:
         """Start the Discord gateway connection."""
@@ -338,7 +343,7 @@ class DiscordChannel(BaseChannel):
 
         content_parts = [content] if content else []
         media_paths: list[str] = []
-        media_dir = Path.home() / ".nanobot" / "media"
+        media_dir = self._media_dir()
 
         for attachment in payload.get("attachments") or []:
             url = attachment.get("url")
@@ -350,7 +355,6 @@ class DiscordChannel(BaseChannel):
                 content_parts.append(f"[attachment: {filename} - too large]")
                 continue
             try:
-                media_dir.mkdir(parents=True, exist_ok=True)
                 file_path = (
                     media_dir / f"{attachment.get('id', 'file')}_{filename.replace('/', '_')}"
                 )

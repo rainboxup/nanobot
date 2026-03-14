@@ -14,6 +14,7 @@ from loguru import logger
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel, MessageType
+from nanobot.config.paths import get_media_dir
 from nanobot.config.schema import FeishuConfig
 from nanobot.services.channel_routing import normalize_sender_id
 
@@ -270,6 +271,10 @@ class FeishuChannel(BaseChannel):
         self._ws_thread: threading.Thread | None = None
         self._processed_message_ids: OrderedDict[str, None] = OrderedDict()  # Ordered dedup cache
         self._loop: asyncio.AbstractEventLoop | None = None
+
+    def _media_dir(self) -> Path:
+        """Return the Feishu media download directory."""
+        return get_media_dir("feishu")
 
     async def start(self) -> None:
         """Start the Feishu bot with WebSocket long connection."""
@@ -612,8 +617,7 @@ class FeishuChannel(BaseChannel):
             (file_path, content_text) - file_path is None if download failed
         """
         loop = asyncio.get_running_loop()
-        media_dir = Path.home() / ".nanobot" / "media"
-        media_dir.mkdir(parents=True, exist_ok=True)
+        media_dir = self._media_dir()
 
         data, filename = None, None
 

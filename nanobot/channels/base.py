@@ -78,18 +78,13 @@ class BaseChannel(ABC):
         """
         allow_list = getattr(self.config, "allow_from", [])
 
-        # If no allow list, allow everyone
+        # Preserve current fork behavior: empty allow list means public access.
         if not allow_list:
             return True
-
-        sender_str = str(sender_id)
-        if sender_str in allow_list:
+        if "*" in allow_list:
             return True
-        if "|" in sender_str:
-            for part in sender_str.split("|"):
-                if part and part in allow_list:
-                    return True
-        return False
+
+        return str(sender_id) in allow_list
 
     async def _handle_message(
         self,

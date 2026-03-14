@@ -416,6 +416,11 @@ def create_app(
     normalized_runtime_mode = str(runtime_mode or "multi").strip().lower()
     if normalized_runtime_mode not in {"single", "multi"}:
         normalized_runtime_mode = "multi"
+    if channel_manager is not None:
+        if hasattr(channel_manager, "tenant_store"):
+            channel_manager.tenant_store = tenant_store
+        if hasattr(channel_manager, "runtime_mode"):
+            channel_manager.runtime_mode = normalized_runtime_mode
     app.state.runtime_mode = normalized_runtime_mode
     app.state.runtime_scope = "global" if normalized_runtime_mode == "single" else "tenant"
 

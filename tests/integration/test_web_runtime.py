@@ -135,6 +135,11 @@ async def test_web_ops_runtime_endpoint_exposes_workspace_runtime_summary(
         async def send(self, msg: OutboundMessage) -> None:
             return None
 
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config("tenant-runtime")
+    tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
+    tenant_cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    web_ctx.tenant_store.save_tenant_config("tenant-runtime", tenant_cfg)
+
     runtime = DummyWorkspaceChannel(config=None, bus=web_ctx.bus)
     runtime._running = True
     web_ctx.channel_manager.register_workspace_channel_runtime(
@@ -158,9 +163,6 @@ async def test_web_ops_runtime_endpoint_exposes_workspace_runtime_summary(
 async def test_web_ops_runtime_endpoint_lists_configured_workspace_runtime_without_instance(
     http_client, auth_headers, web_ctx
 ) -> None:
-    web_ctx.channel_manager.tenant_store = web_ctx.tenant_store
-    web_ctx.channel_manager.runtime_mode = "multi"
-
     tenant_id = web_ctx.tenant_store.ensure_tenant("web", "workspace-owner")
     tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
     tenant_cfg.workspace.channels.feishu.app_id = "tenant-app"
@@ -181,9 +183,6 @@ async def test_web_ops_runtime_endpoint_lists_configured_workspace_runtime_witho
 async def test_web_ops_runtime_endpoint_lists_web_only_workspace_tenant_configs(
     http_client, auth_headers_for, auth_headers, web_ctx
 ) -> None:
-    web_ctx.channel_manager.tenant_store = web_ctx.tenant_store
-    web_ctx.channel_manager.runtime_mode = "multi"
-
     tenant_id = "tenant-web-only-runtime"
     tenant_headers = await auth_headers_for(
         "alice-web-only-runtime",

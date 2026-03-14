@@ -802,6 +802,8 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     assert update_body["runtime_scope"] == "tenant"
     assert update_body["takes_effect"] == "restart"
     assert "restart" in str(update_body.get("runtime_warning") or "").lower()
+    assert update_body["runtime_registered"] is False
+    assert update_body["runtime_running"] is False
     assert update_body["active_in_runtime"] is False
     assert update_body["configured"] is True
     assert update_body["config"]["app_id"] == "tenant-app-id"
@@ -822,6 +824,8 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     )
     assert alice_get.status_code == 200
     alice_body = alice_get.json()
+    assert alice_body["runtime_registered"] is True
+    assert alice_body["runtime_running"] is True
     assert alice_body["active_in_runtime"] is True
     assert alice_body["config"]["app_id"] == "tenant-app-id"
     assert alice_body["config"]["app_secret"] == "****"
@@ -834,6 +838,8 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     assert bob_get.status_code == 200
     bob_body = bob_get.json()
     assert bob_body["configured"] is False
+    assert bob_body["runtime_registered"] is False
+    assert bob_body["runtime_running"] is False
     assert bob_body["config"]["app_id"] == ""
     assert bob_body["config"]["app_secret"] == ""
 
@@ -850,6 +856,8 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
     rows = {row["name"]: row for row in workspace_list.json()}
     assert rows["feishu"]["byo_supported"] is True
     assert rows["feishu"]["byo_configured"] is True
+    assert rows["feishu"]["runtime_registered"] is True
+    assert rows["feishu"]["runtime_running"] is True
     assert rows["feishu"]["active_in_runtime"] is True
 
     drift = await http_client.put(
@@ -858,6 +866,8 @@ async def test_workspace_channel_credentials_roundtrip_is_tenant_isolated(
         json={"app_id": "tenant-app-id-v2", "app_secret": "****"},
     )
     assert drift.status_code == 200
+    assert drift.json()["runtime_registered"] is True
+    assert drift.json()["runtime_running"] is True
     assert drift.json()["active_in_runtime"] is False
 
 

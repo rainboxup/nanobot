@@ -657,6 +657,27 @@ def _workspace_channel_runtime_active(
         return False
 
 
+def _workspace_channel_runtime_state(
+    request: Request,
+    *,
+    tenant_id: str,
+    channel_name: str,
+) -> tuple[bool, bool]:
+    manager = getattr(request.app.state, "channel_manager", None)
+    if not tenant_id or manager is None:
+        return False, False
+    getter = getattr(manager, "get_workspace_channel_runtime", None)
+    if not callable(getter):
+        return False, False
+    try:
+        runtime = getter(tenant_id, channel_name)
+    except Exception:
+        return False, False
+    if runtime is None:
+        return False, False
+    return True, bool(getattr(runtime, "is_running", False))
+
+
 def _workspace_channel_credentials_summary(
     request: Request,
     *,
@@ -664,9 +685,16 @@ def _workspace_channel_credentials_summary(
     name: str,
     routing: TenantChannelOverride,
 ) -> dict[str, Any]:
+    runtime_registered, runtime_running = _workspace_channel_runtime_state(
+        request,
+        tenant_id=tenant_id,
+        channel_name=name,
+    )
     return {
         "byo_supported": _workspace_channel_supports_credentials(name),
         "byo_configured": _workspace_channel_credentials_configured(name, routing),
+        "runtime_registered": runtime_registered,
+        "runtime_running": runtime_running,
         "active_in_runtime": _workspace_channel_runtime_active(
             request,
             tenant_id=tenant_id,
@@ -685,12 +713,19 @@ def _workspace_credentials_payload(
 ) -> dict[str, Any]:
     raw = _workspace_channel_credentials_config(name, routing)
     redacted, sensitive_paths, sensitive_has_value = _redact_sensitive(raw)
+    runtime_registered, runtime_running = _workspace_channel_runtime_state(
+        request,
+        tenant_id=tenant_id,
+        channel_name=name,
+    )
     payload = {
         "name": name,
         "channel": name,
         "config": redacted,
         "configured": _workspace_channel_credentials_configured(name, routing),
         "byo_supported": True,
+        "runtime_registered": runtime_registered,
+        "runtime_running": runtime_running,
         "active_in_runtime": _workspace_channel_runtime_active(
             request,
             tenant_id=tenant_id,

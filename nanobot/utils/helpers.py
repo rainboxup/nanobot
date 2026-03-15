@@ -67,7 +67,6 @@ def sync_workspace_templates(
             _write(item, workspace / item.name)
     _write(tpl / "memory" / "MEMORY.md", workspace / "memory" / "MEMORY.md")
     _write(None, workspace / "memory" / "HISTORY.md")
-    (workspace / "skills").mkdir(exist_ok=True)
 
     if added and not silent:
         from rich.console import Console

@@ -38,11 +38,16 @@ def safe_filename(name: str) -> str:
     return _UNSAFE_CHARS.sub("_", name).strip()
 
 
-def sync_workspace_templates(workspace: Path, silent: bool = False) -> list[str]:
+def sync_workspace_templates(
+    workspace: Path,
+    silent: bool = False,
+    *,
+    templates_root: Any | None = None,
+) -> list[str]:
     """Sync bundled templates to workspace. Only creates missing files."""
     from importlib.resources import files as pkg_files
     try:
-        tpl = pkg_files("nanobot") / "templates"
+        tpl = templates_root if templates_root is not None else pkg_files("nanobot") / "templates"
     except Exception:
         return []
     if not tpl.is_dir():

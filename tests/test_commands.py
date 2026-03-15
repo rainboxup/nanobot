@@ -21,6 +21,26 @@ from nanobot.providers.registry import find_by_model
 runner = CliRunner()
 
 
+def _build_fake_templates_root(base_dir: Path) -> Path:
+    templates = base_dir / "templates"
+    (templates / "memory").mkdir(parents=True, exist_ok=True)
+    (templates / "demo" / "kit-alpha").mkdir(parents=True, exist_ok=True)
+    for name, content in {
+        "AGENTS.md": "# Agent Instructions\n",
+        "SOUL.md": "# Soul\n",
+        "USER.md": "# User\n",
+        "TOOLS.md": "# Tools\n",
+        "HEARTBEAT.md": "# Heartbeat\n",
+        "IDENTITY.md": "# Identity\n",
+    }.items():
+        (templates / name).write_text(content, encoding="utf-8")
+    (templates / "memory" / "MEMORY.md").write_text("# Memory\n", encoding="utf-8")
+    (templates / "demo" / "kit-alpha" / "DEMO.md").write_text(
+        "# Demo Kit Alpha\n", encoding="utf-8"
+    )
+    return templates
+
+
 @pytest.fixture
 def mock_paths():
     """Mock config/workspace paths for test isolation."""
@@ -122,6 +142,37 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     assert (workspace_dir / "TOOLS.md").exists()
     assert (workspace_dir / "HEARTBEAT.md").exists()
     assert (workspace_dir / "IDENTITY.md").exists()
+
+
+def test_onboard_applies_demo_kit_only_when_explicit(mock_paths, monkeypatch, tmp_path):
+    config_file, workspace_dir = mock_paths
+    templates_root = _build_fake_templates_root(tmp_path)
+    monkeypatch.setattr("nanobot.utils.workspace._templates_root", lambda: templates_root)
+
+    result = runner.invoke(app, ["onboard", "--demo-kit", "kit-alpha"])
+
+    assert result.exit_code == 0
+    assert "Applied demo kit 'kit-alpha'" in result.stdout
+    assert (workspace_dir / "DEMO.md").exists()
+    assert (workspace_dir / ".nanobot-demo-kit").read_text(encoding="utf-8").strip() == "kit-alpha"
+
+
+def test_onboard_does_not_mix_demo_kit_into_existing_workspace(mock_paths, monkeypatch, tmp_path):
+    config_file, workspace_dir = mock_paths
+    templates_root = _build_fake_templates_root(tmp_path)
+    monkeypatch.setattr("nanobot.utils.workspace._templates_root", lambda: templates_root)
+
+    workspace_dir.mkdir(parents=True)
+    (workspace_dir / "custom.md").write_text("keep me\n", encoding="utf-8")
+    config_file.write_text("{}")
+
+    result = runner.invoke(app, ["onboard", "--demo-kit", "kit-alpha"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "Skipped demo kit 'kit-alpha'" in result.stdout
+    assert not (workspace_dir / "DEMO.md").exists()
+    assert not (workspace_dir / ".nanobot-demo-kit").exists()
+    assert (workspace_dir / "custom.md").read_text(encoding="utf-8") == "keep me\n"
 
 
 def test_channels_status_includes_qq(monkeypatch):

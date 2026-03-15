@@ -165,7 +165,13 @@ def main(
 
 
 @app.command()
-def onboard():
+def onboard(
+    demo_kit: str | None = typer.Option(
+        None,
+        "--demo-kit",
+        help="Optional packaged demo kit overlay to apply to a fresh workspace",
+    ),
+):
     """Initialize nanobot configuration and workspace."""
     from nanobot.config.loader import get_config_path, save_config
     from nanobot.config.schema import Config
@@ -191,12 +197,13 @@ def onboard():
     # Create workspace
     workspace = get_workspace_path()
     workspace_existed = workspace.exists()
+    workspace_had_content = workspace_existed and any(workspace.iterdir()) if workspace_existed else False
     if not workspace_existed:
         workspace.mkdir(parents=True, exist_ok=True)
         console.print(f"{_ok_text()} Created workspace at {workspace}")
 
     # Create default bootstrap files
-    from nanobot.utils.workspace import create_workspace_templates
+    from nanobot.utils.workspace import apply_demo_kit_overlay, create_workspace_templates
 
     created = create_workspace_templates(workspace)
     for p in created:
@@ -205,6 +212,25 @@ def onboard():
             console.print(f"  [dim]Created {rel.as_posix()}[/dim]")
         except Exception:
             console.print(f"  [dim]Created {p}[/dim]")
+
+    if demo_kit:
+        if workspace_had_content:
+            console.print(
+                f"[yellow]Skipped demo kit '{demo_kit}' because the workspace already existed with content.[/yellow]"
+            )
+        else:
+            try:
+                overlay_created = apply_demo_kit_overlay(workspace, demo_kit)
+            except ValueError as exc:
+                console.print(f"[red]Error: {exc}[/red]")
+                raise typer.Exit(1) from exc
+            for p in overlay_created:
+                try:
+                    rel = p.relative_to(workspace)
+                    console.print(f"  [dim]Created {rel.as_posix()}[/dim]")
+                except Exception:
+                    console.print(f"  [dim]Created {p}[/dim]")
+            console.print(f"{_ok_text()} Applied demo kit '{demo_kit}'")
 
     console.print(f"\n{_cli_brand()} is ready!")
     console.print("\nNext steps:")

@@ -26,6 +26,27 @@ async def test_web_health_and_ready_endpoints(http_client) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_web_ready_and_ops_runtime_expose_operator_guides(http_client, auth_headers) -> None:
+    ready = await http_client.get("/api/ready")
+    assert ready.status_code == 200
+    ready_body = ready.json()
+    ready_guides = {row.get("slug"): row for row in (ready_body.get("guides") or [])}
+    assert {
+        "config-ownership",
+        "workspace-routing-and-binding",
+        "effective-policy-and-soul",
+    }.issubset(ready_guides)
+    assert ready_guides["config-ownership"]["source"]["path"] == "docs/architecture/config-ownership.md"
+
+    ops = await http_client.get("/api/ops/runtime", headers=auth_headers)
+    assert ops.status_code == 200
+    ops_body = ops.json()
+    ops_guides = {row.get("slug"): row for row in (ops_body.get("guides") or [])}
+    assert set(ready_guides) == set(ops_guides)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_web_index_serves_html(http_client) -> None:
     response = await http_client.get("/")
     assert response.status_code == 200

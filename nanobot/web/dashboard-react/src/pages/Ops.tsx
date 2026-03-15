@@ -9,6 +9,7 @@ import { Button } from "@/src/components/ui/button"
 import { Badge } from "@/src/components/ui/badge"
 import { Card, CardContent, CardHeader, CardTitle } from "@/src/components/ui/card"
 import { Skeleton } from "@/src/components/ui/skeleton"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 
 function formatPercent(value: any): string {
   const n = Number(value || 0)
@@ -85,6 +86,7 @@ export function Ops() {
   const registered: string[] = Array.isArray(channels?.registered) ? channels.registered : []
   const channelStatus = channels?.status || {}
   const activeWeb = Number(channels?.active_web_connections || 0)
+  const guides: any[] = Array.isArray(data?.guides) ? data.guides : []
 
   const noticeVariant = String(status || "").toLowerCase() === "ready" ? "success" : "warning"
 
@@ -148,6 +150,19 @@ export function Ops() {
               ) : (
                 <div className="mt-3 text-sm text-muted-foreground">暂无告警</div>
               )}
+              {guides.length ? (
+                <div className="mt-3 flex flex-wrap gap-3 text-sm">
+                  {guides.map((guide, idx) => (
+                    <a
+                      key={`${String(guide?.slug || "")}:${idx}`}
+                      href={helpDocHref(String(guide?.slug || ""))}
+                      className="text-primary underline-offset-4 hover:underline"
+                    >
+                      {String(guide?.title || guide?.slug || "操作指南")}
+                    </a>
+                  ))}
+                </div>
+              ) : null}
             </div>
 
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">

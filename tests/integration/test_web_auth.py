@@ -53,6 +53,40 @@ async def test_login_success(http_client) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_auth_me_reports_role_capabilities_and_operator_guides(
+    http_client, auth_headers, auth_headers_for
+) -> None:
+    owner = await http_client.get("/api/auth/me", headers=auth_headers)
+    assert owner.status_code == 200
+    owner_body = owner.json()
+    assert owner_body.get("help_slugs") == ["config-ownership", "effective-policy-and-soul"]
+    assert owner_body.get("capabilities") == {
+        "can_view_ops": True,
+        "can_manage_security": True,
+        "can_manage_users": True,
+    }
+
+    admin_headers = await auth_headers_for("pilot-admin", role="admin", tenant_id="pilot-tenant")
+    admin = await http_client.get("/api/auth/me", headers=admin_headers)
+    assert admin.status_code == 200
+    assert admin.json().get("capabilities") == {
+        "can_view_ops": False,
+        "can_manage_security": False,
+        "can_manage_users": True,
+    }
+
+    member_headers = await auth_headers_for("pilot-member", role="member", tenant_id="pilot-tenant")
+    member = await http_client.get("/api/auth/me", headers=member_headers)
+    assert member.status_code == 200
+    assert member.json().get("capabilities") == {
+        "can_view_ops": False,
+        "can_manage_security": False,
+        "can_manage_users": False,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_login_failure(http_client) -> None:
     r = await http_client.post(
         "/api/auth/login",

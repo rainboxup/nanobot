@@ -111,3 +111,19 @@ def test_default_registry_registers_demo_kit_help_docs() -> None:
         assert doc is not None
         assert doc.source.path == repo_path
         assert doc.markdown == repo_markdown
+
+
+def test_operator_help_docs_reference_ops_security_and_users_surfaces() -> None:
+    registry = HelpDocsRegistry.default()
+
+    config_doc = registry.get_doc("config-ownership")
+    assert config_doc is not None
+    assert "Settings → Users" in config_doc.markdown
+
+    effective_doc = registry.get_doc("effective-policy-and-soul")
+    assert effective_doc is not None
+    assert "Settings → Security" in effective_doc.markdown
+
+    routing_doc = registry.get_doc("workspace-routing-and-binding")
+    assert routing_doc is not None
+    assert "Ops" in routing_doc.markdown

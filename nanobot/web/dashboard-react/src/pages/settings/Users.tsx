@@ -8,6 +8,7 @@ import { Input } from "@/src/components/ui/input"
 import { Badge } from "@/src/components/ui/badge"
 import { Modal } from "@/src/components/ui/modal"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/src/components/ui/table"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 
 type Role = "owner" | "admin" | "member"
 
@@ -227,7 +228,12 @@ export function Users() {
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">用户与权限</h2>
-          <p className="text-muted-foreground">创建用户、管理角色与会话。</p>
+          <p className="text-muted-foreground">
+            创建用户、管理角色与会话。
+            <a href={helpDocHref("config-ownership")} className="ml-2 text-primary underline-offset-4 hover:underline">
+              角色与 Scope
+            </a>
+          </p>
         </div>
         <Button variant="outline" onClick={() => load().catch(() => {})} disabled={loading}>
           <RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} />

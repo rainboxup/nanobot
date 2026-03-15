@@ -101,6 +101,22 @@ async def test_get_channel_status_reports_missing_fields_and_runtime(http_client
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_system_channel_surfaces_reference_config_ownership_help_doc(
+    http_client, auth_headers
+) -> None:
+    listing = await http_client.get("/api/channels", headers=auth_headers)
+    assert listing.status_code == 200
+    rows = listing.json()
+    assert rows
+    assert all(row.get("help_slug") == "config-ownership" for row in rows)
+
+    status_resp = await http_client.get("/api/channels/telegram/status", headers=auth_headers)
+    assert status_resp.status_code == 200
+    assert status_resp.json().get("help_slug") == "config-ownership"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_get_wecom_channel_status_reports_missing_fields_and_runtime(
     http_client, auth_headers
 ) -> None:

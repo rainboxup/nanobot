@@ -7,6 +7,7 @@ import { Button } from "@/src/components/ui/button"
 import { Input } from "@/src/components/ui/input"
 import { Badge } from "@/src/components/ui/badge"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/src/components/ui/table"
+import { helpDocHref } from "@/src/pages/HelpDoc"
 
 const MAX_UNLOCK_BATCH = 100
 
@@ -323,7 +324,15 @@ export function Security() {
         <div className="flex items-center justify-between gap-2 flex-wrap">
           <div>
             <h2 className="text-2xl font-bold tracking-tight">安全与审计</h2>
-            <p className="text-muted-foreground">登录防护与审计观测面板（Owner）。</p>
+            <p className="text-muted-foreground">
+              登录防护与审计观测面板（Owner）。
+              <a href={helpDocHref("effective-policy-and-soul")} className="ml-2 text-primary underline-offset-4 hover:underline">
+                Explainability 指南
+              </a>
+              <a href={helpDocHref("config-ownership")} className="ml-2 text-primary underline-offset-4 hover:underline">
+                Scope 说明
+              </a>
+            </p>
           </div>
           <Button variant="outline" onClick={() => Promise.all([loadLocks(), loadEvents(false), loadRetention()]).catch(() => {})}>
             <RefreshCw className="mr-2 h-4 w-4" /> 刷新

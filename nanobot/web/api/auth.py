@@ -29,6 +29,7 @@ _REFRESH_TOKEN_SOURCE_POLICIES = {
 _DEFAULT_REFRESH_TOKEN_SOURCE_POLICY = "hybrid_prefer_cookie"
 _MIN_TRUSTED_PROXY_PREFIX_V4 = 16
 _MIN_TRUSTED_PROXY_PREFIX_V6 = 48
+_ROLE_HELP_SLUGS = ("config-ownership", "effective-policy-and-soul")
 
 
 def _parse_positive_int_env(name: str, default: int) -> int:
@@ -455,6 +456,17 @@ def _actor_context(user: dict[str, Any]) -> tuple[str, str, str]:
     return actor_username, actor_role, actor_tenant
 
 
+def _role_capabilities(role: str | None) -> dict[str, bool]:
+    normalized = str(role or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+    is_owner = normalized == ROLE_OWNER
+    is_admin = normalized in {ROLE_OWNER, "admin"}
+    return {
+        "can_view_ops": is_owner,
+        "can_manage_security": is_owner,
+        "can_manage_users": is_admin,
+    }
+
+
 def _require_manageable_user(
     *,
     actor_username: str,
@@ -505,6 +517,8 @@ async def auth_me(user: dict[str, Any] = Depends(get_current_user)) -> dict[str,
         "tenant_id": str(user.get("tenant_id") or ""),
         "role": role,
         "is_beta_admin": bool(role == ROLE_OWNER and is_beta_admin(username)),
+        "help_slugs": list(_ROLE_HELP_SLUGS),
+        "capabilities": _role_capabilities(role),
     }
 
 

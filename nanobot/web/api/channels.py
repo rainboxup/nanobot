@@ -43,6 +43,7 @@ _WORKSPACE_ROUTING_SINGLE_TENANT_DETAIL = (
 _WORKSPACE_CREDENTIALS_SINGLE_TENANT_DETAIL = (
     "Workspace-scoped channel credentials are unavailable in single-tenant runtime mode."
 )
+_CHANNEL_CONFIG_HELP_SLUG = "config-ownership"
 _WORKSPACE_ROUTING_HELP_SLUG = "workspace-routing-and-binding"
 _WORKSPACE_CREDENTIALS_HELP_SLUG = "workspace-routing-and-binding"
 _WORKSPACE_CREDENTIALS_FIELDS: dict[str, tuple[str, ...]] = {
@@ -954,6 +955,7 @@ def _attach_runtime_meta(
     payload["config_scope"] = _config_scope()
     payload["takes_effect"] = _takes_effect()
     payload["runtime_warning"] = _CHANNEL_CONFIG_SYSTEM_SCOPE_WARNING
+    payload["help_slug"] = _CHANNEL_CONFIG_HELP_SLUG
     write_status = _write_status(user)
     payload["writable"] = bool(write_status["writable"])
     payload["write_block_reason_code"] = write_status["write_block_reason_code"]
@@ -1030,6 +1032,7 @@ async def list_channels(
                 "runtime_warning": status_payload.get("runtime_warning"),
                 "config_scope": status_payload.get("config_scope"),
                 "takes_effect": status_payload.get("takes_effect"),
+                "help_slug": status_payload.get("help_slug"),
                 "writable": bool(status_payload.get("writable", True)),
                 "write_block_reason_code": status_payload.get("write_block_reason_code"),
                 "write_block_reason": status_payload.get("write_block_reason"),

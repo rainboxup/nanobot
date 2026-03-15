@@ -325,6 +325,38 @@ def _build_dashboard_unavailable_html(reason: str) -> str:
     )
 
 
+_OPERATOR_GUIDE_SLUGS = (
+    "config-ownership",
+    "workspace-routing-and-binding",
+    "effective-policy-and-soul",
+)
+
+
+def _operator_guide_summaries(app, slugs: tuple[str, ...] = _OPERATOR_GUIDE_SLUGS) -> list[dict[str, Any]]:
+    from nanobot.services.help_docs import HelpDocsRegistry
+
+    registry = getattr(app.state, "help_docs_registry", None)
+    if not isinstance(registry, HelpDocsRegistry):
+        return []
+
+    summaries: list[dict[str, Any]] = []
+    for slug in slugs:
+        spec = registry.get_spec(slug)
+        if spec is None:
+            continue
+        summaries.append(
+            {
+                "slug": spec.slug,
+                "title": spec.title,
+                "source": {
+                    "kind": spec.source.kind,
+                    "path": spec.source.path,
+                },
+            }
+        )
+    return summaries
+
+
 def _build_readiness_payload(app) -> dict[str, Any]:
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode not in {"single", "multi"}:
@@ -369,6 +401,7 @@ def _build_readiness_payload(app) -> dict[str, Any]:
         "runtime_scope": runtime_scope,
         "checks": checks,
         "warnings": warnings,
+        "guides": _operator_guide_summaries(app),
     }
 
 

@@ -986,6 +986,10 @@ Docs (multi-tenant / SaaS):
 - Workspace routing + binding (`!link`): `docs/howto/workspace-routing-and-binding.md`
 - Explainability: effective Policy + Soul: `docs/howto/effective-policy-and-soul.md`
 - Config scopes/ownership (operator/admin): `docs/architecture/config-ownership.md`
+- Dashboard surfaces:
+  - **Ops** → runtime snapshot / rollout readiness
+  - **Security** → login locks / audit visibility
+  - **Users** → tenant-scoped user and session lifecycle controls
 
 Recommended production cookie policy (already defaulted in `.env.example`):
 

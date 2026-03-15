@@ -2,8 +2,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from prompt_toolkit.formatted_text import HTML
+from typer.testing import CliRunner
 
 from nanobot.cli import commands
+
+runner = CliRunner()
 
 
 @pytest.fixture
@@ -56,3 +59,11 @@ def test_init_prompt_session_creates_session():
         _, kwargs = mock_session_cls.call_args
         assert kwargs["multiline"] is False
         assert kwargs["enable_open_in_editor"] is False
+
+
+def test_onboard_help_lists_bundled_demo_kits():
+    result = runner.invoke(commands.app, ["onboard", "--help"], catch_exceptions=False)
+
+    assert result.exit_code == 0
+    assert "private-domain-ops" in result.stdout
+    assert "internal-knowledge-demo" in result.stdout

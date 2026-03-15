@@ -175,6 +175,24 @@ def test_onboard_does_not_mix_demo_kit_into_existing_workspace(mock_paths, monke
     assert (workspace_dir / "custom.md").read_text(encoding="utf-8") == "keep me\n"
 
 
+@pytest.mark.parametrize(
+    ("demo_kit", "expected_relative_path"),
+    [
+        ("private-domain-ops", Path("demo/private-domain-ops/README.md")),
+        ("internal-knowledge-demo", Path("demo/internal-knowledge-demo/README.md")),
+    ],
+)
+def test_onboard_accepts_bundled_demo_kits(mock_paths, demo_kit: str, expected_relative_path: Path):
+    _config_file, workspace_dir = mock_paths
+
+    result = runner.invoke(app, ["onboard", "--demo-kit", demo_kit])
+
+    assert result.exit_code == 0
+    assert f"Applied demo kit '{demo_kit}'" in result.stdout
+    assert (workspace_dir / expected_relative_path).exists()
+    assert (workspace_dir / ".nanobot-demo-kit").read_text(encoding="utf-8").strip() == demo_kit
+
+
 def test_channels_status_includes_qq(monkeypatch):
     config = Config()
     config.channels.qq.enabled = True

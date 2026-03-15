@@ -99,6 +99,20 @@ def _fail_text() -> str:
 def _bool_status_text(enabled: bool) -> str:
     return "enabled" if enabled else "disabled"
 
+
+def _demo_kit_help_text() -> str:
+    base = "Optional packaged demo kit overlay to apply to a fresh workspace"
+    try:
+        from nanobot.utils.workspace import available_demo_kits
+
+        kits = available_demo_kits()
+    except Exception:
+        kits = []
+    if not kits:
+        return base
+    return f"{base}. Available: {', '.join(kits)}"
+
+
 app = typer.Typer(
     name="nanobot",
     help="nanobot - Personal AI Assistant",
@@ -169,7 +183,7 @@ def onboard(
     demo_kit: str | None = typer.Option(
         None,
         "--demo-kit",
-        help="Optional packaged demo kit overlay to apply to a fresh workspace",
+        help=_demo_kit_help_text(),
     ),
 ):
     """Initialize nanobot configuration and workspace."""

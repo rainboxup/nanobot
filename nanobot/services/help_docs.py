@@ -91,6 +91,18 @@ def _default_specs() -> tuple[HelpDocSpec, ...]:
             Path("config-ownership.md"),
             HelpDocSource(kind="repo_docs", path="docs/architecture/config-ownership.md"),
         ),
+        (
+            "private-domain-demo-kit",
+            "Private-Domain Demo Kit",
+            Path("private-domain-demo-kit.md"),
+            HelpDocSource(kind="repo_docs", path="docs/howto/private-domain-demo-kit.md"),
+        ),
+        (
+            "internal-knowledge-demo-kit",
+            "Internal Knowledge Demo Kit",
+            Path("internal-knowledge-demo-kit.md"),
+            HelpDocSource(kind="repo_docs", path="docs/howto/internal-knowledge-demo-kit.md"),
+        ),
     )
     return tuple(
         HelpDocSpec(slug=slug, title=title, relative_path=relative_path, source=source)
@@ -200,6 +212,8 @@ class HelpDocsRegistry:
                 "Help doc source file is not valid UTF-8.",
                 details={"path": path.name},
             ) from exc
+
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
 
         with self._cache_guard:
             self._cache[str(path)] = (mtime, text)

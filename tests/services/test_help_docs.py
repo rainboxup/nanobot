@@ -89,3 +89,25 @@ def test_default_registry_uses_bundled_help_docs_that_match_repo_docs() -> None:
     assert store_doc is not None
     assert store_doc.source.path == "docs/howto/managed-skill-store-integrity.md"
     assert store_doc.markdown == repo_store
+
+
+def test_default_registry_registers_demo_kit_help_docs() -> None:
+    registry = HelpDocsRegistry.default()
+    bundled_dir = Path(bundled_help_docs.__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[2]
+
+    for slug, repo_path in (
+        ("private-domain-demo-kit", "docs/howto/private-domain-demo-kit.md"),
+        ("internal-knowledge-demo-kit", "docs/howto/internal-knowledge-demo-kit.md"),
+    ):
+        spec = registry.get_spec(slug)
+        assert spec is not None
+
+        bundled_markdown = (bundled_dir / f"{slug}.md").read_text(encoding="utf-8")
+        repo_markdown = (repo_root / repo_path).read_text(encoding="utf-8")
+        assert bundled_markdown == repo_markdown
+
+        doc = registry.get_doc(slug)
+        assert doc is not None
+        assert doc.source.path == repo_path
+        assert doc.markdown == repo_markdown

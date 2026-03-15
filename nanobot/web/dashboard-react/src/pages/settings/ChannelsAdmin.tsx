@@ -508,6 +508,9 @@ export function ChannelsAdmin() {
           <p className="text-sm text-muted-foreground">
             Workspace BYO 凭据如已配置，请在 Workspace 页面管理；保存后需重启服务才会载入新的工作区级渠道运行时，active_in_runtime 会反映当前运行时是否与已存凭据一致。
           </p>
+          <p className="text-sm text-muted-foreground">
+            WeCom 当前为系统级 MVP 渠道，需在本页由 Owner 统一配置。
+          </p>
         </div>
       </div>
 

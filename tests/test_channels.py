@@ -14,6 +14,7 @@ from nanobot.config.schema import (
     DingTalkConfig,
     FeishuConfig,
     TenantChannelOverride,
+    WeComConfig,
 )
 from nanobot.tenants.store import TenantStore
 
@@ -150,6 +151,21 @@ def test_tenant_override_validation_unknown_channel(base_config, message_bus):
 
     with pytest.raises(ValueError, match="Unknown channel"):
         manager.validate_tenant_channel_override("tenant1", "unknown_channel", override)
+
+
+def test_channel_manager_initializes_wecom_channel_when_enabled(message_bus) -> None:
+    config = Config()
+    config.channels = ChannelsConfig()
+    config.channels.wecom = WeComConfig(
+        enabled=True,
+        corp_id="corp-id",
+        corp_secret="corp-secret",
+        agent_id="1000001",
+    )
+
+    manager = ChannelManager(config, message_bus)
+
+    assert manager.get_channel("wecom") is not None
 
 
 @pytest.mark.asyncio

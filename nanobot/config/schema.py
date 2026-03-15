@@ -54,6 +54,16 @@ class DingTalkConfig(Base):
     allow_from: list[str] = Field(default_factory=list)  # Allowed staff_ids
 
 
+class WeComConfig(Base):
+    """Enterprise WeChat / WeCom application channel configuration."""
+
+    enabled: bool = False
+    corp_id: str = ""  # 企业 ID (CorpID)
+    corp_secret: str = ""  # 应用 Secret
+    agent_id: str = ""  # 应用 AgentId
+    allow_from: list[str] = Field(default_factory=list)  # Allowed user IDs
+
+
 class DiscordConfig(Base):
     """Discord channel configuration."""
 
@@ -230,6 +240,7 @@ class ChannelsConfig(Base):
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     feishu: FeishuConfig = Field(default_factory=FeishuConfig)
+    wecom: WeComConfig = Field(default_factory=WeComConfig)
     mochat: MochatConfig = Field(default_factory=MochatConfig)
     dingtalk: DingTalkConfig = Field(default_factory=DingTalkConfig)
     email: EmailConfig = Field(default_factory=EmailConfig)

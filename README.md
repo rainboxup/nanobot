@@ -175,11 +175,14 @@ Connect nanobot to your favorite chat platform.
 | **Discord** | Bot token + Message Content intent |
 | **WhatsApp** | QR code scan |
 | **Feishu** | App ID + App Secret |
+| **WeCom** | Corp ID + Corp Secret + Agent ID |
 | **Mochat** | Claw token (auto-setup available) |
 | **DingTalk** | App Key + App Secret |
 | **Slack** | Bot token + App-Level token |
 | **Email** | IMAP/SMTP credentials |
 | **QQ** | App ID + App Secret |
+
+> WeCom is currently an MVP system-scoped channel. See `docs/howto/wecom-channel.md` for setup steps and current support boundaries.
 
 <details>
 <summary><b>Telegram</b> (Recommended)</summary>

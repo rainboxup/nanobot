@@ -73,6 +73,7 @@ REQUIRED_FIELDS: dict[str, list[str]] = {
     "telegram": ["token"],
     "discord": ["token"],
     "feishu": ["app_id", "app_secret"],
+    "wecom": ["corp_id", "corp_secret", "agent_id"],
     "dingtalk": ["client_id", "client_secret"],
     "email": [
         "imap_host",

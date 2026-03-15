@@ -36,6 +36,7 @@ async def test_list_channels_returns_supported_channels(http_client, auth_header
         "telegram",
         "discord",
         "feishu",
+        "wecom",
         "mochat",
         "dingtalk",
         "email",
@@ -96,6 +97,25 @@ async def test_get_channel_status_reports_missing_fields_and_runtime(http_client
     assert body["config_scope"] == "system"
     assert body["takes_effect"] == "restart"
     assert "restart" in str(body.get("runtime_warning") or "").lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_get_wecom_channel_status_reports_missing_fields_and_runtime(
+    http_client, auth_headers
+) -> None:
+    r = await http_client.get("/api/channels/wecom/status", headers=auth_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "wecom"
+    assert body["enabled"] is False
+    assert body["config_ready"] is False
+    assert set(body["missing_required_fields"]) >= {"corp_id", "corp_secret", "agent_id"}
+    assert body["runtime_registered"] is False
+    assert body["runtime_running"] is False
+    assert body["runtime_scope"] == "global"
+    assert body["config_scope"] == "system"
+    assert body["takes_effect"] == "restart"
 
 
 @pytest.mark.integration

@@ -337,6 +337,18 @@ class ChannelManager:
             except ImportError as e:
                 logger.warning(f"Feishu channel not available: {e}")
 
+        # WeCom channel
+        if self.config.channels.wecom.enabled:
+            try:
+                from nanobot.channels.wecom import WeComChannel
+
+                self.channels["wecom"] = WeComChannel(
+                    self.config.channels.wecom, self.inbound_bus
+                )
+                logger.info("WeCom channel enabled")
+            except ImportError as e:
+                logger.warning(f"WeCom channel not available: {e}")
+
         # Mochat channel
         if self.config.channels.mochat.enabled:
             try:

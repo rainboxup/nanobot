@@ -1,4 +1,5 @@
 import threading
+from importlib.resources import files as pkg_files
 from pathlib import Path
 
 import pytest
@@ -20,9 +21,21 @@ def test_ensure_tenant_creates_dirs_and_templates(tmp_path: Path) -> None:
 
     # Workspace templates (idempotent bootstrap)
     assert (ctx.workspace / "AGENTS.md").exists()
+    assert (ctx.workspace / "TOOLS.md").exists()
+    assert (ctx.workspace / "HEARTBEAT.md").exists()
+    assert (ctx.workspace / "IDENTITY.md").exists()
     assert (ctx.workspace / "SOUL.md").exists()
     assert (ctx.workspace / "USER.md").exists()
     assert (ctx.workspace / "memory" / "MEMORY.md").exists()
+    assert (ctx.workspace / "AGENTS.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/AGENTS.md").read_text(encoding="utf-8")
+    )
+    assert (ctx.workspace / "TOOLS.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/TOOLS.md").read_text(encoding="utf-8")
+    )
+    assert (ctx.workspace / "HEARTBEAT.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/HEARTBEAT.md").read_text(encoding="utf-8")
+    )
 
     # Index mapping
     assert store.resolve_tenant("telegram", "123") == tenant_id

@@ -1,4 +1,5 @@
 import asyncio
+from importlib.resources import files as pkg_files
 import shutil
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
@@ -59,7 +60,19 @@ def test_onboard_fresh_install(mock_paths):
     assert "Telegram/WhatsApp/QQ" in result.stdout
     assert config_file.exists()
     assert (workspace_dir / "AGENTS.md").exists()
+    assert (workspace_dir / "TOOLS.md").exists()
+    assert (workspace_dir / "HEARTBEAT.md").exists()
+    assert (workspace_dir / "IDENTITY.md").exists()
     assert (workspace_dir / "memory" / "MEMORY.md").exists()
+    assert (workspace_dir / "AGENTS.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/AGENTS.md").read_text(encoding="utf-8")
+    )
+    assert (workspace_dir / "TOOLS.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/TOOLS.md").read_text(encoding="utf-8")
+    )
+    assert (workspace_dir / "HEARTBEAT.md").read_text(encoding="utf-8") == (
+        pkg_files("nanobot").joinpath("templates/HEARTBEAT.md").read_text(encoding="utf-8")
+    )
 
 
 def test_onboard_existing_config_refresh(mock_paths):
@@ -93,14 +106,22 @@ def test_onboard_existing_workspace_safe_create(mock_paths):
     """Workspace exists — should not recreate, but still add missing templates."""
     config_file, workspace_dir = mock_paths
     workspace_dir.mkdir(parents=True)
+    custom_agents = "# Custom agent instructions\n"
+    (workspace_dir / "AGENTS.md").write_text(custom_agents, encoding="utf-8")
     config_file.write_text("{}")
 
     result = runner.invoke(app, ["onboard"], input="n\n")
 
     assert result.exit_code == 0
     assert "Created workspace" not in result.stdout
-    assert "Created AGENTS.md" in result.stdout
+    assert "Created TOOLS.md" in result.stdout
+    assert "Created HEARTBEAT.md" in result.stdout
+    assert "Created IDENTITY.md" in result.stdout
+    assert (workspace_dir / "AGENTS.md").read_text(encoding="utf-8") == custom_agents
     assert (workspace_dir / "AGENTS.md").exists()
+    assert (workspace_dir / "TOOLS.md").exists()
+    assert (workspace_dir / "HEARTBEAT.md").exists()
+    assert (workspace_dir / "IDENTITY.md").exists()
 
 
 def test_channels_status_includes_qq(monkeypatch):

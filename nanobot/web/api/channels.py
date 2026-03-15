@@ -822,6 +822,12 @@ def _config_summary(name: str, cfg: BaseModel) -> dict[str, Any]:
             "app_id": data.get("app_id") or "",
             "has_app_secret": bool(str(data.get("app_secret") or "")),
         }
+    if name == "wecom":
+        return {
+            "corp_id": data.get("corp_id") or "",
+            "has_corp_secret": bool(str(data.get("corp_secret") or "")),
+            "agent_id": data.get("agent_id") or "",
+        }
     if name == "dingtalk":
         return {"client_id": data.get("client_id") or "", "has_client_secret": bool(data.get("client_secret"))}
     if name == "email":

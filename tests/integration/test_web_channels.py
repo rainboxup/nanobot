@@ -142,6 +142,35 @@ async def test_get_channel_status_becomes_ready_after_config_update(http_client,
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_get_wecom_channel_status_becomes_ready_after_config_update(
+    http_client, auth_headers, web_ctx
+) -> None:
+    set_resp = await http_client.put(
+        "/api/channels/wecom",
+        headers=auth_headers,
+        json={
+            "corp_id": "ww-corp-id",
+            "corp_secret": "corp-secret",
+            "agent_id": "1000002",
+        },
+    )
+    assert set_resp.status_code == 200
+
+    r = await http_client.get("/api/channels/wecom/status", headers=auth_headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["name"] == "wecom"
+    assert body["config_ready"] is True
+    assert body["missing_required_fields"] == []
+
+    persisted = _system_cfg(web_ctx)
+    assert persisted.channels.wecom.corp_id == "ww-corp-id"
+    assert persisted.channels.wecom.corp_secret == "corp-secret"
+    assert persisted.channels.wecom.agent_id == "1000002"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_get_channel_status_unknown_channel_returns_404(http_client, auth_headers) -> None:
     r = await http_client.get("/api/channels/not-a-channel/status", headers=auth_headers)
     assert r.status_code == 404
@@ -167,6 +196,41 @@ async def test_update_channel_masks_sensitive_fields(http_client, auth_headers, 
 
     persisted = _system_cfg(web_ctx)
     assert persisted.channels.telegram.token == token
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_wecom_channel_summary_and_detail_mask_secret(http_client, auth_headers, web_ctx) -> None:
+    secret = "wecom-secret-123456"
+    update = await http_client.put(
+        "/api/channels/wecom",
+        headers=auth_headers,
+        json={
+            "corp_id": "ww-corp-id",
+            "corp_secret": secret,
+            "agent_id": "1000002",
+        },
+    )
+    assert update.status_code == 200
+
+    listing = await http_client.get("/api/channels", headers=auth_headers)
+    assert listing.status_code == 200
+    rows = {row["name"]: row for row in listing.json()}
+    assert rows["wecom"]["config_summary"] == {
+        "corp_id": "ww-corp-id",
+        "has_corp_secret": True,
+        "agent_id": "1000002",
+    }
+
+    detail = await http_client.get("/api/channels/wecom", headers=auth_headers)
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["config"]["corp_id"] == "ww-corp-id"
+    assert body["config"]["corp_secret"] == "****"
+    assert body["config"]["agent_id"] == "1000002"
+
+    persisted = _system_cfg(web_ctx)
+    assert persisted.channels.wecom.corp_secret == secret
 
 
 @pytest.mark.integration

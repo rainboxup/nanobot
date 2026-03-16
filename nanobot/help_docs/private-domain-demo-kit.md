@@ -19,7 +19,8 @@ nanobot onboard --demo-kit private-domain-ops
 ## 你会得到什么
 
 - `workspace/demo/private-domain-ops/README.md`
-- `.nanobot-demo-kit` 标记文件
+- `DEMO_KIT.md` 可见 active-kit 标记文件
+- `.nanobot-demo-kit` 兼容 / legacy 标记文件
 - bundled help 文档与配套 skill，可供产品面与运维面引用
 
 ## 建议下一步

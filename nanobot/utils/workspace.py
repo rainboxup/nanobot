@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
+from importlib.resources import files as pkg_files
 from pathlib import Path
 from typing import Any
-
-from importlib.resources import files as pkg_files
 
 from nanobot.utils.helpers import sync_workspace_templates
 
@@ -65,6 +64,11 @@ def apply_demo_kit_overlay(workspace: Path, demo_kit: str) -> list[Path]:
             created.append(target)
 
     _copy_tree(kit_dir)
+
+    visible_marker = workspace / "DEMO_KIT.md"
+    if not visible_marker.exists():
+        visible_marker.write_text(f"{kit_name}\n", encoding="utf-8")
+        created.append(visible_marker)
 
     marker = workspace / ".nanobot-demo-kit"
     if not marker.exists():

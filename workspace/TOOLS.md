@@ -2,6 +2,16 @@
 
 This document describes the tools available to nanobot.
 
+## Demo Kits & Pilot Framing
+
+The same runtime can be positioned in two main directions without forking behavior:
+
+- **private-domain pilot**: operator workflows, routing checks, exports, rollout evidence
+- **internal knowledge / technical SMB**: searchable knowledge, internal assistant demos, workspace automation
+
+Check `DEMO_KIT.md` as the active-kit marker before choosing product framing. For legacy/demo-kit workspaces, fall back to `.nanobot-demo-kit`, then read `demo/*/README.md` for the actual kit framing.
+Stay honest about current runtime limits.
+
 ## File Operations
 
 ### read_file
@@ -157,3 +167,4 @@ To add custom tools:
 1. Create a class that extends `Tool` in `nanobot/agent/tools/`
 2. Implement `name`, `description`, `parameters`, and `execute`
 3. Register it in `AgentLoop._register_default_tools()`
+

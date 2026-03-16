@@ -1,6 +1,6 @@
 import asyncio
-from importlib.resources import files as pkg_files
 import shutil
+from importlib.resources import files as pkg_files
 from io import BytesIO, TextIOWrapper
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,10 +84,14 @@ def test_onboard_fresh_install(mock_paths):
     assert (workspace_dir / "HEARTBEAT.md").exists()
     assert (workspace_dir / "IDENTITY.md").exists()
     assert (workspace_dir / "memory" / "MEMORY.md").exists()
-    assert (workspace_dir / "AGENTS.md").read_text(encoding="utf-8") == (
+    assert not (workspace_dir / "DEMO_KIT.md").exists()
+    assert not (workspace_dir / ".nanobot-demo-kit").exists()
+    agents_markdown = (workspace_dir / "AGENTS.md").read_text(encoding="utf-8")
+    tools_markdown = (workspace_dir / "TOOLS.md").read_text(encoding="utf-8")
+    assert agents_markdown == (
         pkg_files("nanobot").joinpath("templates/AGENTS.md").read_text(encoding="utf-8")
     )
-    assert (workspace_dir / "TOOLS.md").read_text(encoding="utf-8") == (
+    assert tools_markdown == (
         pkg_files("nanobot").joinpath("templates/TOOLS.md").read_text(encoding="utf-8")
     )
     assert (workspace_dir / "HEARTBEAT.md").read_text(encoding="utf-8") == (
@@ -154,6 +158,7 @@ def test_onboard_applies_demo_kit_only_when_explicit(mock_paths, monkeypatch, tm
     assert result.exit_code == 0
     assert "Applied demo kit 'kit-alpha'" in result.stdout
     assert (workspace_dir / "DEMO.md").exists()
+    assert (workspace_dir / "DEMO_KIT.md").read_text(encoding="utf-8").strip() == "kit-alpha"
     assert (workspace_dir / ".nanobot-demo-kit").read_text(encoding="utf-8").strip() == "kit-alpha"
 
 
@@ -171,6 +176,7 @@ def test_onboard_does_not_mix_demo_kit_into_existing_workspace(mock_paths, monke
     assert result.exit_code == 0
     assert "Skipped demo kit 'kit-alpha'" in result.stdout
     assert not (workspace_dir / "DEMO.md").exists()
+    assert not (workspace_dir / "DEMO_KIT.md").exists()
     assert not (workspace_dir / ".nanobot-demo-kit").exists()
     assert (workspace_dir / "custom.md").read_text(encoding="utf-8") == "keep me\n"
 
@@ -190,6 +196,7 @@ def test_onboard_accepts_bundled_demo_kits(mock_paths, demo_kit: str, expected_r
     assert result.exit_code == 0
     assert f"Applied demo kit '{demo_kit}'" in result.stdout
     assert (workspace_dir / expected_relative_path).exists()
+    assert (workspace_dir / "DEMO_KIT.md").read_text(encoding="utf-8").strip() == demo_kit
     assert (workspace_dir / ".nanobot-demo-kit").read_text(encoding="utf-8").strip() == demo_kit
 
 

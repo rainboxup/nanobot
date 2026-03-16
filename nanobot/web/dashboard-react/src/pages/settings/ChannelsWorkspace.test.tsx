@@ -131,6 +131,19 @@ describe("ChannelsWorkspace", () => {
     expect(mockedApiPost).toHaveBeenCalledWith("/api/channels/feishu/binding/challenges", {})
   })
 
+  it("explains that WeCom stays owner-managed in the admin surface", async () => {
+    mockedApiGet.mockImplementation(async (path: string) => {
+      if (path === "/api/channels/workspace") return [clone(baseChannel)] as any
+      throw new Error(`Unhandled api.get mock for: ${path}`)
+    })
+
+    render(<ChannelsWorkspace />)
+
+    expect(await screen.findByText("Workspace Routing")).toBeInTheDocument()
+    expect(screen.getByText(/WeCom remains owner-managed/i)).toBeInTheDocument()
+    expect(screen.getByText(/does not support workspace BYO credentials/i)).toBeInTheDocument()
+  })
+
   it("confirms a verified identity without asking for sender id", async () => {
     const bindingDetail = {
       name: "feishu",

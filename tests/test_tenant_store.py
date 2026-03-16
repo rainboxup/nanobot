@@ -27,10 +27,14 @@ def test_ensure_tenant_creates_dirs_and_templates(tmp_path: Path) -> None:
     assert (ctx.workspace / "SOUL.md").exists()
     assert (ctx.workspace / "USER.md").exists()
     assert (ctx.workspace / "memory" / "MEMORY.md").exists()
-    assert (ctx.workspace / "AGENTS.md").read_text(encoding="utf-8") == (
+    assert not (ctx.workspace / "DEMO_KIT.md").exists()
+    assert not (ctx.workspace / ".nanobot-demo-kit").exists()
+    agents_markdown = (ctx.workspace / "AGENTS.md").read_text(encoding="utf-8")
+    tools_markdown = (ctx.workspace / "TOOLS.md").read_text(encoding="utf-8")
+    assert agents_markdown == (
         pkg_files("nanobot").joinpath("templates/AGENTS.md").read_text(encoding="utf-8")
     )
-    assert (ctx.workspace / "TOOLS.md").read_text(encoding="utf-8") == (
+    assert tools_markdown == (
         pkg_files("nanobot").joinpath("templates/TOOLS.md").read_text(encoding="utf-8")
     )
     assert (ctx.workspace / "HEARTBEAT.md").read_text(encoding="utf-8") == (

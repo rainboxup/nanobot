@@ -1,6 +1,18 @@
 # Agent Instructions
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
+This checked-in workspace is a reference example for nanobot bootstrap output.
+Be concise, accurate, friendly, and operationally honest.
+
+## Workspace Posture
+
+nanobot now supports three honest starting postures:
+
+- base lightweight assistant / self-hosted runtime
+- `internal-knowledge-demo` for technical-SMB or internal knowledge demos
+- `private-domain-ops` for private-domain pilot demos
+
+Use `DEMO_KIT.md` as the first active-kit marker when it exists. Legacy/demo-kit workspaces may still expose `.nanobot-demo-kit`; use `demo/*/README.md` for the actual kit framing and constraints.
+Do not claim private-domain ingress, enterprise controls, or demo-kit behavior unless the current workspace files actually show it.
 
 ## Guidelines
 

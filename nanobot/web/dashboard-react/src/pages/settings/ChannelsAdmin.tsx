@@ -3,6 +3,7 @@ import { Activity, AlertTriangle, Edit2, Search, PlayCircle, StopCircle } from "
 
 import { api, ApiError } from "@/src/lib/api"
 import { useStore } from "@/src/store/useStore"
+import { Badge } from "@/src/components/ui/badge"
 import { Button } from "@/src/components/ui/button"
 import { Drawer } from "@/src/components/ui/drawer"
 import { Input } from "@/src/components/ui/input"
@@ -568,7 +569,24 @@ export function ChannelsAdmin() {
             ) : (
               filteredChannels.map((channel) => (
                 <TableRow key={channel.name}>
-                  <TableCell className="font-medium">{channel.name}</TableCell>
+                  <TableCell className="font-medium">
+                    <div className="space-y-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span>{channel.name}</span>
+                        {String(channel.name || "").toLowerCase() === "wecom" && (
+                          <>
+                            <Badge variant="outline">system scope</Badge>
+                            <Badge variant="warning">MVP</Badge>
+                          </>
+                        )}
+                      </div>
+                      {String(channel.name || "").toLowerCase() === "wecom" && (
+                        <div className="text-xs font-normal text-muted-foreground">
+                          Owner-managed Enterprise WeChat MVP. No workspace BYO, workspace routing, or media send yet.
+                        </div>
+                      )}
+                    </div>
+                  </TableCell>
                   <TableCell className="text-xs text-muted-foreground font-mono truncate">
                     {channel.config_summary ? JSON.stringify(channel.config_summary) : "{}"}
                   </TableCell>

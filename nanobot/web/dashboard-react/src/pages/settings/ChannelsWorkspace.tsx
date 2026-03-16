@@ -369,7 +369,7 @@ export function ChannelsWorkspace() {
             Control whether Feishu and DingTalk messages can enter the current workspace.
           </p>
           <p className="text-sm text-muted-foreground">
-            System-scoped channels such as WeCom are managed from Admin → Channels and do not appear in workspace routing here.
+            WeCom remains owner-managed in Platform Admin and does not support workspace BYO credentials or workspace routing in this MVP.
           </p>
           {runtimeWarning && (
             <div className="inline-flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">

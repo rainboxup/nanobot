@@ -19,7 +19,8 @@ nanobot onboard --demo-kit internal-knowledge-demo
 ## 你会得到什么
 
 - `workspace/demo/internal-knowledge-demo/README.md`
-- `.nanobot-demo-kit` 标记文件
+- `DEMO_KIT.md` 可见 active-kit 标记文件
+- `.nanobot-demo-kit` 兼容 / legacy 标记文件
 - bundled help 文档与配套 skill，可供演示与培训使用
 
 ## 建议下一步

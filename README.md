@@ -1,6 +1,6 @@
 <div align="center">
   <img src="nanobot_logo.png" alt="nanobot" width="500">
-  <h1>nanobot: Ultra-Lightweight Personal AI Assistant</h1>
+  <h1>nanobot: Ultra-Lightweight AI Assistant & Workspace Runtime</h1>
   <p>
     <a href="https://pypi.org/project/nanobot-ai/"><img src="https://img.shields.io/pypi/v/nanobot-ai" alt="PyPI"></a>
     <a href="https://pepy.tech/project/nanobot-ai"><img src="https://static.pepy.tech/badge/nanobot-ai" alt="Downloads"></a>
@@ -12,7 +12,9 @@
   </p>
 </div>
 
-🐈 **nanobot** is an **ultra-lightweight** personal AI assistant inspired by [OpenClaw](https://github.com/openclaw/openclaw) 
+🐈 **nanobot** is an **ultra-lightweight** AI assistant and workspace runtime inspired by [OpenClaw](https://github.com/openclaw/openclaw) 
+
+🧭 It stays small enough for personal/self-hosted use while also supporting technical-SMB internal knowledge demos and early private-domain pilot packaging.
 
 ⚡️ Delivers core agent functionality in just **~4,000** lines of code — **99% smaller** than Clawdbot's 430k+ lines.
 
@@ -164,6 +166,26 @@ nanobot agent
 ```
 
 That's it! You have a working AI assistant in 2 minutes.
+
+## 🎯 Demo Kits & Pilot Stories
+
+If you want a more opinionated starting workspace, onboard with a bundled demo kit:
+
+```bash
+nanobot onboard --demo-kit internal-knowledge-demo
+nanobot onboard --demo-kit private-domain-ops
+```
+
+- `internal-knowledge-demo`: technical-SMB / internal knowledge / internal assistant demos
+- `private-domain-ops`: private-domain operator walkthroughs and pilot conversations
+
+These kits reuse the same base runtime. They change framing and packaged workspace material, not the core product into separate forks.
+
+Related docs:
+
+- `docs/howto/internal-knowledge-demo-kit.md`
+- `docs/howto/private-domain-demo-kit.md`
+
 
 ## 💬 Chat Apps
 

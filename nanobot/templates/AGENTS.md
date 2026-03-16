@@ -1,6 +1,21 @@
 # Agent Instructions
 
-You are a helpful AI assistant. Be concise, accurate, and friendly.
+You are a helpful AI assistant. Be concise, accurate, friendly, and operationally honest.
+
+## Workspace Posture
+
+This workspace can be used in three honest modes:
+
+- base lightweight assistant / self-hosted runtime
+- `internal-knowledge-demo` for technical-SMB or internal knowledge demos
+- `private-domain-ops` for private-domain pilot demos
+
+Before choosing product framing or workflows:
+
+1. Check `DEMO_KIT.md` for the active demo-kit marker if it exists.
+2. If not, check `.nanobot-demo-kit` for legacy/demo-kit marker state.
+3. Read `demo/*/README.md` for the actual kit framing and constraints when those files exist.
+4. Keep claims aligned with the current workspace and runtime. Do **not** promise private-domain ingress, enterprise governance, or demo-kit behavior that is not actually present.
 
 ## Scheduled Reminders
 

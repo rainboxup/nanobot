@@ -25,7 +25,7 @@ from nanobot.bus.queue import MessageBus
 from nanobot.config.paths import get_skill_store_dir
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
-from nanobot.services.baseline_rollout import BaselineRolloutService
+from nanobot.services.baseline_rollout import BaselineRolloutService, compute_baseline_fingerprint
 from nanobot.services.channel_routing import (
     describe_workspace_channel_routing_decision,
     evaluate_workspace_channel_routing,
@@ -44,7 +44,7 @@ from nanobot.utils.whitelist import parse_str_list, to_set
 class _TenantRuntime:
     tenant_id: str
     config_mtime_ns: int
-    baseline_version_id: str
+    baseline_signature: str
     enable_exec: bool
     enable_web: bool
     agent: AgentLoop
@@ -78,6 +78,23 @@ def _parse_bool(value: Any) -> bool | None:
         if text in {"0", "false", "no", "off"}:
             return False
     return None
+
+
+def _resolve_baseline_signature(
+    baseline_signature: str | None,
+    *,
+    baseline_version_id: str | None = None,
+    baseline_policy: dict[str, Any] | None = None,
+    platform_base_soul_content: str | None = None,
+) -> str:
+    local_fingerprint = compute_baseline_fingerprint(
+        version_id=baseline_version_id,
+        platform_base_soul=platform_base_soul_content,
+        policy=baseline_policy,
+    )
+    if local_fingerprint:
+        return local_fingerprint
+    return str(baseline_signature or "").strip()
 
 
 class MultiTenantAgentLoop:
@@ -383,7 +400,11 @@ class MultiTenantAgentLoop:
         runtime = self._get_or_create_runtime(
             tenant,
             tenant_cfg,
+            baseline_signature=str(baseline_resolution.get("baseline_signature") or ""),
             baseline_version_id=str(baseline_resolution.get("version_id") or ""),
+            baseline_policy=baseline_resolution.get("policy")
+            if isinstance(baseline_resolution.get("policy"), dict)
+            else None,
             platform_base_soul_content=str(baseline_resolution.get("platform_base_soul") or ""),
             system_exec_enabled=system_exec_enabled,
             enable_exec=enable_exec,
@@ -509,7 +530,9 @@ class MultiTenantAgentLoop:
         tenant: TenantContext,
         tenant_cfg: Config,
         *,
+        baseline_signature: str = "",
         baseline_version_id: str = "",
+        baseline_policy: dict[str, Any] | None = None,
         platform_base_soul_content: str | None = None,
         system_exec_enabled: bool | None = None,
         enable_exec: bool,
@@ -521,11 +544,18 @@ class MultiTenantAgentLoop:
         except Exception:
             config_mtime_ns = 0
 
+        resolved_baseline_signature = _resolve_baseline_signature(
+            baseline_signature,
+            baseline_version_id=baseline_version_id,
+            baseline_policy=baseline_policy,
+            platform_base_soul_content=platform_base_soul_content,
+        )
+
         existing = self._runtimes.get(tenant.tenant_id)
         if (
             existing
             and existing.config_mtime_ns == config_mtime_ns
-            and existing.baseline_version_id == baseline_version_id
+            and existing.baseline_signature == resolved_baseline_signature
             and existing.enable_exec == enable_exec
             and existing.enable_web == enable_web
         ):
@@ -588,7 +618,7 @@ class MultiTenantAgentLoop:
         rt = _TenantRuntime(
             tenant_id=tenant.tenant_id,
             config_mtime_ns=config_mtime_ns,
-            baseline_version_id=baseline_version_id,
+            baseline_signature=resolved_baseline_signature,
             enable_exec=enable_exec,
             enable_web=enable_web,
             agent=agent,

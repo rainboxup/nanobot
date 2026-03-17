@@ -29,10 +29,17 @@ def _normalize_label(label: str | None, *, default: str = "baseline") -> str:
 
 
 def _normalize_str_list(values: Any) -> list[str]:
-    if not values:
+    if values is None:
         return []
+    if isinstance(values, str):
+        iterable: Any = [values]
+    else:
+        try:
+            iterable = iter(values)
+        except Exception:
+            return []
     out: set[str] = set()
-    for value in values:
+    for value in iterable:
         text = str(value or "").strip()
         if text:
             out.add(text)
@@ -45,6 +52,75 @@ def _clamp_percent(value: Any) -> int:
     except Exception:
         number = 0
     return max(0, min(100, number))
+
+
+def _normalize_bool(value: Any, *, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value == 0:
+            return False
+        if value == 1:
+            return True
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return bool(default)
+
+
+def _normalize_policy(policy: Any) -> dict[str, Any]:
+    raw_policy = policy if isinstance(policy, dict) else {}
+    exec_enabled = (
+        _normalize_bool(raw_policy.get("exec_enabled"), default=False)
+        if "exec_enabled" in raw_policy
+        else True
+    )
+    web_enabled = (
+        _normalize_bool(raw_policy.get("web_enabled"), default=False)
+        if "web_enabled" in raw_policy
+        else True
+    )
+    return {
+        "exec_enabled": exec_enabled,
+        "exec_whitelist": _normalize_str_list(raw_policy.get("exec_whitelist")),
+        "web_enabled": web_enabled,
+    }
+
+
+def compute_baseline_fingerprint(
+    *,
+    version_id: str | None,
+    platform_base_soul: str | None,
+    policy: Any = None,
+) -> str:
+    normalized_version_id = str(version_id or "").strip()
+    normalized_platform_base_soul = str(platform_base_soul or "")
+    normalized_policy = _normalize_policy(policy) if policy is not None else None
+    if (
+        not normalized_version_id
+        and not normalized_platform_base_soul
+        and normalized_policy is None
+    ):
+        return ""
+    payload = {
+        "version_id": normalized_version_id,
+        "platform_base_soul": normalized_platform_base_soul,
+        "policy": normalized_policy,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+class BaselineRolloutError(ValueError):
+    def __init__(self, code: str, detail: str) -> None:
+        normalized_code = str(code or "").strip() or "baseline_rollout_invalid"
+        normalized_detail = str(detail or "").strip() or normalized_code
+        super().__init__(normalized_detail)
+        self.code = normalized_code
+        self.detail = normalized_detail
 
 
 class BaselineRolloutService:
@@ -116,20 +192,32 @@ class BaselineRolloutService:
     ) -> dict[str, Any]:
         normalized_strategy = str(strategy or "").strip().lower()
         if normalized_strategy not in {"all", "canary"}:
-            raise ValueError("strategy must be one of: all, canary")
+            raise BaselineRolloutError(
+                code="baseline_rollout_invalid",
+                detail="strategy must be one of: all, canary",
+            )
 
         candidate_id = str(candidate_version_id or "").strip()
         control_id = str(control_version_id or "").strip()
         if not candidate_id or not control_id:
-            raise ValueError("candidate_version_id and control_version_id are required")
+            raise BaselineRolloutError(
+                code="baseline_rollout_required",
+                detail="candidate_version_id and control_version_id are required",
+            )
 
         with self._lock:
             state = self._load_state_locked()
             versions = {str(v.get("id") or "") for v in state["versions"]}
             if candidate_id not in versions:
-                raise ValueError("candidate_version_id not found")
+                raise BaselineRolloutError(
+                    code="baseline_version_not_found",
+                    detail="candidate_version_id not found",
+                )
             if control_id not in versions:
-                raise ValueError("control_version_id not found")
+                raise BaselineRolloutError(
+                    code="baseline_version_not_found",
+                    detail="control_version_id not found",
+                )
 
             current_rollout = state.get("rollout") if isinstance(state.get("rollout"), dict) else {}
             salt = str(current_rollout.get("salt") or "").strip() or secrets.token_hex(8)
@@ -149,13 +237,19 @@ class BaselineRolloutService:
     def rollback_to(self, version_id: str, actor: str) -> dict[str, Any]:
         target_version_id = str(version_id or "").strip()
         if not target_version_id:
-            raise ValueError("version_id is required")
+            raise BaselineRolloutError(
+                code="baseline_rollout_required",
+                detail="version_id is required",
+            )
 
         with self._lock:
             state = self._load_state_locked()
             versions = {str(v.get("id") or "") for v in state["versions"]}
             if target_version_id not in versions:
-                raise ValueError("version_id not found")
+                raise BaselineRolloutError(
+                    code="baseline_version_not_found",
+                    detail="version_id not found",
+                )
 
             current_rollout = state.get("rollout") if isinstance(state.get("rollout"), dict) else {}
             salt = str(current_rollout.get("salt") or "").strip() or secrets.token_hex(8)
@@ -235,8 +329,11 @@ class BaselineRolloutService:
             if changed:
                 self._save_state_locked(state)
 
+            baseline_signature = self._baseline_signature(selected_version)
+
             return {
                 "version_id": selected_version_id,
+                "baseline_signature": baseline_signature,
                 "version": self._clone_version(selected_version),
                 "policy": dict(selected_version["policy"]),
                 "platform_base_soul": str(selected_version.get("platform_base_soul") or ""),
@@ -309,18 +406,13 @@ class BaselineRolloutService:
         if not version_id:
             return None
 
-        policy = raw_version.get("policy") if isinstance(raw_version.get("policy"), dict) else {}
         return {
             "id": version_id,
             "created_at": str(raw_version.get("created_at") or _utc_now_iso()),
             "created_by": _normalize_actor(raw_version.get("created_by"), default="system"),
             "label": _normalize_label(raw_version.get("label"), default=version_id),
             "platform_base_soul": str(raw_version.get("platform_base_soul") or ""),
-            "policy": {
-                "exec_enabled": bool(policy.get("exec_enabled", True)),
-                "exec_whitelist": _normalize_str_list(policy.get("exec_whitelist")),
-                "web_enabled": bool(policy.get("web_enabled", True)),
-            },
+            "policy": _normalize_policy(raw_version.get("policy")),
         }
 
     def _normalize_rollout(self, raw_rollout: Any) -> dict[str, Any] | None:
@@ -428,12 +520,16 @@ class BaselineRolloutService:
             "created_by": str(version.get("created_by") or ""),
             "label": str(version.get("label") or ""),
             "platform_base_soul": str(version.get("platform_base_soul") or ""),
-            "policy": {
-                "exec_enabled": bool(version.get("policy", {}).get("exec_enabled", True)),
-                "exec_whitelist": list(version.get("policy", {}).get("exec_whitelist") or []),
-                "web_enabled": bool(version.get("policy", {}).get("web_enabled", True)),
-            },
+            "policy": _normalize_policy(version.get("policy")),
         }
+
+    @staticmethod
+    def _baseline_signature(version: dict[str, Any]) -> str:
+        return compute_baseline_fingerprint(
+            version_id=str(version.get("id") or ""),
+            platform_base_soul=str(version.get("platform_base_soul") or ""),
+            policy=version.get("policy"),
+        )
 
     @staticmethod
     def _policy_from_config(system_config: Any) -> dict[str, Any]:

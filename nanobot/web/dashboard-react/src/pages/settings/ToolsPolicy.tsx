@@ -6,21 +6,13 @@ import { useStore } from "@/src/store/useStore"
 import { Button } from "@/src/components/ui/button"
 import { Badge } from "@/src/components/ui/badge"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/src/components/ui/card"
+import { BaselineBadges, normalizeBaselineMeta, type BaselineMeta } from "./baselineMeta"
 
 type ToolKey = "exec" | "web"
 
 interface ToolPolicyState {
   enabled: boolean
   reason_codes?: string[]
-}
-
-interface BaselineMeta {
-  selected_version_id?: string | null
-  effective_version_id?: string | null
-  strategy?: string | null
-  canary_percent?: number | null
-  control_version_id?: string | null
-  is_canary?: boolean | null
 }
 
 interface ToolsPolicyPayload {
@@ -90,8 +82,9 @@ export function ToolsPolicy() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState("")
 
+  const hasPolicyState = policy !== null
   const writable = Boolean(policy?.writable)
-  const writeBlocked = policy !== null && !writable
+  const writeBlocked = hasPolicyState && !writable
 
   const isDirty = useMemo(() => {
     if (!policy) return false
@@ -144,6 +137,7 @@ export function ToolsPolicy() {
   const execEffective = policy?.effective?.exec || { enabled: false, reason_codes: [] }
   const webEffective = policy?.effective?.web || { enabled: false, reason_codes: [] }
   const warnings = Array.isArray(policy?.warnings) ? policy?.warnings : []
+  const baselineMeta = useMemo(() => normalizeBaselineMeta(policy?.baseline), [policy])
   const runtimeCacheRedacted = Boolean(policy?.runtime_cache_redacted)
   const cacheMaxEntries = safeNumber(policy?.runtime_cache?.max_entries, 0)
   const cacheCurrent = safeNumber(policy?.runtime_cache?.current_cached_tenant_session_managers, 0)
@@ -176,7 +170,7 @@ export function ToolsPolicy() {
               type="checkbox"
               checked={requested}
               onChange={(e) => setRequested(Boolean(e.target.checked))}
-              disabled={!canEdit || writeBlocked || saving}
+              disabled={!hasPolicyState || !canEdit || writeBlocked || saving}
             />
             请求开启（tenant 设置）
           </label>
@@ -242,24 +236,13 @@ export function ToolsPolicy() {
               <div className="text-xs text-muted-foreground">
                 tenant: {String(policy?.subject?.tenant_id || "-")}
               </div>
-              <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                <Badge variant="outline">
-                  baseline: {String(policy?.baseline?.selected_version_id || "-")}
-                </Badge>
-                <Badge variant="outline">
-                  strategy: {String(policy?.baseline?.strategy || "all")}
-                </Badge>
-                <Badge variant="outline">
-                  canary:{" "}
-                  {policy?.baseline?.canary_percent == null
-                    ? "-"
-                    : `${Number(policy.baseline.canary_percent)}%`}
-                </Badge>
-                {policy?.baseline?.is_canary != null && (
-                  <Badge variant={policy.baseline.is_canary ? "success" : "secondary"}>
-                    {policy.baseline.is_canary ? "canary hit" : "control hit"}
-                  </Badge>
-                )}
+              <BaselineBadges
+                meta={baselineMeta}
+                variant="outline"
+                className="text-xs text-muted-foreground"
+              />
+              <div className="text-xs text-muted-foreground">
+                baseline 会影响系统工具上限；如需按 tenant 查看 bucket / canary 命中，请到 Soul 页面查看 tenant baseline 模拟。
               </div>
               <div className="rounded-md border border-muted/60 bg-muted/20 p-3 text-xs text-muted-foreground">
                 <div className="font-medium text-foreground mb-1">Web 会话缓存（运行时）</div>
@@ -314,7 +297,7 @@ export function ToolsPolicy() {
           <div className="flex justify-end">
             <Button
               onClick={() => savePolicy().catch(() => {})}
-              disabled={!canEdit || writeBlocked || saving || !isDirty}
+              disabled={!hasPolicyState || !canEdit || writeBlocked || saving || !isDirty}
             >
               {saving ? "保存中..." : "保存工具策略"}
             </Button>

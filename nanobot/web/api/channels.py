@@ -11,6 +11,10 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from nanobot.config.loader import save_config
 from nanobot.config.schema import ChannelsConfig, Config, TenantChannelOverride
+from nanobot.services.channel_routing import (
+    describe_workspace_channel_routing_decision,
+    evaluate_workspace_channel_routing,
+)
 from nanobot.services.config_ownership import ConfigOwnershipService, ConfigScope
 from nanobot.tenants.validation import (
     is_workspace_routing_channel,
@@ -104,6 +108,15 @@ class WorkspaceRoutingUpdate(BaseModel):
     group_allow_from: list[str] | None = None
     allow_from: list[str] | None = None
     require_mention: bool | None = None
+
+
+class WorkspaceRoutingExplainRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    sender_id: str
+    message_type: Literal["private", "group"] = "private"
+    group_id: str | None = None
+    mentioned: bool = False
 
 
 class AccountBindingUpdate(BaseModel):
@@ -407,6 +420,46 @@ def _workspace_binding_instructions(name: str) -> str:
     )
 
 
+def _workspace_binding_flow_payload(name: str) -> dict[str, Any]:
+    normalized = _ensure_workspace_channel(name)
+    channel_display = workspace_routing_channel_display_name(normalized)
+    return {
+        "preferred_flow": {
+            "name": "dashboard_binding_challenge",
+            "summary": (
+                "Preferred: start binding in the dashboard, generate a short-lived verification "
+                f"challenge for {channel_display}, verify it in a private chat/DM with !prove <CODE>, "
+                "then confirm the verified identity in the dashboard."
+            ),
+            "commands": {
+                "verify": "!prove <CODE>",
+                "inspect": "!whoami",
+            },
+        },
+        "compatibility_flow": {
+            "name": "legacy_link_code",
+            "summary": (
+                "Compatibility fallback: use !link in a private chat/DM to generate a one-time "
+                "code, then send !link <CODE> from the target identity."
+            ),
+            "commands": {
+                "generate": "!link",
+                "consume": "!link <CODE>",
+                "inspect": "!whoami",
+            },
+        },
+    }
+
+
+def _workspace_routing_explain_metadata(mentioned: bool) -> dict[str, Any]:
+    flag = bool(mentioned)
+    return {
+        "mentioned": flag,
+        "is_bot_mentioned": flag,
+        "is_in_at_list": flag,
+    }
+
+
 def _current_account_id(user: dict[str, Any]) -> str:
     return str(user.get("sub") or user.get("username") or "").strip().lower()
 
@@ -488,6 +541,7 @@ def _workspace_account_binding_payload(
         "proof_of_possession_supported": True,
         "active_challenge": active_challenge,
     }
+    payload.update(_workspace_binding_flow_payload(channel_name))
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
 
@@ -1080,6 +1134,7 @@ async def get_channel_binding_instructions(
         "channel": channel_name,
         "instructions": _workspace_binding_instructions(channel_name),
     }
+    payload.update(_workspace_binding_flow_payload(channel_name))
     return _workspace_runtime_meta(request, channel_name=channel_name, payload=payload)
 
 
@@ -1413,6 +1468,49 @@ async def get_workspace_channel_routing(
         system_channel=getattr(system_cfg.channels, channel_name),
         routing=getattr(tenant_cfg.workspace.channels, channel_name),
     )
+
+
+@router.post("/api/channels/{name}/routing/explain")
+async def explain_workspace_channel_routing(
+    name: str,
+    payload: WorkspaceRoutingExplainRequest,
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    channel_name = _ensure_workspace_channel(name)
+    tenant_id, _store, tenant_cfg = load_tenant_config(request, user)
+    system_cfg = _system_config(request)
+    routing = getattr(tenant_cfg.workspace.channels, channel_name)
+
+    decision = evaluate_workspace_channel_routing(
+        config=tenant_cfg,
+        channel_name=channel_name,
+        sender_id=payload.sender_id,
+        message_type=payload.message_type,
+        group_id=payload.group_id,
+        metadata=_workspace_routing_explain_metadata(payload.mentioned),
+    )
+
+    response = _workspace_routing_payload(
+        request,
+        tenant_id=tenant_id,
+        name=channel_name,
+        system_channel=getattr(system_cfg.channels, channel_name),
+        routing=routing,
+    )
+    response["channel"] = channel_name
+    response["simulation"] = {
+        "sender_id": payload.sender_id,
+        "message_type": payload.message_type,
+        "group_id": payload.group_id,
+        "mentioned": bool(payload.mentioned),
+    }
+    response["decision"] = describe_workspace_channel_routing_decision(decision)
+    response["simulated_effective_enabled"] = bool(response.get("effective_enabled")) and bool(
+        response["decision"].get("allowed")
+    )
+    return response
 
 
 @router.put("/api/channels/{name}/routing")

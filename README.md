@@ -167,6 +167,26 @@ nanobot agent
 
 That's it! You have a working AI assistant in 2 minutes.
 
+## 🧪 Pilot-ready today
+
+nanobot can already support a **small, honest pilot walkthrough** without pretending to be a full enterprise governance platform.
+
+What is ready to demo today:
+
+- **Multi-tenant web dashboard** with explicit **owner / admin / member** boundaries
+- **Workspace Routing** for Feishu / DingTalk, including stable `reason_code` explainability
+- **Account-centric binding** in the dashboard, with `!link` kept as a compatibility fallback
+- **Owner-facing Ops snapshot** for runtime health, queue pressure, active connections, and attention items
+- **Owner-facing Security / audit surfaces** for login locks, audit visibility, and retention status
+- **WeCom MVP** as an **owner-managed, system-scoped** channel
+
+Current support boundaries to keep sales / pilot conversations honest:
+
+- WeCom is **not** yet a workspace-BYO / workspace-routing channel
+- Owner / admin / member boundaries are explicit, but this is **not** a full enterprise IAM suite
+- Ops is a factual runtime snapshot, **not** a full observability platform
+- Demo kits reuse the same runtime; they do **not** fork the product into separate editions
+
 ## 🎯 Demo Kits & Pilot Stories
 
 If you want a more opinionated starting workspace, onboard with a bundled demo kit:
@@ -1008,10 +1028,12 @@ Docs (multi-tenant / SaaS):
 - Workspace routing + binding (`!link`): `docs/howto/workspace-routing-and-binding.md`
 - Explainability: effective Policy + Soul: `docs/howto/effective-policy-and-soul.md`
 - Config scopes/ownership (operator/admin): `docs/architecture/config-ownership.md`
+- Role and surface boundaries (API + UI): `GET /api/security/boundaries`
 - Dashboard surfaces:
   - **Ops** → runtime snapshot / rollout readiness
   - **Security** → login locks / audit visibility
   - **Users** → tenant-scoped user and session lifecycle controls
+  - **Workspace Routing** → member binding vs admin-only routing / BYO boundaries
 
 Recommended production cookie policy (already defaulted in `.env.example`):
 

@@ -70,15 +70,47 @@ Effective 通常来自三层合并：
 
 - **Platform Admin**：系统级 channels（通常需重启生效）
 - **Workspace Routing**：工作区级 routing（立即生效，只能“更严格”）
+- **Binding（账号绑定）**：当前推荐走 dashboard challenge-first 流程；`!link` 仍保留为兼容路径
 
 更多 routing + `!link` 的用户流/排障：`docs/howto/workspace-routing-and-binding.md`
 
-### 3.4 Security / Users：为什么有的页面你看得到但不能操作？
+支持/排障建议：
+
+- 如果用户问“为什么消息没进 workspace”，优先看 routing explainability：
+  - Dashboard 的 routing explain / 日志里的 `reason_code`
+  - API：`POST /api/channels/{name}/routing/explain`
+- 重点字段：
+  - `reason_code`：稳定拒绝/放行原因
+  - `reason_summary`：给支持/销售能直接复述的简明解释
+  - `details`：用于定位 mention、allowlist、workspace enabled 等具体条件
+
+### 3.4 Ops：怎么讲“这是支持/销售也能看懂的运行时快照”？
+
+入口：**Settings → Ops**
+
+- 这是 **Owner-only** 的事实型快照，不是另一个配置页
+- 数据来自：`/api/ops/runtime`
+- 当前适合在 pilot 演示中讲的内容：
+  - 已注册 / 运行中渠道数
+  - workspace runtime 数量与 inactive 数量
+  - inbound / outbound queue pressure
+  - active web connections
+  - attention items（例如某个 workspace runtime 已配置但未激活）
+
+讲法建议：
+
+- 用它解释“系统现在是什么状态”
+- 不要把它描述成完整 observability / SIEM / APM 平台
+- 看到 attention item 时，继续联动 Channels / Security / Users 页面做解释
+
+### 3.5 Security / Users：为什么有的页面你看得到但不能操作？
 
 入口：**Settings → Security** / **Settings → Users**
 
 - **Security**：偏 Owner 的运维/审计视角，主要看登录锁定、审计事件、清理策略
 - **Users**：Owner / Admin 都能进入，但 Admin 的操作范围会被限制在**本租户的 member 用户**
+- **Channels → Workspace Routing**：member 可以做 binding，但 routing / BYO credentials 仍要求 admin access
+- Dashboard 现在会显示“权限边界”卡片；API 侧也可通过 `GET /api/security/boundaries` 查看机器可读的边界说明
 - 如果 UI 显示按钮不可用，优先看：
   - 当前登录角色（owner / admin / member）
   - 当前资源是 system 还是 workspace scope

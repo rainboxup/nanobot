@@ -25,6 +25,20 @@ function statusLabel(value: any): string {
   return String(value || "") || "未知"
 }
 
+function pressureLabel(value: any): string {
+  const v = String(value || "").toLowerCase()
+  if (v === "high") return "高"
+  if (v === "elevated") return "偏高"
+  return "正常"
+}
+
+function pressureVariant(value: any): "success" | "warning" | "secondary" {
+  const v = String(value || "").toLowerCase()
+  if (v === "high" || v === "elevated") return "warning"
+  if (v === "normal") return "success"
+  return "secondary"
+}
+
 export function Ops() {
   const { user, addToast } = useStore()
   const [isRefreshing, setIsRefreshing] = useState(false)
@@ -81,11 +95,15 @@ export function Ops() {
   const version = data?.version ? `v${String(data.version)}` : ""
   const warnings: string[] = Array.isArray(data?.warnings) ? data.warnings : []
   const runtime = data?.runtime || {}
+  const summary = runtime?.summary || {}
   const queue = runtime?.queue || {}
   const channels = runtime?.channels || {}
   const registered: string[] = Array.isArray(channels?.registered) ? channels.registered : []
+  const channelRows: any[] = Array.isArray(channels?.rows) ? channels.rows : []
+  const workspaceRows: any[] = Array.isArray(channels?.workspace_rows) ? channels.workspace_rows : []
   const channelStatus = channels?.status || {}
   const activeWeb = Number(channels?.active_web_connections || 0)
+  const attention: any[] = Array.isArray(runtime?.attention) ? runtime.attention : []
   const guides: any[] = Array.isArray(data?.guides) ? data.guides : []
 
   const noticeVariant = String(status || "").toLowerCase() === "ready" ? "success" : "warning"
@@ -168,6 +186,58 @@ export function Ops() {
             <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
               <Card>
                 <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">已注册渠道</CardTitle>
+                  <Wifi className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{String(summary?.registered_channel_count ?? 0)}</div>
+                  <div className="text-sm text-muted-foreground">{registered.join(", ") || "（无）"}</div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">运行中渠道</CardTitle>
+                  <Activity className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{String(summary?.running_channel_count ?? 0)}</div>
+                  <div className="text-sm text-muted-foreground">
+                    未运行：{Math.max(0, Number(summary?.registered_channel_count || 0) - Number(summary?.running_channel_count || 0))}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">工作区运行时</CardTitle>
+                  <Server className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">
+                    {String(summary?.workspace_runtime_running_count ?? 0)} / {String(summary?.workspace_runtime_count ?? 0)}
+                  </div>
+                  <div className="text-sm text-muted-foreground">
+                    未激活：{String(summary?.workspace_runtime_inactive_count ?? 0)}
+                  </div>
+                </CardContent>
+              </Card>
+
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                  <CardTitle className="text-sm font-medium">活跃 Web 连接</CardTitle>
+                  <Wifi className="h-4 w-4 text-muted-foreground" />
+                </CardHeader>
+                <CardContent>
+                  <div className="text-2xl font-semibold">{String(summary?.active_web_connections ?? activeWeb)}</div>
+                  <div className="text-sm text-muted-foreground">当前在线会话连接数</div>
+                </CardContent>
+              </Card>
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+              <Card>
+                <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                   <CardTitle className="text-sm font-medium">运行时间</CardTitle>
                   <Server className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
@@ -183,6 +253,11 @@ export function Ops() {
                   <Database className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
+                  <div className="mb-2">
+                    <Badge variant={pressureVariant(queue?.inbound_pressure_level)}>
+                      {pressureLabel(queue?.inbound_pressure_level)}
+                    </Badge>
+                  </div>
                   <div className="text-sm text-muted-foreground">
                     深度：{String(queue?.inbound_depth ?? 0)} / {String(queue?.inbound_capacity ?? 0)}（{formatPercent(queue?.inbound_utilization)}）
                   </div>
@@ -195,6 +270,11 @@ export function Ops() {
                   <Database className="h-4 w-4 text-muted-foreground" />
                 </CardHeader>
                 <CardContent>
+                  <div className="mb-2">
+                    <Badge variant={pressureVariant(queue?.outbound_pressure_level)}>
+                      {pressureLabel(queue?.outbound_pressure_level)}
+                    </Badge>
+                  </div>
                   <div className="text-sm text-muted-foreground">
                     深度：{String(queue?.outbound_depth ?? 0)} / {String(queue?.outbound_capacity ?? 0)}（{formatPercent(queue?.outbound_utilization)}）
                   </div>
@@ -213,6 +293,35 @@ export function Ops() {
               </Card>
             </div>
 
+            <Card>
+              <CardHeader>
+                <CardTitle className="text-base">重点关注</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                {attention.length ? (
+                  attention.map((item, idx) => (
+                    <div key={`${String(item?.reason_code || "")}:${idx}`} className="rounded-md border bg-muted/20 p-3">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="warning">{String(item?.reason_code || "attention")}</Badge>
+                        <div className="font-medium">{String(item?.summary || "")}</div>
+                      </div>
+                      {item?.details ? (
+                        <div className="mt-2 text-sm text-muted-foreground">
+                          {Object.entries(item.details as Record<string, unknown>).map(([key, value]) => (
+                            <div key={key}>
+                              {key}: {String(value)}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))
+                ) : (
+                  <div className="text-sm text-muted-foreground">暂无重点告警</div>
+                )}
+              </CardContent>
+            </Card>
+
             <div className="grid gap-4 md:grid-cols-2">
               <Card className="col-span-1">
                 <CardHeader>
@@ -226,6 +335,28 @@ export function Ops() {
                   >
                     {JSON.stringify(channelStatus, null, 2)}
                   </SyntaxHighlighter>
+                </CardContent>
+              </Card>
+
+              <Card className="col-span-1">
+                <CardHeader>
+                  <CardTitle className="text-base">工作区运行时明细</CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-3">
+                  {workspaceRows.length ? (
+                    workspaceRows.map((row, idx) => (
+                      <div key={`${String(row?.channel || "")}:${String(row?.tenant_id || "")}:${idx}`} className="rounded-md border bg-muted/20 p-3 text-sm">
+                        <div className="font-medium">
+                          {String(row?.channel || "")} / {String(row?.tenant_id || "")}
+                        </div>
+                        <div className="text-muted-foreground">
+                          running={String(Boolean(row?.running))} · active_in_runtime={String(Boolean(row?.active_in_runtime))}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <div className="text-sm text-muted-foreground">暂无工作区运行时</div>
+                  )}
                 </CardContent>
               </Card>
 

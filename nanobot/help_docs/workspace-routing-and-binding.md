@@ -172,9 +172,9 @@
 5) **你可能收到了“私聊回复”而不是群里回复**
    - Feishu/DingTalk 为安全起见，群消息默认倾向私聊回复（避免把 tenant 上下文泄漏到群里）
 
-### 4.1 Workspace routing 常见 reason_code
+### 4.1 Workspace routing 常见 deny reason_code
 
-这些 reason_code 通常出现在日志/指标里（以及部分 API 返回中）：
+这些 deny reason_code 通常出现在日志/指标里（以及部分 API 返回中）：
 
 | reason_code | 含义 | 你该怎么做 |
 |---|---|---|
@@ -186,3 +186,73 @@
 | `missing_sender_id` | 平台消息里缺少 sender_id | 多为适配器/平台异常；联系运维看日志 |
 
 > 如果你“完全没看到任何拒绝信息”，这通常是**刻意的静默丢弃**（避免泄露策略）。此时最有效的办法是让运维看一眼 ingress 侧日志。
+
+### 4.2 Workspace routing 常见 allow reason_code
+
+为了让 support / ops 更容易解释“为什么这条消息能进来”，runtime explainability 现在也会给允许路径打稳定的 allow reason_code：
+
+| reason_code | 含义 |
+|---|---|
+| `routing_not_applicable` | 当前 channel 不走 workspace routing（例如 Telegram） |
+| `private_message_allowed` | 私聊消息通过了 workspace routing 检查 |
+| `group_policy_open` | 群策略是 `open`，所以群消息直接放行 |
+| `group_mention_satisfied` | 群策略是 `mention`，且这次消息满足了 @ 机器人条件 |
+| `group_allowlist_match` | 群策略是 `allowlist`，且当前 group_id 在 allowlist 中 |
+
+### 4.3 Runtime explainability 现在会附带什么上下文
+
+为了让 reason_code 不只是“一个字符串”，workspace routing 判定现在还会附带一组稳定上下文，便于 support/ops 解释：
+
+- `channel_name`
+- `sender_id`
+- `group_id`
+- `message_type`
+- `group_policy`
+- `allow_from_count`
+- `group_allow_from_count`
+
+实操上可以这样理解：
+
+- 先看 `reason_code`
+- 再看 `reason_summary`
+- 最后结合上述上下文判断问题落在：
+  - workspace 开关
+  - sender allowlist
+  - group policy
+  - group allowlist
+  - 上游适配器缺少 sender_id
+
+这样 support 在排障时不用先反推整份 tenant config，就能快速解释“为什么被拦”或“为什么被放行”。
+
+### 4.4 Operator dry-run：用 API 直接解释一条“假设消息”
+
+如果 support / ops 手上只有一组线索（sender_id、是否群聊、是否 @ 机器人），不想等真实消息重放，可以直接调用：
+
+```text
+POST /api/channels/{name}/routing/explain
+```
+
+当前请求体最小格式：
+
+```json
+{
+  "sender_id": "user-123",
+  "message_type": "group",
+  "group_id": "group-456",
+  "mentioned": true
+}
+```
+
+返回会包含：
+
+- 当前 workspace routing 配置快照
+- `system_enabled` / `workspace_enabled` / `effective_enabled`
+- `decision.reason_code`
+- `decision.reason_summary`
+- `decision.details`
+
+适合用于：
+
+- support 排障 dry-run
+- pilot 演示时解释一条“为什么这条消息会 / 不会进入 workspace”
+- 在不翻日志的情况下快速复核 allowlist / mention / group policy 的判断结果

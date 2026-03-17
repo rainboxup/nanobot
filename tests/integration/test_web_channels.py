@@ -554,6 +554,14 @@ async def test_workspace_routing_binding_instructions_are_readable(
     assert body["name"] == "dingtalk"
     assert body["channel"] == "dingtalk"
     assert body.get("help_slug") == "workspace-routing-and-binding"
+    assert body["preferred_flow"]["name"] == "dashboard_binding_challenge"
+    assert "dashboard" in body["preferred_flow"]["summary"].lower()
+    assert body["compatibility_flow"]["name"] == "legacy_link_code"
+    assert body["compatibility_flow"]["commands"] == {
+        "generate": "!link",
+        "consume": "!link <CODE>",
+        "inspect": "!whoami",
+    }
 
     instructions = str(body["instructions"] or "")
     assert "account" in instructions.lower() or "dashboard" in instructions.lower()
@@ -869,6 +877,39 @@ async def test_workspace_routing_requires_admin_but_not_owner(http_client, auth_
         json={"client_id": "new-client"},
     )
     assert system_update.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_channel_list_explains_member_vs_admin_write_boundaries(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for("alice-routing-admin", role="admin", tenant_id="tenant-routing-admin")
+    member_headers = await auth_headers_for(
+        "member-routing",
+        role="member",
+        tenant_id="tenant-routing-member",
+    )
+
+    admin_list = await http_client.get("/api/channels/workspace", headers=admin_headers)
+    assert admin_list.status_code == 200
+    admin_rows = {row.get("name"): row for row in (admin_list.json() or [])}
+    assert "feishu" in admin_rows
+    assert admin_rows["feishu"]["binding_supported"] is True
+    assert admin_rows["feishu"]["writable"] is True
+    assert admin_rows["feishu"]["write_block_reason_code"] is None
+
+    member_list = await http_client.get("/api/channels/workspace", headers=member_headers)
+    assert member_list.status_code == 200
+    member_rows = {row.get("name"): row for row in (member_list.json() or [])}
+    assert "feishu" in member_rows
+    assert member_rows["feishu"]["binding_supported"] is True
+    assert member_rows["feishu"]["writable"] is False
+    assert member_rows["feishu"]["write_block_reason_code"] == "admin_required"
+    assert (
+        member_rows["feishu"]["write_block_reason"]
+        == "Workspace routing and BYO credential changes require admin access. Binding remains available to workspace members."
+    )
 
 
 @pytest.mark.integration
@@ -1195,6 +1236,103 @@ async def test_workspace_routing_conflicting_flags_return_structured_422(
     detail = response.json()["detail"]
     assert detail["reason_code"] == "workspace_routing_conflict"
     assert "conflicts" in str(detail["message"]).lower()
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_explain_returns_structured_denial(
+    http_client, auth_headers_for
+) -> None:
+    headers = await auth_headers_for(
+        "alice-routing-explain-deny",
+        role="admin",
+        tenant_id="tenant-routing-explain-deny",
+    )
+
+    update = await http_client.put(
+        "/api/channels/feishu/routing",
+        headers=headers,
+        json={"allow_from": ["allowed-user"]},
+    )
+    assert update.status_code == 200
+
+    response = await http_client.post(
+        "/api/channels/feishu/routing/explain",
+        headers=headers,
+        json={"sender_id": "blocked-user", "message_type": "private"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "feishu"
+    assert body["channel"] == "feishu"
+    assert body["simulation"] == {
+        "sender_id": "blocked-user",
+        "message_type": "private",
+        "group_id": None,
+        "mentioned": False,
+    }
+    decision = body["decision"]
+    assert decision["allowed"] is False
+    assert decision["reason_code"] == "sender_not_allowlisted"
+    assert decision["reason_summary"] == "Sender is outside the workspace allowlist."
+    assert decision["details"] == {
+        "channel_name": "feishu",
+        "sender_id": "blocked-user",
+        "group_id": None,
+        "message_type": "private",
+        "group_policy": "mention",
+        "allow_from_count": 1,
+        "group_allow_from_count": 0,
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_workspace_routing_explain_returns_structured_allow_and_effective_flags(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    web_ctx.app.state.config.channels.feishu.enabled = True
+    save_config(web_ctx.app.state.config, config_path=web_ctx.config_path)
+
+    headers = await auth_headers_for(
+        "alice-routing-explain-allow",
+        role="admin",
+        tenant_id="tenant-routing-explain-allow",
+    )
+
+    response = await http_client.post(
+        "/api/channels/feishu/routing/explain",
+        headers=headers,
+        json={
+            "sender_id": "alice",
+            "message_type": "group",
+            "group_id": "group-1",
+            "mentioned": True,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["system_enabled"] is True
+    assert body["workspace_enabled"] is True
+    assert body["effective_enabled"] is True
+    assert body.get("help_slug") == "workspace-routing-and-binding"
+    decision = body["decision"]
+    assert decision["allowed"] is True
+    assert decision["reason_code"] == "group_mention_satisfied"
+    assert decision["reason_summary"] == (
+        "Group message allowed because the bot mention requirement was satisfied."
+    )
+    assert decision["details"] == {
+        "channel_name": "feishu",
+        "sender_id": "alice",
+        "group_id": "group-1",
+        "message_type": "group",
+        "group_policy": "mention",
+        "allow_from_count": 0,
+        "group_allow_from_count": 0,
+    }
 
 
 @pytest.mark.integration

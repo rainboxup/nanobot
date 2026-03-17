@@ -19,6 +19,24 @@ interface UserRow {
   active: boolean
 }
 
+interface BoundaryRule {
+  allowed: boolean
+  scope: string
+  summary: string
+}
+
+interface SecurityBoundariesPayload {
+  role: string
+  surfaces?: {
+    users?: {
+      page_allowed?: boolean
+      create_users?: BoundaryRule
+      change_roles?: BoundaryRule
+      manage_lifecycle?: BoundaryRule
+    }
+  }
+}
+
 function roleLabel(role: string): string {
   const r = String(role || "").toLowerCase()
   if (r === "member") return "成员"
@@ -27,12 +45,23 @@ function roleLabel(role: string): string {
   return String(role || "")
 }
 
+function boundaryScopeLabel(scope: string): string {
+  const normalized = String(scope || "").trim().toLowerCase()
+  if (normalized === "any_tenant") return "任意租户"
+  if (normalized === "current_tenant") return "当前租户"
+  if (normalized === "owner_only") return "仅 Owner"
+  if (normalized === "current_tenant_members") return "当前租户成员"
+  if (normalized === "any_tenant_except_self") return "非本人 / 任意租户"
+  return normalized || "未说明"
+}
+
 export function Users() {
   const { user, addToast } = useStore()
 
   const [rows, setRows] = useState<UserRow[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
+  const [roleBoundaries, setRoleBoundaries] = useState<SecurityBoundariesPayload | null>(null)
 
   const [createUsername, setCreateUsername] = useState("")
   const [createPassword, setCreatePassword] = useState("")
@@ -61,6 +90,37 @@ export function Users() {
     return isOwner ? ["member", "admin", "owner"] : ["member", "admin"]
   }, [isOwner])
 
+  const usersBoundaries = useMemo(() => {
+    return (
+      roleBoundaries?.surfaces?.users || {
+        page_allowed: isAdmin,
+        create_users: {
+          allowed: isAdmin,
+          scope: isOwner ? "any_tenant" : "current_tenant",
+          summary: isOwner
+            ? "Owners can create users in any tenant and may create owner accounts."
+            : isAdmin
+              ? "Admins can create member/admin users only in the current tenant."
+              : "Members cannot create users.",
+        },
+        change_roles: {
+          allowed: isOwner,
+          scope: "owner_only",
+          summary: "Only owners can change roles, including promoting admins or owners.",
+        },
+        manage_lifecycle: {
+          allowed: isAdmin,
+          scope: isOwner ? "any_tenant_except_self" : "current_tenant_members",
+          summary: isOwner
+            ? "Owners can reset passwords, revoke sessions, disable, or delete any other user."
+            : isAdmin
+              ? "Admins can reset passwords, revoke sessions, disable, or delete member users in the current tenant."
+              : "Members cannot manage other users.",
+        },
+      }
+    )
+  }, [isAdmin, isOwner, roleBoundaries])
+
   function canManageLifecycle(target: UserRow): boolean {
     const targetUsername = String(target.username || "").toLowerCase()
     if (!targetUsername || targetUsername === actorUsername) return false
@@ -70,9 +130,19 @@ export function Users() {
     return targetTenant === actorTenant && targetRole === "member"
   }
 
+  async function loadRoleBoundaries() {
+    try {
+      const payload = await api.get<SecurityBoundariesPayload>("/api/security/boundaries")
+      setRoleBoundaries(payload || null)
+    } catch {
+      setRoleBoundaries(null)
+    }
+  }
+
   async function load() {
     if (!isAdmin) {
       setRows([])
+      setRoleBoundaries(null)
       setError("用户管理仅对 Admin/Owner 角色开放。")
       return
     }
@@ -98,7 +168,9 @@ export function Users() {
   }
 
   useEffect(() => {
+    if (!isAdmin) return
     load().catch(() => {})
+    loadRoleBoundaries().catch(() => {})
   }, [isAdmin])
 
   async function createUser() {
@@ -114,7 +186,11 @@ export function Users() {
       if (password.length < 6) throw new Error("密码至少 6 位")
 
       const payload: any = { username, password, role: createRole }
-      if (tenant) payload.tenant_id = tenant
+      if (isOwner) {
+        if (tenant) payload.tenant_id = tenant
+      } else if (actorTenant) {
+        payload.tenant_id = actorTenant
+      }
       await api.post("/api/auth/users", payload)
       setCreatePassword("")
       addToast({ type: "success", message: "用户已创建" })
@@ -235,7 +311,14 @@ export function Users() {
             </a>
           </p>
         </div>
-        <Button variant="outline" onClick={() => load().catch(() => {})} disabled={loading}>
+        <Button
+          variant="outline"
+          onClick={() => {
+            load().catch(() => {})
+            loadRoleBoundaries().catch(() => {})
+          }}
+          disabled={loading}
+        >
           <RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} />
           刷新
         </Button>
@@ -248,10 +331,56 @@ export function Users() {
       )}
 
       {isAdmin && (
+        <div className="rounded-md border bg-muted/20 p-4">
+          <div className="flex items-center gap-2">
+            <div className="font-medium">权限边界</div>
+            <Badge variant={isOwner ? "success" : "outline"}>{isOwner ? "Owner" : "Admin"}</Badge>
+          </div>
+          <div className="mt-3 grid gap-3 md:grid-cols-3">
+            <div className="rounded-md border bg-card p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">创建用户</div>
+                <Badge variant={usersBoundaries.create_users?.allowed ? "success" : "secondary"}>
+                  {boundaryScopeLabel(String(usersBoundaries.create_users?.scope || ""))}
+                </Badge>
+              </div>
+              <div className="mt-2 text-sm text-muted-foreground">
+                {String(usersBoundaries.create_users?.summary || "")}
+              </div>
+            </div>
+            <div className="rounded-md border bg-card p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">角色调整</div>
+                <Badge variant={usersBoundaries.change_roles?.allowed ? "success" : "secondary"}>
+                  {boundaryScopeLabel(String(usersBoundaries.change_roles?.scope || ""))}
+                </Badge>
+              </div>
+              <div className="mt-2 text-sm text-muted-foreground">
+                {String(usersBoundaries.change_roles?.summary || "")}
+              </div>
+            </div>
+            <div className="rounded-md border bg-card p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-sm font-medium">账号生命周期</div>
+                <Badge variant={usersBoundaries.manage_lifecycle?.allowed ? "success" : "secondary"}>
+                  {boundaryScopeLabel(String(usersBoundaries.manage_lifecycle?.scope || ""))}
+                </Badge>
+              </div>
+              <div className="mt-2 text-sm text-muted-foreground">
+                {String(usersBoundaries.manage_lifecycle?.summary || "")}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isAdmin && (
         <div className="rounded-md border bg-card p-4">
           <div className="flex items-center justify-between">
             <div className="font-medium">创建用户</div>
-            <div className="text-sm text-muted-foreground">Admin 只能在自己的租户内创建用户。</div>
+            <div className="text-sm text-muted-foreground">
+              {String(usersBoundaries.create_users?.summary || "Admin 只能在自己的租户内创建用户。")}
+            </div>
           </div>
           <div className="mt-3 flex flex-wrap gap-2">
             <Input
@@ -279,10 +408,14 @@ export function Users() {
               ))}
             </select>
             <Input
-              placeholder="租户ID（可选）"
-              value={createTenant}
-              onChange={(e) => setCreateTenant(e.target.value)}
+              placeholder={isOwner ? "租户ID（可选）" : "当前租户"}
+              value={isOwner ? createTenant : actorTenant}
+              onChange={(e) => {
+                if (!isOwner) return
+                setCreateTenant(e.target.value)
+              }}
               className="min-w-[160px]"
+              disabled={!isOwner}
             />
             <Button onClick={() => createUser().catch(() => {})} disabled={creating}>
               <UserPlus className="mr-2 h-4 w-4" />

@@ -26,7 +26,11 @@ from nanobot.config.paths import get_skill_store_dir
 from nanobot.config.schema import Config
 from nanobot.providers.litellm_provider import LiteLLMProvider
 from nanobot.services.baseline_rollout import BaselineRolloutService
-from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
+from nanobot.services.channel_routing import (
+    describe_workspace_channel_routing_decision,
+    evaluate_workspace_channel_routing,
+    normalize_sender_id,
+)
 from nanobot.services.soul_paths import resolve_platform_base_soul_path
 from nanobot.session.manager import SessionManager
 from nanobot.tenants.commands import configure_link_throttle, try_handle
@@ -248,11 +252,14 @@ class MultiTenantAgentLoop:
             metadata=msg.metadata,
         )
         if not routing_decision.allowed:
+            explainability = describe_workspace_channel_routing_decision(routing_decision)
             logger.info(
-                "Workspace routing denied inbound message channel={} tenant={} reason={}",
+                "Workspace routing denied inbound message channel={} tenant={} reason={} summary={} details={}",
                 msg.channel,
                 tenant_id,
                 routing_decision.reason_code,
+                explainability.get("reason_summary") or "",
+                explainability.get("details") or {},
             )
             return None
 
@@ -264,6 +271,9 @@ class MultiTenantAgentLoop:
             msg.metadata["workspace_channel_routing"] = routing_decision.policy.model_dump(
                 exclude_none=True
             )
+        msg.metadata["workspace_channel_routing_explainability"] = (
+            describe_workspace_channel_routing_decision(routing_decision)
+        )
 
         self._touch_tenant(tenant_id)
         lock = self._tenant_locks.setdefault(tenant_id, asyncio.Lock())

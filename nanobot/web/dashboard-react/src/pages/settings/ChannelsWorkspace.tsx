@@ -70,6 +70,25 @@ interface WorkspaceAccountBindingDetail {
   write_block_reason?: string | null
 }
 
+interface BoundaryRule {
+  allowed: boolean
+  scope: string
+  summary: string
+}
+
+interface SecurityBoundariesPayload {
+  role: string
+  surfaces?: {
+    workspace_channels?: {
+      page_allowed?: boolean
+      binding?: BoundaryRule
+      workspace_routing?: BoundaryRule
+      workspace_credentials?: BoundaryRule
+      system_channels?: BoundaryRule
+    }
+  }
+}
+
 function toTextareaValue(items?: string[] | null) {
   return Array.isArray(items) ? items.join("\n") : ""
 }
@@ -98,6 +117,14 @@ function bindingChallengeCommand(challenge?: WorkspaceBindingChallenge | null) {
   return command || `!prove ${code}`
 }
 
+function boundaryScopeLabel(scope: string) {
+  const normalized = String(scope || "").trim().toLowerCase()
+  if (normalized === "current_account") return "current account"
+  if (normalized === "current_tenant_admin") return "admin / owner"
+  if (normalized === "owner_only") return "owner only"
+  return normalized || "read-only"
+}
+
 const WORKSPACE_CREDENTIAL_FIELDS: Record<
   string,
   Array<{ name: string; label: string; sensitive?: boolean; placeholder?: string }>
@@ -113,7 +140,7 @@ const WORKSPACE_CREDENTIAL_FIELDS: Record<
 }
 
 export function ChannelsWorkspace() {
-  const { addToast } = useStore()
+  const { user, addToast } = useStore()
   const [channels, setChannels] = useState<WorkspaceChannelItem[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
@@ -135,6 +162,52 @@ export function ChannelsWorkspace() {
   const [credentialValues, setCredentialValues] = useState<Record<string, string>>({})
   const [credentialError, setCredentialError] = useState("")
   const [credentialSaving, setCredentialSaving] = useState(false)
+  const [roleBoundaries, setRoleBoundaries] = useState<SecurityBoundariesPayload | null>(null)
+
+  const actorRole = String(user?.role || "").toLowerCase()
+  const isOwner = actorRole === "owner"
+  const isAdmin = isOwner || actorRole === "admin"
+
+  const workspaceBoundaries = useMemo(() => {
+    return (
+      roleBoundaries?.surfaces?.workspace_channels || {
+        page_allowed: true,
+        binding: {
+          allowed: true,
+          scope: "current_account",
+          summary: "Members can bind or detach their own channel identities for the current account.",
+        },
+        workspace_routing: {
+          allowed: isAdmin,
+          scope: "current_tenant_admin",
+          summary: isAdmin
+            ? "Admins and owners can edit workspace routing and BYO credentials for the current tenant."
+            : "Workspace routing and BYO credential edits require admin access in the current tenant.",
+        },
+        workspace_credentials: {
+          allowed: isAdmin,
+          scope: "current_tenant_admin",
+          summary: isAdmin
+            ? "Admins and owners can edit workspace routing and BYO credentials for the current tenant."
+            : "Workspace routing and BYO credential edits require admin access in the current tenant.",
+        },
+        system_channels: {
+          allowed: isOwner,
+          scope: "owner_only",
+          summary: "System channel settings and WeCom remain owner-managed in Platform Admin.",
+        },
+      }
+    )
+  }, [isAdmin, isOwner, roleBoundaries])
+
+  async function loadRoleBoundaries() {
+    try {
+      const payload = await api.get<SecurityBoundariesPayload>("/api/security/boundaries")
+      setRoleBoundaries(payload || null)
+    } catch {
+      setRoleBoundaries(null)
+    }
+  }
 
   async function loadChannels() {
     setLoading(true)
@@ -153,6 +226,7 @@ export function ChannelsWorkspace() {
 
   useEffect(() => {
     loadChannels().catch(() => {})
+    loadRoleBoundaries().catch(() => {})
   }, [])
 
   const runtimeWarning = useMemo(() => {
@@ -388,7 +462,14 @@ export function ChannelsWorkspace() {
               Learn more
             </a>
           </Button>
-          <Button variant="outline" onClick={() => loadChannels().catch(() => {})} disabled={loading}>
+          <Button
+            variant="outline"
+            onClick={() => {
+              loadChannels().catch(() => {})
+              loadRoleBoundaries().catch(() => {})
+            }}
+            disabled={loading}
+          >
             <RefreshCw className="mr-2 h-4 w-4" />
             Refresh
           </Button>
@@ -396,6 +477,50 @@ export function ChannelsWorkspace() {
       </div>
 
       {error && <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">{error}</div>}
+
+      <div className="rounded-lg border bg-muted/20 p-4">
+        <div className="flex items-center gap-2">
+          <div className="font-medium">权限边界</div>
+          <Badge variant={isOwner ? "success" : isAdmin ? "outline" : "secondary"}>
+            {isOwner ? "Owner" : isAdmin ? "Admin" : "Member"}
+          </Badge>
+        </div>
+        <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <div className="rounded-md border bg-card p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">Identity binding</div>
+              <Badge variant={workspaceBoundaries.binding?.allowed ? "success" : "secondary"}>
+                {boundaryScopeLabel(String(workspaceBoundaries.binding?.scope || ""))}
+              </Badge>
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">
+              {String(workspaceBoundaries.binding?.summary || "")}
+            </div>
+          </div>
+          <div className="rounded-md border bg-card p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">Workspace routing</div>
+              <Badge variant={workspaceBoundaries.workspace_routing?.allowed ? "success" : "secondary"}>
+                {boundaryScopeLabel(String(workspaceBoundaries.workspace_routing?.scope || ""))}
+              </Badge>
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">
+              {String(workspaceBoundaries.workspace_routing?.summary || "")}
+            </div>
+          </div>
+          <div className="rounded-md border bg-card p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-sm font-medium">System channels</div>
+              <Badge variant={workspaceBoundaries.system_channels?.allowed ? "success" : "secondary"}>
+                {boundaryScopeLabel(String(workspaceBoundaries.system_channels?.scope || ""))}
+              </Badge>
+            </div>
+            <div className="mt-2 text-sm text-muted-foreground">
+              {String(workspaceBoundaries.system_channels?.summary || "")}
+            </div>
+          </div>
+        </div>
+      </div>
 
       <div className="rounded-lg border bg-card">
         <Table>
@@ -410,7 +535,11 @@ export function ChannelsWorkspace() {
             </TableRow>
           </TableHeader>
           <TableBody>
-            {channels.map((channel) => (
+            {channels.map((channel) => {
+              const canEditWorkspace = Boolean(
+                channel.writable && workspaceBoundaries.workspace_routing?.allowed
+              )
+              return (
               <TableRow key={channel.name}>
                 <TableCell className="font-medium uppercase">{channel.name}</TableCell>
                 <TableCell>
@@ -448,7 +577,15 @@ export function ChannelsWorkspace() {
                         BYO {channel.byo_configured ? "configured" : "not configured"} · runtime {channel.active_in_runtime ? "active" : "inactive"}
                       </div>
                     )}
-                    {!channel.writable && channel.write_block_reason && <div>{channel.write_block_reason}</div>}
+                    {!canEditWorkspace && (
+                      <div>
+                        {String(
+                          channel.write_block_reason ||
+                            workspaceBoundaries.workspace_routing?.summary ||
+                            ""
+                        )}
+                      </div>
+                    )}
                   </div>
                 </TableCell>
                 <TableCell className="text-right">
@@ -462,7 +599,7 @@ export function ChannelsWorkspace() {
                         variant="outline"
                         size="sm"
                         onClick={() => openCredentialsEditor(channel.name)}
-                        disabled={!channel.writable}
+                        disabled={!canEditWorkspace}
                       >
                         <Edit2 className="mr-2 h-4 w-4" />
                         Credentials
@@ -472,7 +609,7 @@ export function ChannelsWorkspace() {
                       variant="outline"
                       size="sm"
                       onClick={() => openEditor(channel.name)}
-                      disabled={!channel.writable}
+                      disabled={!canEditWorkspace}
                     >
                       <Edit2 className="mr-2 h-4 w-4" />
                       Edit
@@ -480,7 +617,7 @@ export function ChannelsWorkspace() {
                   </div>
                 </TableCell>
               </TableRow>
-            ))}
+            )})}
             {!loading && channels.length === 0 && !error && (
               <TableRow>
                 <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">

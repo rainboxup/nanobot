@@ -23,7 +23,11 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.services.channel_routing import evaluate_workspace_channel_routing, normalize_sender_id
+from nanobot.services.channel_routing import (
+    describe_workspace_channel_routing_decision,
+    evaluate_workspace_channel_routing,
+    normalize_sender_id,
+)
 from nanobot.tenants.store import TenantStore
 from nanobot.utils.metrics import METRICS
 
@@ -56,6 +60,8 @@ class AdmitResult:
     accepted: bool
     tenant_id: str = ""
     reason: str = ""
+    reason_summary: str = ""
+    details: dict[str, Any] | None = None
 
 
 class TenantIngressBroker:
@@ -109,10 +115,22 @@ class TenantIngressBroker:
 
         if res.reason:
             METRICS.inc("ingress_reject_total", reason=res.reason)
-            logger.warning(
-                "Ingress rejected message "
-                f"channel={msg.channel} sender={msg.sender_id} reason={res.reason}"
-            )
+            if res.reason_summary or res.details:
+                logger.warning(
+                    "Ingress rejected message channel={} sender={} reason={} summary={} details={}",
+                    msg.channel,
+                    msg.sender_id,
+                    res.reason,
+                    res.reason_summary or "",
+                    res.details or {},
+                )
+            else:
+                logger.warning(
+                    "Ingress rejected message channel={} sender={} reason={}",
+                    msg.channel,
+                    msg.sender_id,
+                    res.reason,
+                )
 
         if res.reason in _SILENT_REJECTION_REASONS:
             return
@@ -210,10 +228,13 @@ class TenantIngressBroker:
             metadata=msg.metadata,
         )
         if not routing_decision.allowed:
+            explainability = describe_workspace_channel_routing_decision(routing_decision)
             return AdmitResult(
                 accepted=False,
                 tenant_id=tenant_id,
                 reason=routing_decision.reason_code or "workspace_channel_denied",
+                reason_summary=str(explainability.get("reason_summary") or ""),
+                details=explainability.get("details"),
             )
 
         # Enforce per-tenant pending limit (counts queued + inflight).
@@ -235,6 +256,9 @@ class TenantIngressBroker:
             msg.metadata["workspace_channel_routing"] = routing_decision.policy.model_dump(
                 exclude_none=True
             )
+        msg.metadata["workspace_channel_routing_explainability"] = (
+            describe_workspace_channel_routing_decision(routing_decision)
+        )
 
         ok = await self.bus.publish_inbound(msg)
         if ok:

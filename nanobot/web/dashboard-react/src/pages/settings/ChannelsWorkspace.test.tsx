@@ -134,14 +134,49 @@ describe("ChannelsWorkspace", () => {
   it("explains that WeCom stays owner-managed in the admin surface", async () => {
     mockedApiGet.mockImplementation(async (path: string) => {
       if (path === "/api/channels/workspace") return [clone(baseChannel)] as any
+      if (path === "/api/security/boundaries") {
+        return {
+          role: "member",
+          surfaces: {
+            workspace_channels: {
+              binding: {
+                allowed: true,
+                scope: "current_account",
+                summary: "Members can bind or detach their own channel identities for the current account.",
+              },
+              workspace_routing: {
+                allowed: false,
+                scope: "current_tenant_admin",
+                summary: "Workspace routing and BYO credential edits require admin access in the current tenant.",
+              },
+              system_channels: {
+                allowed: false,
+                scope: "owner_only",
+                summary: "System channel settings and WeCom remain owner-managed in Platform Admin.",
+              },
+            },
+          },
+        } as any
+      }
       throw new Error(`Unhandled api.get mock for: ${path}`)
     })
 
     render(<ChannelsWorkspace />)
 
     expect(await screen.findByText("Workspace Routing")).toBeInTheDocument()
+    expect(screen.getByText("权限边界")).toBeInTheDocument()
+    expect(
+      screen.getByText("Members can bind or detach their own channel identities for the current account.")
+    ).toBeInTheDocument()
+    expect(
+      screen.getAllByText("Workspace routing and BYO credential edits require admin access in the current tenant.")
+        .length
+    ).toBeGreaterThan(0)
     expect(screen.getByText(/WeCom remains owner-managed/i)).toBeInTheDocument()
-    expect(screen.getByText(/does not support workspace BYO credentials/i)).toBeInTheDocument()
+    expect(screen.getByText("System channel settings and WeCom remain owner-managed in Platform Admin.")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Binding" })).toBeEnabled()
+    expect(screen.getByRole("button", { name: "Credentials" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "Edit" })).toBeDisabled()
   })
 
   it("confirms a verified identity without asking for sender id", async () => {

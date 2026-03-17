@@ -5,7 +5,9 @@ Web/CLI/Channels are thin adapters that call these services.
 
 from nanobot.services.channel_routing import (
     ChannelRoutingDecision,
+    describe_workspace_channel_routing_decision,
     evaluate_workspace_channel_routing,
+    explain_workspace_channel_routing_reason,
 )
 from nanobot.services.config_ownership import (
     ConfigOwnershipService,
@@ -36,7 +38,9 @@ __all__ = [
     "ConfigScope",
     "OwnershipDecision",
     "ChannelRoutingDecision",
+    "describe_workspace_channel_routing_decision",
     "evaluate_workspace_channel_routing",
+    "explain_workspace_channel_routing_reason",
     "PolicyDecision",
     "PolicyEvaluationService",
     "SkillManagementService",

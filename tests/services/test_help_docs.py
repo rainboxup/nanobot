@@ -119,11 +119,39 @@ def test_operator_help_docs_reference_ops_security_and_users_surfaces() -> None:
     config_doc = registry.get_doc("config-ownership")
     assert config_doc is not None
     assert "Settings → Users" in config_doc.markdown
+    assert "Settings → Ops" in config_doc.markdown
+    assert "/api/security/boundaries" in config_doc.markdown
+    assert "WeCom remains owner-managed" in config_doc.markdown
 
     effective_doc = registry.get_doc("effective-policy-and-soul")
     assert effective_doc is not None
     assert "Settings → Security" in effective_doc.markdown
+    assert "Settings → Ops" in effective_doc.markdown
+    assert "/api/ops/runtime" in effective_doc.markdown
+    assert "/api/channels/{name}/routing/explain" in effective_doc.markdown
 
     routing_doc = registry.get_doc("workspace-routing-and-binding")
     assert routing_doc is not None
     assert "Ops" in routing_doc.markdown
+
+
+def test_bundled_operator_help_docs_match_repo_docs_for_security_and_ops_guidance() -> None:
+    registry = HelpDocsRegistry.default()
+    bundled_dir = Path(bundled_help_docs.__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parents[2]
+
+    for slug, repo_path in (
+        ("config-ownership", "docs/architecture/config-ownership.md"),
+        ("effective-policy-and-soul", "docs/howto/effective-policy-and-soul.md"),
+    ):
+        spec = registry.get_spec(slug)
+        assert spec is not None
+
+        bundled_markdown = (bundled_dir / f"{slug}.md").read_text(encoding="utf-8")
+        repo_markdown = (repo_root / repo_path).read_text(encoding="utf-8")
+        assert bundled_markdown == repo_markdown
+
+        doc = registry.get_doc(slug)
+        assert doc is not None
+        assert doc.source.path == repo_path
+        assert doc.markdown == repo_markdown

@@ -357,6 +357,120 @@ def _operator_guide_summaries(app, slugs: tuple[str, ...] = _OPERATOR_GUIDE_SLUG
     return summaries
 
 
+def _queue_pressure_level(utilization: Any) -> str:
+    try:
+        value = float(utilization or 0.0)
+    except Exception:
+        value = 0.0
+    if value >= 0.8:
+        return "high"
+    if value >= 0.5:
+        return "elevated"
+    return "normal"
+
+
+def _ops_channel_rows(channel_manager: Any) -> list[dict[str, Any]]:
+    status = channel_manager.get_status() if channel_manager is not None else {}
+    rows: list[dict[str, Any]] = []
+    for name in sorted(list((status or {}).keys())):
+        row = status.get(name) or {}
+        rows.append(
+            {
+                "name": name,
+                "enabled": bool(row.get("enabled", False)),
+                "running": bool(row.get("running", False)),
+            }
+        )
+    return rows
+
+
+def _ops_workspace_runtime_rows(channel_manager: Any) -> list[dict[str, Any]]:
+    workspace_status = channel_manager.get_workspace_runtime_status() if channel_manager is not None else {}
+    rows: list[dict[str, Any]] = []
+    for channel_name in sorted(list((workspace_status or {}).keys())):
+        for item in list(workspace_status.get(channel_name) or []):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "channel": channel_name,
+                    "tenant_id": str(item.get("tenant_id") or "").strip(),
+                    "running": bool(item.get("running", False)),
+                    "active_in_runtime": bool(item.get("active_in_runtime", False)),
+                }
+            )
+    return rows
+
+
+def _ops_runtime_attention(
+    *,
+    inbound_pressure_level: str,
+    outbound_pressure_level: str,
+    channel_rows: list[dict[str, Any]],
+    workspace_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+
+    if inbound_pressure_level in {"elevated", "high"}:
+        items.append(
+            {
+                "scope": "queue",
+                "level": "warning" if inbound_pressure_level == "high" else "info",
+                "reason_code": f"inbound_queue_pressure_{inbound_pressure_level}",
+                "summary": "Inbound queue pressure is elevated."
+                if inbound_pressure_level == "elevated"
+                else "Inbound queue pressure is high.",
+                "details": {"direction": "inbound", "level": inbound_pressure_level},
+            }
+        )
+
+    if outbound_pressure_level in {"elevated", "high"}:
+        items.append(
+            {
+                "scope": "queue",
+                "level": "warning" if outbound_pressure_level == "high" else "info",
+                "reason_code": f"outbound_queue_pressure_{outbound_pressure_level}",
+                "summary": "Outbound queue pressure is elevated."
+                if outbound_pressure_level == "elevated"
+                else "Outbound queue pressure is high.",
+                "details": {"direction": "outbound", "level": outbound_pressure_level},
+            }
+        )
+
+    for row in channel_rows:
+        if bool(row.get("running", False)):
+            continue
+        items.append(
+            {
+                "scope": "channel",
+                "level": "warning",
+                "reason_code": "channel_registered_not_running",
+                "summary": "Registered channel is not running.",
+                "details": {"channel": row.get("name")},
+            }
+        )
+
+    for row in workspace_rows:
+        if bool(row.get("active_in_runtime", False)):
+            continue
+        items.append(
+            {
+                "scope": "workspace_runtime",
+                "level": "warning",
+                "reason_code": "workspace_runtime_inactive",
+                "summary": "Workspace runtime is configured but not active.",
+                "details": {
+                    "channel": row.get("channel"),
+                    "tenant_id": row.get("tenant_id"),
+                    "running": bool(row.get("running", False)),
+                    "active_in_runtime": bool(row.get("active_in_runtime", False)),
+                },
+            }
+        )
+
+    return items
+
+
 def _build_readiness_payload(app) -> dict[str, Any]:
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode not in {"single", "multi"}:
@@ -594,33 +708,59 @@ def create_app(
         if started_monotonic > 0:
             uptime_seconds = max(0.0, round(time.monotonic() - started_monotonic, 3))
 
+        inbound_utilization = round(inbound_depth / inbound_capacity, 4) if inbound_capacity else 0.0
+        outbound_utilization = round(outbound_depth / outbound_capacity, 4) if outbound_capacity else 0.0
+        inbound_pressure_level = _queue_pressure_level(inbound_utilization)
+        outbound_pressure_level = _queue_pressure_level(outbound_utilization)
+        channel_rows = _ops_channel_rows(channel_manager)
+        workspace_rows = _ops_workspace_runtime_rows(channel_manager)
+        attention = _ops_runtime_attention(
+            inbound_pressure_level=inbound_pressure_level,
+            outbound_pressure_level=outbound_pressure_level,
+            channel_rows=channel_rows,
+            workspace_rows=workspace_rows,
+        )
+
         return {
             **payload,
             "runtime": {
                 "started_at": started_at,
                 "uptime_seconds": uptime_seconds,
+                "summary": {
+                    "registered_channel_count": len(channel_rows),
+                    "running_channel_count": sum(1 for row in channel_rows if row.get("running")),
+                    "workspace_runtime_count": len(workspace_rows),
+                    "workspace_runtime_running_count": sum(
+                        1 for row in workspace_rows if row.get("running")
+                    ),
+                    "workspace_runtime_inactive_count": sum(
+                        1 for row in workspace_rows if not row.get("active_in_runtime")
+                    ),
+                    "active_web_connections": active_web_connections,
+                },
                 "queue": {
                     "inbound_depth": inbound_depth,
                     "inbound_capacity": inbound_capacity,
-                    "inbound_utilization": round(inbound_depth / inbound_capacity, 4)
-                    if inbound_capacity
-                    else 0.0,
+                    "inbound_utilization": inbound_utilization,
+                    "inbound_pressure_level": inbound_pressure_level,
                     "outbound_depth": outbound_depth,
                     "outbound_capacity": outbound_capacity,
-                    "outbound_utilization": round(outbound_depth / outbound_capacity, 4)
-                    if outbound_capacity
-                    else 0.0,
+                    "outbound_utilization": outbound_utilization,
+                    "outbound_pressure_level": outbound_pressure_level,
                 },
                 "channels": {
                     "registered": sorted(list(getattr(channel_manager, "channels", {}).keys()))
                     if channel_manager is not None
                     else [],
                     "status": channel_manager.get_status() if channel_manager is not None else {},
+                    "rows": channel_rows,
                     "workspace_status": channel_manager.get_workspace_runtime_status()
                     if channel_manager is not None
                     else {},
+                    "workspace_rows": workspace_rows,
                     "active_web_connections": active_web_connections,
                 },
+                "attention": attention,
                 "web_session_cache": web_session_cache,
             },
         }

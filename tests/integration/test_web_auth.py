@@ -87,6 +87,105 @@ async def test_auth_me_reports_role_capabilities_and_operator_guides(
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_security_boundaries_describe_owner_admin_member_scope(
+    http_client, auth_headers, auth_headers_for
+) -> None:
+    owner = await http_client.get("/api/security/boundaries", headers=auth_headers)
+    assert owner.status_code == 200
+    owner_body = owner.json()
+    assert owner_body.get("role") == "owner"
+    assert owner_body.get("surfaces", {}).get("users", {}).get("create_users") == {
+        "allowed": True,
+        "scope": "any_tenant",
+        "summary": "Owners can create users in any tenant and may create owner accounts.",
+    }
+    assert owner_body.get("surfaces", {}).get("users", {}).get("change_roles") == {
+        "allowed": True,
+        "scope": "owner_only",
+        "summary": "Only owners can change roles, including promoting admins or owners.",
+    }
+    assert owner_body.get("surfaces", {}).get("workspace_channels", {}).get("system_channels") == {
+        "allowed": True,
+        "scope": "owner_only",
+        "summary": "System channel settings and WeCom remain owner-managed in Platform Admin.",
+    }
+    assert owner_body.get("surfaces", {}).get("ops", {}).get("runtime_snapshot", {}).get(
+        "allowed"
+    ) is True
+    assert owner_body.get("surfaces", {}).get("security", {}).get("login_locks", {}).get(
+        "allowed"
+    ) is True
+
+    admin_headers = await auth_headers_for("pilot-admin", role="admin", tenant_id="pilot-tenant")
+    admin = await http_client.get("/api/security/boundaries", headers=admin_headers)
+    assert admin.status_code == 200
+    admin_body = admin.json()
+    assert admin_body.get("role") == "admin"
+    assert admin_body.get("surfaces", {}).get("users", {}).get("create_users") == {
+        "allowed": True,
+        "scope": "current_tenant",
+        "summary": "Admins can create member/admin users only in the current tenant.",
+    }
+    assert admin_body.get("surfaces", {}).get("users", {}).get("change_roles") == {
+        "allowed": False,
+        "scope": "owner_only",
+        "summary": "Only owners can change roles, including promoting admins or owners.",
+    }
+    assert admin_body.get("surfaces", {}).get("users", {}).get("manage_lifecycle") == {
+        "allowed": True,
+        "scope": "current_tenant_members",
+        "summary": "Admins can reset passwords, revoke sessions, disable, or delete member users in the current tenant.",
+    }
+    assert admin_body.get("surfaces", {}).get("workspace_channels", {}).get("binding", {}).get(
+        "allowed"
+    ) is True
+    assert admin_body.get("surfaces", {}).get("workspace_channels", {}).get(
+        "workspace_routing"
+    ) == {
+        "allowed": True,
+        "scope": "current_tenant_admin",
+        "summary": "Admins and owners can edit workspace routing and BYO credentials for the current tenant.",
+    }
+    assert admin_body.get("surfaces", {}).get("workspace_channels", {}).get("system_channels") == {
+        "allowed": False,
+        "scope": "owner_only",
+        "summary": "System channel settings and WeCom remain owner-managed in Platform Admin.",
+    }
+    assert admin_body.get("surfaces", {}).get("ops", {}).get("runtime_snapshot", {}).get(
+        "allowed"
+    ) is False
+    assert admin_body.get("surfaces", {}).get("security", {}).get("login_locks", {}).get(
+        "allowed"
+    ) is False
+
+    member_headers = await auth_headers_for("pilot-member", role="member", tenant_id="pilot-tenant")
+    member = await http_client.get("/api/security/boundaries", headers=member_headers)
+    assert member.status_code == 200
+    member_body = member.json()
+    assert member_body.get("role") == "member"
+    assert member_body.get("surfaces", {}).get("users", {}).get("page_allowed") is False
+    assert member_body.get("surfaces", {}).get("users", {}).get("create_users", {}).get(
+        "allowed"
+    ) is False
+    assert member_body.get("surfaces", {}).get("users", {}).get("manage_lifecycle", {}).get(
+        "allowed"
+    ) is False
+    assert member_body.get("surfaces", {}).get("workspace_channels", {}).get("binding") == {
+        "allowed": True,
+        "scope": "current_account",
+        "summary": "Members can bind or detach their own channel identities for the current account.",
+    }
+    assert member_body.get("surfaces", {}).get("workspace_channels", {}).get(
+        "workspace_routing"
+    ) == {
+        "allowed": False,
+        "scope": "current_tenant_admin",
+        "summary": "Workspace routing and BYO credential edits require admin access in the current tenant.",
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_login_failure(http_client) -> None:
     r = await http_client.post(
         "/api/auth/login",

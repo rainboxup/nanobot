@@ -32,12 +32,20 @@
 - **Settings → Channels → Workspace Routing（工作区级）**
   - 改：`workspace.channels.feishu|dingtalk.*`
   - 特点：**立即生效**；只负责“能否进入当前 workspace”，不会改变系统连接本身
+  - 绑定与排障：
+    - workspace 成员可以做当前账号的 identity binding
+    - workspace admin / owner 才能修改 routing 与 BYO credentials
+    - 支持侧可用 `POST /api/channels/{name}/routing/explain` 查看 `reason_code` / `reason_summary` / `details`
+- **Settings → Ops**
+  - 看：owner 侧运行时快照（`/api/ops/runtime`）
+  - 特点：只展示事实型信号：registered/running channels、workspace runtimes、queue pressure、active web connections、attention items
 - **Settings → Users**
   - 改：用户、角色、会话生命周期（按角色/租户范围收敛）
   - 特点：Owner 可管理全部租户；Admin 仅能管理自己租户下的 member 用户
 - **Settings → Security**
   - 看：登录锁定、审计事件、保留策略
   - 特点：这是 Owner 视角的运维/审计面板，不用于修改租户业务配置
+  - 角色边界可通过 `GET /api/security/boundaries` 或 dashboard 中的“权限边界”卡片查看
 - **Settings → Providers / Tools Policy / Soul（工作区级）**
   - 改：`providers.*`, `tools.*`, `agents.*` 等
   - 特点：立即生效；提供 Effective/Reason codes 解释入口
@@ -45,8 +53,26 @@
 聊天命令（工作区级/会话级）：
 
 - `!whoami`：查看当前 tenant/workspace 与已绑定身份（用于排障/配置 allowlist）
-- `!link` / `!link <CODE>`：跨身份绑定到同一 workspace（请务必私聊/DM 使用）
+- `!link` / `!link <CODE>`：跨身份绑定到同一 workspace（请务必私聊/DM 使用；当前保留为兼容路径）
 - `!apikey set ...` / `!model set ...`：写入工作区配置
+
+---
+
+## 2.1) Pilot 讲解时最常用的角色边界
+
+| Surface | Owner | Admin | Member |
+|---|---|---|---|
+| Users | 可创建任意租户用户；可调角色；可管理除自己外任意账号生命周期 | 仅能在当前租户创建 member/admin；仅能管理当前租户 member 生命周期 | 不可进入 |
+| Workspace Routing / BYO | 可改 | 可改（当前租户） | 只读 |
+| Workspace Binding | 可用 | 可用 | 可用（仅当前账号） |
+| Ops | 可看 | 不可看 | 不可看 |
+| Security / Audit | 可看可操作 | 不可看 | 不可看 |
+
+补充说明：
+
+- **WeCom remains owner-managed in Platform Admin.**
+- WeCom 当前仍是 **system-scoped MVP**，不承诺 workspace BYO / workspace routing。
+- 对 pilot / 销售演示，优先展示 dashboard 里的“权限边界”与 owner/admin/member 的差异，不要把它描述成完整企业 IAM。
 
 ---
 

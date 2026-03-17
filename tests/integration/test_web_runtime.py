@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from nanobot.bus.events import OutboundMessage
@@ -224,6 +226,60 @@ async def test_web_ops_runtime_endpoint_lists_web_only_workspace_tenant_configs(
     assert channels.get("workspace_status") == {
         "feishu": [{"tenant_id": tenant_id, "running": False, "active_in_runtime": False}]
     }
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_web_ops_runtime_endpoint_exposes_operator_summary_and_attention(
+    http_client, auth_headers, web_ctx
+) -> None:
+    tenant_id = "tenant-ops-attention"
+    web_ctx.tenant_store.ensure_tenant_files(tenant_id)
+    cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    cfg.workspace.channels.feishu.app_id = "tenant-app"
+    cfg.workspace.channels.feishu.app_secret = "tenant-secret"
+    web_ctx.tenant_store.save_tenant_config(tenant_id, cfg)
+
+    response = await http_client.get("/api/ops/runtime", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    runtime = body.get("runtime") or {}
+    summary = runtime.get("summary") or {}
+    assert int(summary.get("registered_channel_count") or 0) >= 1
+    assert int(summary.get("running_channel_count") or 0) >= 1
+    assert int(summary.get("workspace_runtime_count") or 0) >= 1
+    assert int(summary.get("workspace_runtime_inactive_count") or 0) >= 1
+    assert int(summary.get("active_web_connections") or 0) >= 0
+
+    queue = runtime.get("queue") or {}
+    assert str(queue.get("inbound_pressure_level") or "") in {"normal", "elevated", "high"}
+    assert str(queue.get("outbound_pressure_level") or "") in {"normal", "elevated", "high"}
+
+    channels = runtime.get("channels") or {}
+    rows = list(channels.get("rows") or [])
+    assert any(row.get("name") == "web" for row in rows)
+    workspace_rows = list(channels.get("workspace_rows") or [])
+    assert any(
+        row.get("channel") == "feishu" and row.get("tenant_id") == tenant_id for row in workspace_rows
+    )
+
+    attention = list(runtime.get("attention") or [])
+    inactive = next(
+        (item for item in attention if item.get("reason_code") == "workspace_runtime_inactive"),
+        None,
+    )
+    assert inactive is not None
+    assert inactive.get("summary") == "Workspace runtime is configured but not active."
+    assert inactive.get("details") == {
+        "channel": "feishu",
+        "tenant_id": tenant_id,
+        "running": False,
+        "active_in_runtime": False,
+    }
+
+    payload_text = json.dumps(body, ensure_ascii=False)
+    assert "tenant-secret" not in payload_text
+    assert "app_secret" not in payload_text
 
 
 @pytest.mark.integration

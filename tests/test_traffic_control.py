@@ -324,6 +324,56 @@ async def test_tenant_ingress_broker_attaches_workspace_routing_metadata_when_al
     assert inbound.metadata.get("tenant_id") == tenant_id
     assert inbound.metadata.get("canonical_sender_id") == "alice"
     assert isinstance(inbound.metadata.get("workspace_channel_routing"), dict)
+    explainability = inbound.metadata.get("workspace_channel_routing_explainability")
+    assert explainability == {
+        "allowed": True,
+        "reason_code": "group_mention_satisfied",
+        "reason_summary": "Group message allowed because the bot mention requirement was satisfied.",
+        "details": {
+            "channel_name": channel_name,
+            "sender_id": "alice",
+            "group_id": "group-1",
+            "message_type": "group",
+            "group_policy": "mention",
+            "allow_from_count": 0,
+            "group_allow_from_count": 0,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_tenant_ingress_broker_returns_workspace_routing_explainability_for_denial(
+    tmp_path,
+) -> None:
+    cfg = Config()
+    cfg.channels.feishu.enabled = True
+    bus = MessageBus()
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=cfg)
+    lock = asyncio.Lock()
+    broker = TenantIngressBroker(bus=bus, store=store, store_lock=lock)
+
+    tenant_id = store.ensure_tenant("feishu", "alice")
+    tenant_cfg = store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.channels.feishu.allow_from = ["bob"]
+    store.save_tenant_config(tenant_id, tenant_cfg)
+
+    result = await broker._admit(
+        InboundMessage(channel="feishu", sender_id="alice", chat_id="c-1", content="hello")
+    )
+
+    assert result.accepted is False
+    assert result.tenant_id == tenant_id
+    assert result.reason == "sender_not_allowlisted"
+    assert result.reason_summary == "Sender is outside the workspace allowlist."
+    assert result.details == {
+        "channel_name": "feishu",
+        "sender_id": "alice",
+        "group_id": None,
+        "message_type": "private",
+        "group_policy": "mention",
+        "allow_from_count": 1,
+        "group_allow_from_count": 0,
+    }
 
 
 @pytest.mark.asyncio

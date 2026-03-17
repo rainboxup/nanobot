@@ -284,9 +284,10 @@ def try_handle(
             handled=True,
             reply=(
                 "🐈 nanobot 多租户命令：\n"
-                "- !whoami  查看你的租户信息\n"
-                "- !link  生成绑定码（用于跨 Telegram/Discord/飞书/WhatsApp 绑定同一助理）\n"
-                "- !link <CODE>  使用绑定码完成绑定\n"
+                "- 推荐绑定：优先在 Dashboard → Settings → Channels → Workspace Routing → Binding 发起验证\n"
+                "- !whoami  查看你的租户信息与已绑定身份（排障/兼容迁移）\n"
+                "- !link  兼容路径：生成绑定码（用于跨 Telegram/Discord/飞书/WhatsApp 绑定同一助理）\n"
+                "- !link <CODE>  兼容路径：使用绑定码完成绑定\n"
                 "- !apikey set <provider> <key>  设置你的 LLM API Key（仅建议私聊使用）\n"
                 "- !apikey status  查看已配置的 provider（脱敏）\n"
                 "- !model set <model>  设置默认模型（例如 anthropic/claude-sonnet-4-5）\n"
@@ -305,7 +306,10 @@ def try_handle(
                 f"tenant_id: {tenant.tenant_id}\n"
                 f"workspace: {tenant.workspace}\n"
                 "linked identities:\n"
-                f"{ids_text}"
+                f"{ids_text}\n\n"
+                "推荐绑定：请优先在 Dashboard → Settings → Channels → Workspace Routing → Binding 发起验证。\n"
+                "兼容路径：私聊/DM 中仍可使用 !link 与 !link <CODE>。\n"
+                "排障提示：如需再次检查当前归属与已绑定身份，可继续使用 !whoami。"
             ),
         )
 
@@ -320,10 +324,13 @@ def try_handle(
             return CommandResult(
                 handled=True,
                 reply=(
-                    "🔗 绑定码已生成（10 分钟内有效，一次性使用）：\n"
+                    "🔗 兼容绑定码已生成（10 分钟内有效，一次性使用）：\n"
                     f"{code}\n\n"
-                    "在另一个平台/账号里对机器人发送：\n"
-                    f"!link {code}"
+                    "推荐：优先在 Dashboard → Settings → Channels → Workspace Routing → Binding 发起验证，"
+                    "再在目标私聊/DM 中使用 !prove <CODE>。\n"
+                    "兼容回退：命令模板为 !link <CODE>；在另一个平台/账号里对机器人发送：\n"
+                    f"!link {code}\n\n"
+                    "完成后可用 !whoami 检查 tenant_id 与 linked identities。"
                 ),
             )
 
@@ -341,9 +348,10 @@ def try_handle(
         return CommandResult(
             handled=True,
             reply=(
-                "✅ 已完成绑定。\n"
+                "✅ 已完成兼容绑定。\n"
                 f"当前身份已绑定到 tenant_id: {target.tenant_id}\n"
-                "提示：绑定后会共享记忆与技能（会话历史按身份隔离）。"
+                "推荐：后续新绑定优先使用 Dashboard challenge-first 流程；!link 仍保留兼容。\n"
+                "提示：绑定后会共享记忆与技能（会话历史按身份隔离）。可用 !whoami 查看当前绑定状态。"
             ),
         )
 

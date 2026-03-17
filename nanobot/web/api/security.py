@@ -10,8 +10,11 @@ from pydantic import BaseModel, Field
 from nanobot.web.audit import AuditLogger, request_ip
 from nanobot.web.auth import get_current_user, require_min_role
 from nanobot.web.login_guard import LoginAttemptGuard
+from nanobot.web.user_store import ROLE_MEMBER, ROLE_OWNER
 
 router = APIRouter()
+
+_ROLE_HELP_SLUGS = ("config-ownership", "effective-policy-and-soul")
 
 
 def _get_login_guard(app) -> LoginAttemptGuard:
@@ -79,6 +82,113 @@ def _match_lock_item(
     return True
 
 
+def _role_capabilities(role: str | None) -> dict[str, bool]:
+    normalized = str(role or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+    is_owner = normalized == ROLE_OWNER
+    is_admin = normalized in {ROLE_OWNER, "admin"}
+    return {
+        "can_view_ops": is_owner,
+        "can_manage_security": is_owner,
+        "can_manage_users": is_admin,
+    }
+
+
+def _boundary_rule(*, allowed: bool, scope: str, summary: str) -> dict[str, Any]:
+    return {
+        "allowed": bool(allowed),
+        "scope": str(scope or "").strip(),
+        "summary": str(summary or "").strip(),
+    }
+
+
+def _role_boundaries_payload(user: dict[str, Any]) -> dict[str, Any]:
+    role = str((user or {}).get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+    is_owner = role == ROLE_OWNER
+    is_admin = role in {ROLE_OWNER, "admin"}
+    return {
+        "role": role,
+        "help_slugs": list(_ROLE_HELP_SLUGS),
+        "capabilities": _role_capabilities(role),
+        "surfaces": {
+            "users": {
+                "page_allowed": is_admin,
+                "create_users": _boundary_rule(
+                    allowed=is_admin,
+                    scope="any_tenant" if is_owner else "current_tenant",
+                    summary=(
+                        "Owners can create users in any tenant and may create owner accounts."
+                        if is_owner
+                        else "Admins can create member/admin users only in the current tenant."
+                        if is_admin
+                        else "Members cannot create users."
+                    ),
+                ),
+                "change_roles": _boundary_rule(
+                    allowed=is_owner,
+                    scope="owner_only",
+                    summary="Only owners can change roles, including promoting admins or owners.",
+                ),
+                "manage_lifecycle": _boundary_rule(
+                    allowed=is_admin,
+                    scope="any_tenant_except_self" if is_owner else "current_tenant_members",
+                    summary=(
+                        "Owners can reset passwords, revoke sessions, disable, or delete any other user."
+                        if is_owner
+                        else "Admins can reset passwords, revoke sessions, disable, or delete member users in the current tenant."
+                        if is_admin
+                        else "Members cannot manage other users."
+                    ),
+                ),
+            },
+            "workspace_channels": {
+                "page_allowed": True,
+                "binding": _boundary_rule(
+                    allowed=True,
+                    scope="current_account",
+                    summary="Members can bind or detach their own channel identities for the current account.",
+                ),
+                "workspace_routing": _boundary_rule(
+                    allowed=is_admin,
+                    scope="current_tenant_admin",
+                    summary=(
+                        "Admins and owners can edit workspace routing and BYO credentials for the current tenant."
+                        if is_admin
+                        else "Workspace routing and BYO credential edits require admin access in the current tenant."
+                    ),
+                ),
+                "workspace_credentials": _boundary_rule(
+                    allowed=is_admin,
+                    scope="current_tenant_admin",
+                    summary=(
+                        "Admins and owners can edit workspace routing and BYO credentials for the current tenant."
+                        if is_admin
+                        else "Workspace routing and BYO credential edits require admin access in the current tenant."
+                    ),
+                ),
+                "system_channels": _boundary_rule(
+                    allowed=is_owner,
+                    scope="owner_only",
+                    summary="System channel settings and WeCom remain owner-managed in Platform Admin.",
+                ),
+            },
+            "ops": {
+                "runtime_snapshot": _boundary_rule(
+                    allowed=is_owner,
+                    scope="owner_only",
+                    summary="Ops runtime snapshots are restricted to owners.",
+                ),
+            },
+            "security": {
+                "login_locks": _boundary_rule(
+                    allowed=is_owner,
+                    scope="owner_only",
+                    summary="Login lock and security audit controls are restricted to owners.",
+                ),
+            },
+        },
+    }
+
+
 class UnlockRequest(BaseModel):
     subject_key: str = Field(min_length=1, max_length=512)
     reason: str = Field(min_length=1, max_length=256)
@@ -87,6 +197,13 @@ class UnlockRequest(BaseModel):
 class UnlockBatchRequest(BaseModel):
     subject_keys: list[str] = Field(min_length=1, max_length=100)
     reason: str = Field(min_length=1, max_length=256)
+
+
+@router.get("/api/security/boundaries")
+async def get_security_boundaries(
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    return _role_boundaries_payload(user)
 
 
 @router.get("/api/security/login-locks")

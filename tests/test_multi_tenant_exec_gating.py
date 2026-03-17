@@ -581,6 +581,20 @@ async def test_process_inbound_allows_when_workspace_routing_allows(
     assert msg.metadata.get("tenant_id") == tenant_id
     assert msg.metadata.get("canonical_sender_id") == "alice"
     assert isinstance(msg.metadata.get("workspace_channel_routing"), dict)
+    assert msg.metadata.get("workspace_channel_routing_explainability") == {
+        "allowed": True,
+        "reason_code": "group_mention_satisfied",
+        "reason_summary": "Group message allowed because the bot mention requirement was satisfied.",
+        "details": {
+            "channel_name": channel_name,
+            "sender_id": "alice",
+            "group_id": "group-1",
+            "message_type": "group",
+            "group_policy": "mention",
+            "allow_from_count": 0,
+            "group_allow_from_count": 0,
+        },
+    }
 
 
 @pytest.mark.asyncio

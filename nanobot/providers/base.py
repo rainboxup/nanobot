@@ -42,11 +42,7 @@ class LLMProvider(ABC):
 
     @staticmethod
     def _sanitize_empty_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Replace empty text content that causes provider 400 errors.
-
-        Empty content can appear when MCP tools return nothing. Most providers
-        reject empty-string content or empty text blocks in list content.
-        """
+        """Replace empty text content and strip internal metadata before provider calls."""
         result: list[dict[str, Any]] = []
         for msg in messages:
             content = msg.get("content")
@@ -58,18 +54,25 @@ class LLMProvider(ABC):
                 continue
 
             if isinstance(content, list):
-                filtered = [
-                    item for item in content
-                    if not (
+                cleaned_items: list[Any] = []
+                changed = False
+                for item in content:
+                    if (
                         isinstance(item, dict)
                         and item.get("type") in ("text", "input_text", "output_text")
                         and not item.get("text")
-                    )
-                ]
-                if len(filtered) != len(content):
+                    ):
+                        changed = True
+                        continue
+                    if isinstance(item, dict) and "_meta" in item:
+                        cleaned_items.append({k: v for k, v in item.items() if k != "_meta"})
+                        changed = True
+                    else:
+                        cleaned_items.append(item)
+                if changed:
                     clean = dict(msg)
-                    if filtered:
-                        clean["content"] = filtered
+                    if cleaned_items:
+                        clean["content"] = cleaned_items
                     elif msg.get("role") == "assistant" and msg.get("tool_calls"):
                         clean["content"] = None
                     else:

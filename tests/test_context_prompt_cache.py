@@ -79,6 +79,34 @@ def test_runtime_context_is_separate_untrusted_user_message(tmp_path) -> None:
     assert messages[-1]["content"] == "Return exactly: OK"
 
 
+def test_multimodal_messages_preserve_image_path_metadata(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    builder = ContextBuilder(workspace)
+    image_path = workspace / "demo.png"
+    image_path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        b"\x00\x00\x00\rIHDR"
+        b"\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00"
+        b"\x90wS\xde"
+        b"\x00\x00\x00\x0cIDATx\x9cc``\x00\x00\x00\x02\x00\x01"
+        b"\xe2!\xbc3"
+        b"\x00\x00\x00\x00IEND\xaeB`\x82"
+    )
+
+    messages = builder.build_messages(
+        history=[],
+        current_message="describe image",
+        media=[str(image_path)],
+        channel="cli",
+        chat_id="direct",
+    )
+
+    content = messages[-1]["content"]
+    assert isinstance(content, list)
+    assert content[0]["type"] == "image_url"
+    assert content[0]["_meta"]["path"] == str(image_path)
+
+
 def test_web_messages_use_tenant_scoped_memory_context(tmp_path) -> None:
     workspace = _make_workspace(tmp_path)
 

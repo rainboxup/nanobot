@@ -269,3 +269,62 @@ class TestMemoryConsolidationTypeHandling:
 
         assert result is True
         provider.chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_forces_save_memory_tool_choice_first(self, tmp_path: Path) -> None:
+        """Consolidation should first require the save_memory function explicitly."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="[2026-01-01] User discussed testing.",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is True
+        kwargs = provider.chat.await_args.kwargs
+        assert kwargs["tool_choice"] == {
+            "type": "function",
+            "function": {"name": "save_memory"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_falls_back_to_auto_when_provider_rejects_forced_choice(
+        self, tmp_path: Path
+    ) -> None:
+        """If forced tool_choice is rejected, retry once with auto."""
+        store = MemoryStore(tmp_path)
+        error_resp = LLMResponse(
+            content=(
+                "Error calling LLM: litellm.BadRequestError: "
+                "The tool_choice parameter does not support being set to required or object"
+            ),
+            finish_reason="error",
+            tool_calls=[],
+        )
+        ok_resp = _make_tool_response(
+            history_entry="[2026-01-01] Fallback worked.",
+            memory_update="# Memory\nFallback OK.",
+        )
+
+        call_log: list[dict] = []
+
+        async def _tracking_chat(**kwargs):
+            call_log.append(kwargs)
+            return error_resp if len(call_log) == 1 else ok_resp
+
+        provider = AsyncMock()
+        provider.chat = AsyncMock(side_effect=_tracking_chat)
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is True
+        assert len(call_log) == 2
+        assert isinstance(call_log[0]["tool_choice"], dict)
+        assert call_log[1]["tool_choice"] == "auto"
+        assert "Fallback worked." in store.history_file.read_text()

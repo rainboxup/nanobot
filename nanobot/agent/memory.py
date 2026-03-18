@@ -41,6 +41,13 @@ _SAVE_MEMORY_TOOL = [
     }
 ]
 
+_TOOL_CHOICE_ERROR_MARKERS = (
+    "tool_choice",
+    "toolchoice",
+    "does not support",
+    'should be ["none", "auto"]',
+)
+
 
 class MemoryStore:
     """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
@@ -65,6 +72,12 @@ class MemoryStore:
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
+
+    @staticmethod
+    def _is_tool_choice_unsupported(content: str | None) -> bool:
+        """Detect provider errors caused by forced tool_choice being unsupported."""
+        text = (content or "").lower()
+        return any(marker in text for marker in _TOOL_CHOICE_ERROR_MARKERS)
 
     async def consolidate(
         self,
@@ -112,19 +125,40 @@ class MemoryStore:
 
 ## Conversation to Process
 {chr(10).join(lines)}"""
+        chat_messages = [
+            {
+                "role": "system",
+                "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation.",
+            },
+            {"role": "user", "content": prompt},
+        ]
 
         try:
+            forced_tool_choice = {"type": "function", "function": {"name": "save_memory"}}
             response = await provider.chat(
-                messages=[
-                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=chat_messages,
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
                 temperature=self._resolve_temperature(temperature),
                 max_tokens=max_tokens or 4096,
                 reasoning_effort=reasoning_effort,
+                tool_choice=forced_tool_choice,
             )
+
+            if (
+                response.finish_reason == "error"
+                and self._is_tool_choice_unsupported(response.content)
+            ):
+                logger.warning("Forced tool_choice unsupported, retrying with auto")
+                response = await provider.chat(
+                    messages=chat_messages,
+                    tools=_SAVE_MEMORY_TOOL,
+                    model=model,
+                    temperature=self._resolve_temperature(temperature),
+                    max_tokens=max_tokens or 4096,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice="auto",
+                )
 
             if not response.has_tool_calls:
                 logger.warning("Memory consolidation: LLM did not call save_memory, skipping")

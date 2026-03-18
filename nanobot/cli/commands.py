@@ -216,7 +216,9 @@ def onboard(
     # Create workspace
     workspace = get_workspace_path(config.workspace_path)
     workspace_existed = workspace.exists()
-    workspace_had_content = workspace_existed and any(workspace.iterdir()) if workspace_existed else False
+    workspace_had_content = (
+        workspace_existed and any(workspace.iterdir()) if workspace_existed else False
+    )
     if not workspace_existed:
         workspace.mkdir(parents=True, exist_ok=True)
         console.print(f"{_ok_text()} Created workspace at {workspace}")
@@ -332,6 +334,7 @@ def _make_provider(config):
         provider_name=provider_name,
     )
 
+
 def _compute_exec_whitelist(config) -> set[str]:
     """Merge exec whitelist from env and config (MVP policy source of truth)."""
     from nanobot.utils.whitelist import parse_str_list, to_set
@@ -382,7 +385,6 @@ def _emit_provider_health_warning(provider_name: str | None, api_base: str | Non
     )
     console.print(f"[bold yellow]WARNING:[/bold yellow] {warning}")
     logger.warning(warning)
-
 
 
 # ============================================================================
@@ -465,14 +467,15 @@ def _gateway_impl(
         )
         METRICS.set_gauge("runsc_runtime_check_ok", 1 if runtime_ok else 0)
         if exec_runtime_required and not runtime_ok:
-            console.print("[red]Error: required sandbox runtime is unavailable in multi-tenant mode.[/red]")
+            console.print(
+                "[red]Error: required sandbox runtime is unavailable in multi-tenant mode.[/red]"
+            )
             console.print(f"[red]{runtime_error}[/red]")
             raise typer.Exit(1)
         if not exec_runtime_required:
             logger.info(
                 "runtime_check_skipped: exec whitelist is empty; sandbox runtime check not required"
             )
-
 
         store = TenantStore()
         store_lock = asyncio.Lock()
@@ -621,6 +624,7 @@ def _gateway_impl(
         web_config=config.tools.web,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
+        input_limits=config.tools.input_limits,
         cron_service=cron,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         session_manager=session_manager,
@@ -712,7 +716,9 @@ def _gateway_impl(
         channel, chat_id = _pick_heartbeat_target()
         if channel == "cli":
             return
-        await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
+        await bus.publish_outbound(
+            OutboundMessage(channel=channel, chat_id=chat_id, content=response)
+        )
 
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
@@ -911,6 +917,7 @@ def _agent_impl(*, message: str | None, session_id: str, workspace: str | None) 
         web_config=config.tools.web,
         exec_config=config.tools.exec,
         filesystem_config=config.tools.filesystem,
+        input_limits=config.tools.input_limits,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         managed_skills_dir=get_skill_store_dir(),
@@ -1129,7 +1136,9 @@ def cron_add(
     message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
     every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
     cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
-    tz: str = typer.Option(None, "--tz", help="Timezone for --cron (IANA, e.g. 'America/Vancouver')"),
+    tz: str = typer.Option(
+        None, "--tz", help="Timezone for --cron (IANA, e.g. 'America/Vancouver')"
+    ),
     at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
     deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
     to: str = typer.Option(None, "--to", help="Recipient for delivery"),
@@ -1260,12 +1269,8 @@ def status():
 
     console.print(f"{_cli_brand()} Status\n")
 
-    console.print(
-        f"Config: {config_path} {_ok_text() if config_path.exists() else _fail_text()}"
-    )
-    console.print(
-        f"Workspace: {workspace} {_ok_text() if workspace.exists() else _fail_text()}"
-    )
+    console.print(f"Config: {config_path} {_ok_text() if config_path.exists() else _fail_text()}")
+    console.print(f"Workspace: {workspace} {_ok_text() if workspace.exists() else _fail_text()}")
 
     if config_path.exists():
         from nanobot.providers.registry import PROVIDERS
@@ -1285,9 +1290,7 @@ def status():
                     console.print(f"{spec.label}: [dim]not set[/dim]")
             else:
                 has_key = bool(p.api_key)
-                console.print(
-                    f"{spec.label}: {_ok_text() if has_key else '[dim]not set[/dim]'}"
-                )
+                console.print(f"{spec.label}: {_ok_text() if has_key else '[dim]not set[/dim]'}")
 
 
 if __name__ == "__main__":

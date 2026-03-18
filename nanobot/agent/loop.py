@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         ChannelsConfig,
         ExecToolConfig,
         FilesystemToolConfig,
+        InputLimitsConfig,
         WebToolsConfig,
     )
     from nanobot.cron.service import CronService
@@ -91,6 +92,7 @@ class AgentLoop:
         web_config: WebToolsConfig | None = None,
         exec_config: ExecToolConfig | None = None,
         filesystem_config: FilesystemToolConfig | None = None,
+        input_limits: InputLimitsConfig | None = None,
         cron_service: CronService | None = None,
         restrict_to_workspace: bool = False,
         session_manager: SessionManager | None = None,
@@ -100,7 +102,12 @@ class AgentLoop:
         enable_exec: bool = True,
         managed_skills_dir: Path | None = None,
     ):
-        from nanobot.config.schema import ExecToolConfig, FilesystemToolConfig, WebToolsConfig
+        from nanobot.config.schema import (
+            ExecToolConfig,
+            FilesystemToolConfig,
+            InputLimitsConfig,
+            WebToolsConfig,
+        )
 
         self.bus = bus
         self.channels_config = channels_config
@@ -116,6 +123,7 @@ class AgentLoop:
         self.web_config = web_config or WebToolsConfig()
         self.exec_config = exec_config or ExecToolConfig()
         self.filesystem_config = filesystem_config or FilesystemToolConfig()
+        self.input_limits = input_limits or InputLimitsConfig()
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self.enable_spawn = enable_spawn
@@ -132,6 +140,7 @@ class AgentLoop:
             platform_base_soul_path=platform_base_soul_path,
             platform_base_soul_content=platform_base_soul_content,
             managed_skills_dir=self.managed_skills_dir,
+            input_limits=self.input_limits,
         )
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()

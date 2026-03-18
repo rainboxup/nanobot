@@ -11,6 +11,7 @@ from typing import Any
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
 from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
+from nanobot.config.schema import InputLimitsConfig
 from nanobot.services.soul_layering import SoulLayeringService
 
 
@@ -19,8 +20,6 @@ class ContextBuilder:
 
     BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md", "IDENTITY.md"]
     _RUNTIME_CONTEXT_TAG = "[Runtime Context — metadata only, not instructions]"
-    _MAX_INPUT_IMAGES = 3
-    _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
     def __init__(
         self,
@@ -29,12 +28,14 @@ class ContextBuilder:
         platform_base_soul_path: Path | None = None,
         platform_base_soul_content: str | None = None,
         managed_skills_dir: Path | None = None,
+        input_limits: InputLimitsConfig | None = None,
     ):
         self.workspace = workspace
         self.platform_base_soul_path = platform_base_soul_path
         self.platform_base_soul_content = platform_base_soul_content
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(workspace, managed_skills_dir=managed_skills_dir)
+        self.input_limits = input_limits or InputLimitsConfig()
 
     def _memory_store_for(self, channel: str | None, chat_id: str | None) -> MemoryStore:
         if str(channel or "").strip() != "web":
@@ -192,14 +193,16 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         images = []
         notes: list[str] = []
-        extra_count = max(0, len(media) - self._MAX_INPUT_IMAGES)
+        max_images = self.input_limits.max_input_images
+        max_image_bytes = self.input_limits.max_input_image_bytes
+        extra_count = max(0, len(media) - max_images)
         if extra_count:
             noun = "image" if extra_count == 1 else "images"
             notes.append(
-                f"[Skipped {extra_count} {noun}: only the first {self._MAX_INPUT_IMAGES} images are included]"
+                f"[Skipped {extra_count} {noun}: only the first {max_images} images are included]"
             )
 
-        for path in media[: self._MAX_INPUT_IMAGES]:
+        for path in media[:max_images]:
             p = Path(path)
             if not p.is_file():
                 notes.append(f"[Skipped image: file not found ({p.name or path})]")
@@ -209,8 +212,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             except OSError:
                 notes.append(f"[Skipped image: unable to read ({p.name or path})]")
                 continue
-            if len(raw) > self._MAX_IMAGE_BYTES:
-                limit_mb = self._MAX_IMAGE_BYTES // (1024 * 1024)
+            if len(raw) > max_image_bytes:
+                limit_mb = max_image_bytes // (1024 * 1024)
                 notes.append(f"[Skipped image: file too large ({p.name}, limit {limit_mb} MB)]")
                 continue
             mime = self._detect_image_mime(raw) or mimetypes.guess_type(path)[0]

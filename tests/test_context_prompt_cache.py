@@ -13,6 +13,7 @@ from nanobot.agent.context import ContextBuilder
 from nanobot.agent.loop import AgentLoop
 from nanobot.bus.events import InboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import InputLimitsConfig
 from nanobot.providers.base import LLMResponse, ToolCallRequest
 
 
@@ -285,3 +286,21 @@ async def test_subagent_system_messages_use_assistant_role(tmp_path) -> None:
     sent_messages = captured["messages"]
     assert sent_messages[-1]["role"] == "assistant"
     assert sent_messages[-1]["content"] == "Background task finished."
+
+
+def test_agent_loop_forwards_input_limits_to_context(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    limits = InputLimitsConfig(max_input_images=1, max_input_image_bytes=2048)
+
+    loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=workspace,
+        model="test-model",
+        input_limits=limits,
+    )
+
+    assert loop.context.input_limits == limits

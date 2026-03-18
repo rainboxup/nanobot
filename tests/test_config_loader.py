@@ -80,3 +80,25 @@ def test_load_config_migrates_legacy_restrict_to_workspace(tmp_path) -> None:
 
     cfg = load_config(config_path=path, allow_env_override=False, strict=True)
     assert cfg.tools.restrict_to_workspace is True
+
+
+def test_load_config_reads_input_limits_from_camel_case(tmp_path) -> None:
+    path = tmp_path / "input-limits.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tools": {
+                    "inputLimits": {
+                        "maxInputImages": 1,
+                        "maxInputImageBytes": 2048,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path=path, allow_env_override=False, strict=True)
+
+    assert cfg.tools.input_limits.max_input_images == 1
+    assert cfg.tools.input_limits.max_input_image_bytes == 2048

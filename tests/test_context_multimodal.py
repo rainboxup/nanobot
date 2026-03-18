@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.config.schema import InputLimitsConfig
 
 PNG_BYTES = (
     b"\x89PNG\r\n\x1a\n"
@@ -58,6 +59,25 @@ def test_build_user_content_skips_large_images_with_note(tmp_path: Path) -> None
     assert isinstance(content, str)
     assert "[Skipped image: file too large (big.png, limit 10 MB)]" in content
     assert content.endswith("analyze")
+
+
+def test_build_user_content_respects_custom_input_limits(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    builder = ContextBuilder(
+        workspace,
+        input_limits=InputLimitsConfig(max_input_images=1, max_input_image_bytes=1024),
+    )
+    small = workspace / "small.png"
+    extra = workspace / "extra.png"
+    small.write_bytes(PNG_BYTES)
+    extra.write_bytes(PNG_BYTES)
+
+    content = builder._build_user_content("describe", [str(small), str(extra)])
+
+    assert isinstance(content, list)
+    assert sum(1 for block in content if block.get("type") == "image_url") == 1
+    assert content[-1]["text"].startswith("[Skipped 1 image: only the first 1 images are included]")
 
 
 def test_build_user_content_keeps_valid_images_and_skip_notes_together(tmp_path: Path) -> None:

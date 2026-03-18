@@ -513,12 +513,14 @@ class AgentLoop:
                 session_key=key,
             )
             history = session.get_history(max_messages=self.memory_window)
+            current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
                 channel=channel,
                 chat_id=chat_id,
                 session_overlay=session_overlay,
+                current_role=current_role,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))

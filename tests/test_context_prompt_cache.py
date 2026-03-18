@@ -222,3 +222,38 @@ async def test_agent_loop_progress_metadata_does_not_echo_session_overlay(tmp_pa
         metadata = call.args[0].metadata
         assert "overlay" not in metadata
         assert "session_overlay" not in metadata
+
+
+@pytest.mark.asyncio
+async def test_subagent_system_messages_use_assistant_role(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    bus = MessageBus()
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    captured: dict[str, list[dict]] = {}
+
+    async def _fake_chat(**kwargs):
+        captured["messages"] = [
+            dict(message) if isinstance(message, dict) else message
+            for message in kwargs["messages"]
+        ]
+        return LLMResponse(content="done", tool_calls=[])
+
+    provider.chat = AsyncMock(side_effect=_fake_chat)
+
+    loop = AgentLoop(bus=bus, provider=provider, workspace=workspace, model="test-model")
+
+    msg = InboundMessage(
+        channel="system",
+        sender_id="subagent",
+        chat_id="cli:direct",
+        content="Background task finished.",
+    )
+
+    response = await loop._process_message(msg)
+
+    assert response is not None
+    provider.chat.assert_awaited_once()
+    sent_messages = captured["messages"]
+    assert sent_messages[-1]["role"] == "assistant"
+    assert sent_messages[-1]["content"] == "Background task finished."

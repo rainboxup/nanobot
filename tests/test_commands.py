@@ -126,6 +126,36 @@ def test_onboard_existing_config_overwrite(mock_paths):
     assert workspace_dir.exists()
 
 
+def test_onboard_uses_configured_workspace_path(monkeypatch, tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    workspace_dir = tmp_path / "configured-workspace"
+
+    config = Config()
+    config.agents.defaults.workspace = str(workspace_dir)
+
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: config_file)
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: config)
+    monkeypatch.setattr("nanobot.config.loader.save_config", lambda _config: None)
+    monkeypatch.setattr(
+        "nanobot.utils.workspace.create_workspace_templates",
+        lambda _workspace: [],
+    )
+
+    def _fake_get_workspace_path(workspace: str | None = None):
+        captured["workspace"] = workspace
+        return workspace_dir
+
+    monkeypatch.setattr("nanobot.utils.helpers.get_workspace_path", _fake_get_workspace_path)
+
+    result = runner.invoke(app, ["onboard"], input="n\n")
+
+    assert result.exit_code == 0
+    assert captured["workspace"] == config.workspace_path
+
+
 def test_onboard_existing_workspace_safe_create(mock_paths):
     """Workspace exists — should not recreate, but still add missing templates."""
     config_file, workspace_dir = mock_paths

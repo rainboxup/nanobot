@@ -164,6 +164,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         channel: str | None = None,
         chat_id: str | None = None,
         session_overlay: str | None = None,
+        current_role: str = "user",
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
         return [
@@ -178,7 +179,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
             },
             *history,
             {"role": "user", "content": self._build_runtime_context(channel, chat_id)},
-            {"role": "user", "content": self._build_user_content(current_message, media)},
+            {"role": current_role, "content": self._build_user_content(current_message, media)},
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:

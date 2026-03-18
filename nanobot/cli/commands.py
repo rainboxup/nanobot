@@ -187,29 +187,34 @@ def onboard(
     ),
 ):
     """Initialize nanobot configuration and workspace."""
-    from nanobot.config.loader import get_config_path, save_config
+    from nanobot.config.loader import get_config_path, load_config, save_config
     from nanobot.config.schema import Config
     from nanobot.utils.helpers import get_workspace_path
 
     config_path = get_config_path()
     config_exists = config_path.exists()
     overwrite = False
+    config: Config
 
     if config_exists:
         console.print(f"[yellow]Config already exists at {config_path}[/yellow]")
         overwrite = typer.confirm("Overwrite?")
 
     if not config_exists:
-        save_config(Config())
+        config = Config()
+        save_config(config)
         console.print(f"{_ok_text()} Created config at {config_path}")
     elif overwrite:
-        save_config(Config())
+        config = Config()
+        save_config(config)
         console.print(f"{_ok_text()} Config reset to defaults")
     else:
+        config = load_config()
+        save_config(config)
         console.print(f"{_ok_text()} Config refreshed (existing values preserved)")
 
     # Create workspace
-    workspace = get_workspace_path()
+    workspace = get_workspace_path(config.workspace_path)
     workspace_existed = workspace.exists()
     workspace_had_content = workspace_existed and any(workspace.iterdir()) if workspace_existed else False
     if not workspace_existed:

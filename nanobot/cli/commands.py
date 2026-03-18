@@ -436,7 +436,7 @@ def _gateway_impl(
 
         logging.basicConfig(level=logging.DEBUG)
 
-    console.print(f"{_cli_brand()} Starting gateway on port {port}...")
+    console.print(f"{_cli_brand()} Starting gateway version {__version__} on port {port}...")
 
     config = _load_cli_config(workspace=workspace)
     bus = MessageBus(

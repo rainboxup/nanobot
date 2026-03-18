@@ -390,6 +390,7 @@ def test_gateway_passes_mcp_servers_to_agent_loop(monkeypatch, tmp_path):
     result = runner.invoke(app, ["gateway", "--port", "18790"])
 
     assert result.exit_code == 0
+    assert f"version {commands.__version__}" in result.stdout
     assert captured.get("mcp_servers") == config.tools.mcp_servers
 
 

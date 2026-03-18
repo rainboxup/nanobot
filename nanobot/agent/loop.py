@@ -51,6 +51,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 500
+    _BACKGROUND_ARCHIVE_MAX_ATTEMPTS = 3
 
     @staticmethod
     def _session_overlay_from_metadata(metadata: dict | None) -> str | None:
@@ -496,6 +497,30 @@ class AgentLoop:
         task.add_done_callback(self._background_tasks.discard)
         return task
 
+    def _append_raw_archive_fallback(self, session_key: str, messages: list[dict]) -> None:
+        """Persist a raw conversation dump so /new archival failures do not lose data."""
+        if not messages:
+            return
+
+        lines = [f"[RAW ARCHIVE FALLBACK] session={session_key}"]
+        for message in messages:
+            content = message.get("content")
+            if content in (None, ""):
+                continue
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            tools = (
+                f" [tools: {', '.join(message['tools_used'])}]"
+                if message.get("tools_used")
+                else ""
+            )
+            lines.append(
+                f"[{str(message.get('timestamp', '?'))[:16]}] "
+                f"{str(message.get('role', '?')).upper()}{tools}: {content}"
+            )
+
+        MemoryStore(self._memory_workspace_for_session(session_key)).append_history("\n".join(lines))
+
     async def _process_message(
         self,
         msg: InboundMessage,
@@ -568,10 +593,21 @@ class AgentLoop:
                             snapshot = existing_session.messages[existing_session.last_consolidated:]
                             if not snapshot:
                                 return
-                            temp = Session(key=existing_session.key)
-                            temp.messages = list(snapshot)
-                            if not await self._consolidate_memory(temp, archive_all=True):
-                                logger.warning("/new background archival failed for {}", existing_session.key)
+                            snapshot_messages = list(snapshot)
+                            for attempt in range(1, self._BACKGROUND_ARCHIVE_MAX_ATTEMPTS + 1):
+                                temp = Session(key=existing_session.key)
+                                temp.messages = list(snapshot_messages)
+                                if await self._consolidate_memory(temp, archive_all=True):
+                                    return
+                                logger.warning(
+                                    "/new background archival attempt {}/{} failed for {}",
+                                    attempt,
+                                    self._BACKGROUND_ARCHIVE_MAX_ATTEMPTS,
+                                    existing_session.key,
+                                )
+                            self._append_raw_archive_fallback(
+                                existing_session.key, snapshot_messages
+                            )
                     except Exception:
                         logger.exception("/new background archival failed for {}", existing_session.key)
 

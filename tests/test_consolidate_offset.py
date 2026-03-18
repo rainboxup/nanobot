@@ -872,6 +872,58 @@ class TestConsolidationDeduplicationGuard:
         await loop.close_mcp()
         assert archived.is_set()
 
+    @pytest.mark.asyncio
+    async def test_new_background_archive_retries_and_falls_back_to_raw_history(
+        self, tmp_path: Path
+    ) -> None:
+        """/new archival should retry and then persist a raw fallback instead of losing data."""
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.base import LLMResponse
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus, provider=provider, workspace=tmp_path, model="test-model", memory_window=10
+        )
+        loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        session = loop.sessions.get_or_create("cli:test")
+        for i in range(3):
+            session.add_message("user", f"msg{i}")
+            session.add_message("assistant", f"resp{i}")
+        loop.sessions.save(session)
+
+        attempts = 0
+
+        async def _always_fail(_sess, archive_all: bool = False) -> bool:
+            nonlocal attempts
+            if archive_all:
+                attempts += 1
+                return False
+            return True
+
+        loop._consolidate_memory = _always_fail  # type: ignore[method-assign]
+
+        new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
+        response = await loop._process_message(new_msg)
+
+        assert response is not None
+        assert "new session started" in response.content.lower()
+
+        await loop.close_mcp()
+
+        assert attempts == 3
+        history_path = tmp_path / "memory" / "HISTORY.md"
+        assert history_path.exists()
+        history_text = history_path.read_text(encoding="utf-8")
+        assert "[RAW ARCHIVE FALLBACK]" in history_text
+        assert "msg0" in history_text
+        assert "resp2" in history_text
+
 
 class TestConsolidationMemoryWorkspace:
     @pytest.mark.asyncio

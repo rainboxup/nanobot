@@ -126,6 +126,34 @@ class TestDispatch:
         assert order == ["start-a", "end-a", "start-b", "end-b"]
 
 
+class TestRunLoop:
+    @pytest.mark.asyncio
+    async def test_run_continues_after_consume_inbound_error(self):
+        loop, _bus = _make_loop()
+        calls = 0
+
+        async def _fake_connect_mcp():
+            return None
+
+        async def _fake_consume():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
+            loop._running = False
+            raise asyncio.TimeoutError
+
+        loop._connect_mcp = _fake_connect_mcp  # type: ignore[method-assign]
+        loop.bus.consume_inbound = _fake_consume  # type: ignore[method-assign]
+
+        with patch("nanobot.agent.loop.logger.warning") as mock_warning:
+            await loop.run()
+
+        assert calls == 2
+        mock_warning.assert_called_once()
+        assert "Error consuming inbound message" in mock_warning.call_args[0][0]
+
+
 class TestSubagentCancellation:
     @pytest.mark.asyncio
     async def test_cancel_by_session(self):

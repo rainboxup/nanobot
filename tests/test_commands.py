@@ -677,6 +677,103 @@ def test_gateway_cron_callback_guards_recursive_scheduling(monkeypatch, tmp_path
     assert cron_calls[1][0] == "reset"
 
 
+def test_gateway_reports_unexpected_runtime_error(monkeypatch, tmp_path):
+    config = Config()
+    config.agents.defaults.workspace = str(tmp_path / "workspace")
+
+    class StubAgentLoop:
+        close_mcp_called = False
+        stop_called = False
+
+        def __init__(self, **_kwargs):
+            self.model = "test-model"
+
+        async def run(self):
+            raise RuntimeError("boom")
+
+        async def process_direct(self, *_args, **_kwargs):
+            return "ok"
+
+        async def close_mcp(self):
+            StubAgentLoop.close_mcp_called = True
+
+        def stop(self):
+            StubAgentLoop.stop_called = True
+
+    class StubSessionManager:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def list_sessions(self):
+            return []
+
+    class StubCronService:
+        stop_called = False
+
+        def __init__(self, *_args, **_kwargs):
+            self.on_job = None
+
+        def status(self):
+            return {"jobs": 0}
+
+        async def start(self):
+            return None
+
+        def stop(self):
+            StubCronService.stop_called = True
+
+    class StubHeartbeatService:
+        stop_called = False
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def start(self):
+            return None
+
+        def stop(self):
+            StubHeartbeatService.stop_called = True
+
+    class StubChannelManager:
+        stop_called = False
+
+        def __init__(self, *_args, **_kwargs):
+            self.enabled_channels = []
+
+        async def start_all(self):
+            return None
+
+        async def stop_all(self):
+            StubChannelManager.stop_called = True
+
+    class StubDiskJanitor:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def run_once(self):
+            return None
+
+    monkeypatch.setattr("nanobot.config.loader.load_config", lambda: config)
+    monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _cfg: object())
+    monkeypatch.setattr("nanobot.agent.loop.AgentLoop", StubAgentLoop)
+    monkeypatch.setattr("nanobot.session.manager.SessionManager", StubSessionManager)
+    monkeypatch.setattr("nanobot.cron.service.CronService", StubCronService)
+    monkeypatch.setattr("nanobot.heartbeat.service.HeartbeatService", StubHeartbeatService)
+    monkeypatch.setattr("nanobot.channels.manager.ChannelManager", StubChannelManager)
+    monkeypatch.setattr("nanobot.utils.disk_janitor.DiskJanitor", StubDiskJanitor)
+
+    result = runner.invoke(app, ["gateway", "--port", "18790"])
+
+    assert result.exit_code == 0
+    assert "Gateway crashed unexpectedly" in result.stdout
+    assert "RuntimeError: boom" in result.stdout
+    assert StubAgentLoop.close_mcp_called is True
+    assert StubAgentLoop.stop_called is True
+    assert StubHeartbeatService.stop_called is True
+    assert StubCronService.stop_called is True
+    assert StubChannelManager.stop_called is True
+
+
 def _gbk_console():
     buffer = BytesIO()
     file = TextIOWrapper(buffer, encoding="gbk")

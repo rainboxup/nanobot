@@ -785,11 +785,18 @@ def _gateway_impl(
             await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
+        except Exception:
+            import traceback
+
+            console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
+            console.print(traceback.format_exc())
+        finally:
             heartbeat.stop()
             cron.stop()
             agent.stop()
             if web_server is not None:
                 web_server.should_exit = True
+            await agent.close_mcp()
             await channels.stop_all()
 
     asyncio.run(run())

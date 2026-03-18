@@ -433,16 +433,28 @@ class FeishuChannel(BaseChannel):
 
     _CODE_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
 
-    @staticmethod
-    def _parse_md_table(table_text: str) -> dict | None:
+    _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+    _MD_ITALIC_RE = re.compile(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)")
+    _MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
+
+    @classmethod
+    def _strip_md_formatting(cls, text: str) -> str:
+        """Strip markdown markers from content Feishu table cells can't render."""
+        text = cls._MD_BOLD_RE.sub(r"\1", text)
+        text = cls._MD_ITALIC_RE.sub(r"\1", text)
+        text = cls._MD_STRIKE_RE.sub(r"\1", text)
+        return text
+
+    @classmethod
+    def _parse_md_table(cls, table_text: str) -> dict | None:
         """Parse a markdown table into a Feishu table element."""
         lines = [_line.strip() for _line in table_text.strip().split("\n") if _line.strip()]
         if len(lines) < 3:
             return None
         def split(_line: str) -> list[str]:
             return [c.strip() for c in _line.strip("|").split("|")]
-        headers = split(lines[0])
-        rows = [split(_line) for _line in lines[2:]]
+        headers = [cls._strip_md_formatting(h) for h in split(lines[0])]
+        rows = [[cls._strip_md_formatting(c) for c in split(_line)] for _line in lines[2:]]
         columns = [{"tag": "column", "name": f"c{i}", "display_name": h, "width": "auto"}
                    for i, h in enumerate(headers)]
         return {
@@ -481,11 +493,15 @@ class FeishuChannel(BaseChannel):
             if before:
                 elements.append({"tag": "markdown", "content": before})
             text = m.group(2).strip()
+            if text.startswith("**") and text.endswith("**"):
+                display_text = text
+            else:
+                display_text = f"**{text}**"
             elements.append({
                 "tag": "div",
                 "text": {
                     "tag": "lark_md",
-                    "content": f"**{text}**",
+                    "content": display_text,
                 },
             })
             last_end = m.end()

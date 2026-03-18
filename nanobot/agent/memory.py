@@ -128,19 +128,42 @@ class MemoryStore:
             # Some providers return arguments as a JSON string instead of dict
             if isinstance(args, str):
                 args = json.loads(args)
+            # Some providers return arguments as a list containing the actual payload dict.
+            if isinstance(args, list):
+                if args and isinstance(args[0], dict):
+                    args = args[0]
+                else:
+                    logger.warning(
+                        "Memory consolidation: unexpected arguments type list with non-dict content"
+                    )
+                    return False
             if not isinstance(args, dict):
                 logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
                 return False
 
-            if entry := args.get("history_entry"):
-                if not isinstance(entry, str):
-                    entry = json.dumps(entry, ensure_ascii=False)
-                self.append_history(entry)
-            if update := args.get("memory_update"):
-                if not isinstance(update, str):
-                    update = json.dumps(update, ensure_ascii=False)
-                if update != current_memory:
-                    self.write_long_term(update)
+            if "history_entry" not in args or "memory_update" not in args:
+                logger.warning("Memory consolidation: save_memory payload missing required fields")
+                return False
+
+            entry = args["history_entry"]
+            update = args["memory_update"]
+            if entry is None or update is None:
+                logger.warning("Memory consolidation: save_memory payload contains null required fields")
+                return False
+
+            if not isinstance(entry, str):
+                entry = json.dumps(entry, ensure_ascii=False)
+            entry = entry.strip()
+            if not entry:
+                logger.warning("Memory consolidation: history_entry is empty after normalization")
+                return False
+
+            self.append_history(entry)
+
+            if not isinstance(update, str):
+                update = json.dumps(update, ensure_ascii=False)
+            if update != current_memory:
+                self.write_long_term(update)
 
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
             logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)

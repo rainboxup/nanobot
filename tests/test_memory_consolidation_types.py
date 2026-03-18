@@ -120,6 +120,130 @@ class TestMemoryConsolidationTypeHandling:
         assert "User discussed testing." in store.history_file.read_text()
 
     @pytest.mark.asyncio
+    async def test_list_arguments_extracts_first_dict(self, tmp_path: Path) -> None:
+        """Some providers return arguments as a list containing a single dict payload."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments=[
+                            {
+                                "history_entry": "[2026-01-01] User discussed testing.",
+                                "memory_update": "# Memory\nUser likes testing.",
+                            }
+                        ],
+                    )
+                ],
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is True
+        assert "User discussed testing." in store.history_file.read_text()
+        assert "User likes testing." in store.memory_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_list_arguments_non_dict_returns_false(self, tmp_path: Path) -> None:
+        """List arguments without a dict payload should be rejected."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments=["bad-payload"],
+                    )
+                ],
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is False
+        assert not store.history_file.exists()
+        assert not store.memory_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_missing_history_entry_returns_false_without_writing(self, tmp_path: Path) -> None:
+        """Missing required history_entry should not persist partial output."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments={"memory_update": "# Memory\nOnly memory update"},
+                    )
+                ],
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is False
+        assert not store.history_file.exists()
+        assert not store.memory_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_missing_memory_update_returns_false_without_writing(self, tmp_path: Path) -> None:
+        """Missing required memory_update should not append history alone."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments={"history_entry": "[2026-01-01] Partial output."},
+                    )
+                ],
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is False
+        assert not store.history_file.exists()
+        assert not store.memory_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_empty_history_entry_returns_false_without_writing(self, tmp_path: Path) -> None:
+        """Blank history_entry should be rejected to avoid empty archival records."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat = AsyncMock(
+            return_value=_make_tool_response(
+                history_entry="   ",
+                memory_update="# Memory\nUser likes testing.",
+            )
+        )
+        session = _make_session(message_count=60)
+
+        result = await store.consolidate(session, provider, "test-model", memory_window=50)
+
+        assert result is False
+        assert not store.history_file.exists()
+        assert not store.memory_file.exists()
+
+    @pytest.mark.asyncio
     async def test_no_tool_call_returns_false(self, tmp_path: Path) -> None:
         """When LLM doesn't use the save_memory tool, return False."""
         store = MemoryStore(tmp_path)

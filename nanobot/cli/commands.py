@@ -305,6 +305,17 @@ def _make_provider(config):
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
+
+    if provider_name == "custom":
+        from nanobot.providers.custom_provider import CustomProvider
+
+        return CustomProvider(
+            api_key=p.api_key if (p and p.api_key) else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
+
     if not (p and p.api_key) and not model.startswith("bedrock/"):
         console.print("[red]Error: No API key configured.[/red]")
         console.print(f"Set one in {get_config_path()} under providers section")

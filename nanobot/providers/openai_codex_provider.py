@@ -44,47 +44,62 @@ class OpenAICodexProvider(LLMProvider):
             )
 
         model = model or self.default_model
-        system_prompt, input_items = _convert_messages(messages)
 
         token = await asyncio.to_thread(get_codex_token)
         headers = _build_headers(token.account_id, token.access)
 
-        body: dict[str, Any] = {
-            "model": _strip_model_prefix(model),
-            "store": False,
-            "stream": True,
-            "instructions": system_prompt,
-            "input": input_items,
-            "text": {"verbosity": "medium"},
-            "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": _prompt_cache_key(messages),
-            "tool_choice": tool_choice or "auto",
-            "parallel_tool_calls": True,
-        }
-
-        if tools:
-            body["tools"] = _convert_tools(tools)
-
         url = DEFAULT_CODEX_URL
 
-        try:
+        async def _call(request_messages: list[dict[str, Any]]) -> LLMResponse:
+            system_prompt, input_items = _convert_messages(request_messages)
+            body: dict[str, Any] = {
+                "model": _strip_model_prefix(model),
+                "store": False,
+                "stream": True,
+                "instructions": system_prompt,
+                "input": input_items,
+                "text": {"verbosity": "medium"},
+                "include": ["reasoning.encrypted_content"],
+                "prompt_cache_key": _prompt_cache_key(request_messages),
+                "tool_choice": tool_choice or "auto",
+                "parallel_tool_calls": True,
+            }
+
+            if tools:
+                body["tools"] = _convert_tools(tools)
+
             try:
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=True)
+                try:
+                    content, tool_calls, finish_reason = await _request_codex(
+                        url,
+                        headers,
+                        body,
+                        verify=True,
+                    )
+                except Exception as e:
+                    if "CERTIFICATE_VERIFY_FAILED" not in str(e):
+                        raise
+                    logger.warning(
+                        "SSL certificate verification failed for Codex API; retrying with verify=False"
+                    )
+                    content, tool_calls, finish_reason = await _request_codex(
+                        url,
+                        headers,
+                        body,
+                        verify=False,
+                    )
+                return LLMResponse(
+                    content=content,
+                    tool_calls=tool_calls,
+                    finish_reason=finish_reason,
+                )
             except Exception as e:
-                if "CERTIFICATE_VERIFY_FAILED" not in str(e):
-                    raise
-                logger.warning("SSL certificate verification failed for Codex API; retrying with verify=False")
-                content, tool_calls, finish_reason = await _request_codex(url, headers, body, verify=False)
-            return LLMResponse(
-                content=content,
-                tool_calls=tool_calls,
-                finish_reason=finish_reason,
-            )
-        except Exception as e:
-            return LLMResponse(
-                content=f"Error calling Codex: {str(e)}",
-                finish_reason="error",
-            )
+                return LLMResponse(
+                    content=f"Error calling Codex: {str(e)}",
+                    finish_reason="error",
+                )
+
+        return await self._chat_with_image_fallback(messages, _call)
 
     def get_default_model(self) -> str:
         return self.default_model
@@ -118,7 +133,9 @@ async def _request_codex(
         async with client.stream("POST", url, headers=headers, json=body) as response:
             if response.status_code != 200:
                 text = await response.aread()
-                raise RuntimeError(_friendly_error(response.status_code, text.decode("utf-8", "ignore")))
+                raise RuntimeError(
+                    _friendly_error(response.status_code, text.decode("utf-8", "ignore"))
+                )
             return await _consume_sse(response)
 
 
@@ -131,12 +148,14 @@ def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not name:
             continue
         params = fn.get("parameters") or {}
-        converted.append({
-            "type": "function",
-            "name": name,
-            "description": fn.get("description") or "",
-            "parameters": params if isinstance(params, dict) else {},
-        })
+        converted.append(
+            {
+                "type": "function",
+                "name": name,
+                "description": fn.get("description") or "",
+                "parameters": params if isinstance(params, dict) else {},
+            }
+        )
     return converted
 
 
@@ -187,7 +206,9 @@ def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[st
 
         if role == "tool":
             call_id, _ = _split_tool_call_id(msg.get("tool_call_id"))
-            output_text = content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            output_text = (
+                content if isinstance(content, str) else json.dumps(content, ensure_ascii=False)
+            )
             input_items.append(
                 {
                     "type": "function_call_output",
@@ -238,7 +259,11 @@ async def _iter_sse(response: httpx.Response) -> AsyncGenerator[dict[str, Any], 
     async for line in response.aiter_lines():
         if line == "":
             if buffer:
-                data_lines = [entry_line[5:].strip() for entry_line in buffer if entry_line.startswith("data:")]
+                data_lines = [
+                    entry_line[5:].strip()
+                    for entry_line in buffer
+                    if entry_line.startswith("data:")
+                ]
                 buffer = []
                 if not data_lines:
                     continue
@@ -310,7 +335,12 @@ async def _consume_sse(response: httpx.Response) -> tuple[str, list[ToolCallRequ
     return content, tool_calls, finish_reason
 
 
-_FINISH_REASON_MAP = {"completed": "stop", "incomplete": "length", "failed": "error", "cancelled": "error"}
+_FINISH_REASON_MAP = {
+    "completed": "stop",
+    "incomplete": "length",
+    "failed": "error",
+    "cancelled": "error",
+}
 
 
 def _map_finish_reason(status: str | None) -> str:

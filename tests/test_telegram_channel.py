@@ -1,3 +1,8 @@
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+import pytest
+
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.telegram import TelegramChannel
 from nanobot.config.schema import TelegramConfig
@@ -27,3 +32,19 @@ def test_is_allowed_keeps_public_and_wildcard_behavior() -> None:
 
     assert public_channel.is_allowed("12345|alice") is True
     assert wildcard_channel.is_allowed("12345|alice") is True
+
+
+@pytest.mark.asyncio
+async def test_on_help_includes_restart_command() -> None:
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(message=message)
+
+    await channel._on_help(update, None)
+
+    message.reply_text.assert_awaited_once()
+    help_text = message.reply_text.await_args.args[0]
+    assert "/restart" in help_text

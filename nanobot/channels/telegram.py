@@ -354,6 +354,7 @@ class TelegramChannel(BaseChannel):
             "🐈 <b>nanobot commands</b>\n\n"
             "/start — Start the bot\n"
             "/reset — Reset conversation history\n"
+            "/restart — Restart the bot\n"
             "/help — Show this help message\n\n"
             "Just send me a text message to chat!"
         )

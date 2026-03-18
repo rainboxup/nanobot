@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from nanobot.heartbeat.service import HeartbeatService
-from nanobot.providers.base import LLMResponse, ToolCallRequest
+from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 
 class DummyProvider:
@@ -115,3 +115,40 @@ async def test_trigger_now_returns_none_when_decision_is_skip(tmp_path) -> None:
     )
 
     assert await service.trigger_now() is None
+
+
+@pytest.mark.asyncio
+async def test_decide_prompt_includes_current_time(tmp_path) -> None:
+    """Phase 1 prompt should include current time for time-aware scheduling."""
+
+    captured_messages: list[dict] = []
+
+    class CapturingProvider(LLMProvider):
+        async def chat(self, *, messages=None, **kwargs) -> LLMResponse:
+            if messages:
+                captured_messages.extend(messages)
+            return LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(
+                        id="hb_1",
+                        name="heartbeat",
+                        arguments={"action": "skip"},
+                    )
+                ],
+            )
+
+        def get_default_model(self) -> str:
+            return "test-model"
+
+    service = HeartbeatService(
+        workspace=tmp_path,
+        provider=CapturingProvider(),
+        model="test-model",
+    )
+
+    await service._decide("- [ ] check servers at 10:00 UTC")
+
+    user_msg = captured_messages[1]
+    assert user_msg["role"] == "user"
+    assert "Current Time:" in user_msg["content"]

@@ -1,6 +1,7 @@
 """Utility functions for nanobot."""
 
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,13 @@ def get_workspace_path(workspace: str | None = None) -> Path:
 def timestamp() -> str:
     """Current ISO timestamp."""
     return datetime.now().isoformat()
+
+
+def current_time_str() -> str:
+    """Human-readable current time with weekday and timezone."""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M (%A)")
+    tz = time.strftime("%Z") or "UTC"
+    return f"{now} ({tz})"
 
 
 _UNSAFE_CHARS = re.compile(r'[<>:"/\\|?*]')

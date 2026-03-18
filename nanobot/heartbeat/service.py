@@ -83,6 +83,8 @@ class HeartbeatService:
 
     async def _decide(self, content: str) -> tuple[str, str]:
         """Phase 1: ask LLM to decide skip/run via virtual tool call."""
+        from nanobot.utils.helpers import current_time_str
+
         response = await self.provider.chat(
             messages=[
                 {
@@ -94,6 +96,7 @@ class HeartbeatService:
                 {
                     "role": "user",
                     "content": (
+                        f"Current Time: {current_time_str()}\n\n"
                         "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
                         f"{content}"
                     ),

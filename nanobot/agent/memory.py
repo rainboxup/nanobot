@@ -74,6 +74,9 @@ class MemoryStore:
         *,
         archive_all: bool = False,
         memory_window: int = 50,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> bool:
         """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
 
@@ -118,6 +121,9 @@ class MemoryStore:
                 ],
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
+                temperature=self._resolve_temperature(temperature),
+                max_tokens=max_tokens or 4096,
+                reasoning_effort=reasoning_effort,
             )
 
             if not response.has_tool_calls:
@@ -171,3 +177,8 @@ class MemoryStore:
         except Exception:
             logger.exception("Memory consolidation failed")
             return False
+
+    @staticmethod
+    def _resolve_temperature(temperature: float | None) -> float:
+        """Use caller-provided temperature when set, otherwise preserve provider default."""
+        return 0.7 if temperature is None else float(temperature)

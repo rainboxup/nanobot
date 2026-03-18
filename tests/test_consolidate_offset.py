@@ -997,3 +997,49 @@ class TestConsolidationMemoryWorkspace:
 
         assert ok is True
         assert seen["workspace"] == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_consolidation_passes_generation_settings_to_memory_store(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.queue import MessageBus
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus,
+            provider=provider,
+            workspace=tmp_path,
+            model="test-model",
+            temperature=0.23,
+            max_tokens=2222,
+            reasoning_effort="high",
+            enable_spawn=False,
+            enable_exec=False,
+        )
+
+        seen: dict[str, object] = {}
+
+        class _FakeMemoryStore:
+            def __init__(self, workspace: Path):
+                seen["workspace"] = workspace
+
+            async def consolidate(self, *args, **kwargs) -> bool:
+                seen["args"] = args
+                seen["kwargs"] = kwargs
+                return True
+
+        monkeypatch.setattr("nanobot.agent.loop.MemoryStore", _FakeMemoryStore)
+
+        session = Session(key="cli:direct")
+        ok = await loop._consolidate_memory(session)
+
+        assert ok is True
+        assert seen["workspace"] == tmp_path
+        kwargs = seen["kwargs"]
+        assert isinstance(kwargs, dict)
+        assert kwargs["temperature"] == 0.23
+        assert kwargs["max_tokens"] == 2222
+        assert kwargs["reasoning_effort"] == "high"

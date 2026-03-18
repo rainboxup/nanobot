@@ -750,6 +750,9 @@ class AgentLoop:
         return await MemoryStore(memory_workspace).consolidate(
             session, self.provider, self.model,
             archive_all=archive_all, memory_window=self.memory_window,
+            temperature=self.temperature,
+            max_tokens=self.max_tokens,
+            reasoning_effort=self.reasoning_effort,
         )
 
     async def process_direct(

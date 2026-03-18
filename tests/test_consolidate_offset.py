@@ -630,10 +630,10 @@ class TestConsolidationDeduplicationGuard:
         )
 
     @pytest.mark.asyncio
-    async def test_new_waits_for_inflight_consolidation_and_preserves_messages(
+    async def test_new_returns_immediately_and_archives_remaining_messages_in_background(
         self, tmp_path: Path
     ) -> None:
-        """/new waits for in-flight consolidation and archives before clear."""
+        """/new should return immediately and archive the unconsolidated tail in background."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -666,6 +666,7 @@ class TestConsolidationDeduplicationGuard:
                 return True
             started.set()
             await release.wait()
+            sess.last_consolidated = len(sess.messages) - 3
             return True
 
         loop._consolidate_memory = _fake_consolidate  # type: ignore[method-assign]
@@ -678,20 +679,23 @@ class TestConsolidationDeduplicationGuard:
         pending_new = asyncio.create_task(loop._process_message(new_msg))
 
         await asyncio.sleep(0.02)
-        assert not pending_new.done(), "/new should wait while consolidation is in-flight"
-
-        release.set()
+        assert pending_new.done(), "/new should return without waiting for archival"
         response = await pending_new
         assert response is not None
         assert "new session started" in response.content.lower()
-        assert archived_count > 0, "Expected /new archival to process a non-empty snapshot"
+        assert loop.sessions.get_or_create("cli:test").messages == []
 
-        session_after = loop.sessions.get_or_create("cli:test")
-        assert session_after.messages == [], "Session should be cleared after successful archival"
+        release.set()
+        await loop.close_mcp()
+        assert archived_count == 3, (
+            f"Expected only unconsolidated tail to archive after in-flight task, got {archived_count}"
+        )
 
     @pytest.mark.asyncio
-    async def test_new_does_not_clear_session_when_archive_fails(self, tmp_path: Path) -> None:
-        """/new must keep session data if archive step reports failure."""
+    async def test_new_clears_session_even_when_background_archive_fails(
+        self, tmp_path: Path
+    ) -> None:
+        """/new should clear immediately even if the background archive later fails."""
         from nanobot.agent.loop import AgentLoop
         from nanobot.bus.events import InboundMessage
         from nanobot.bus.queue import MessageBus
@@ -712,7 +716,6 @@ class TestConsolidationDeduplicationGuard:
             session.add_message("user", f"msg{i}")
             session.add_message("assistant", f"resp{i}")
         loop.sessions.save(session)
-        before_count = len(session.messages)
 
         async def _failing_consolidate(sess, archive_all: bool = False) -> bool:
             if archive_all:
@@ -725,11 +728,9 @@ class TestConsolidationDeduplicationGuard:
         response = await loop._process_message(new_msg)
 
         assert response is not None
-        assert "failed" in response.content.lower()
-        session_after = loop.sessions.get_or_create("cli:test")
-        assert len(session_after.messages) == before_count, (
-            "Session must remain intact when /new archival fails"
-        )
+        assert "new session started" in response.content.lower()
+        assert loop.sessions.get_or_create("cli:test").messages == []
+        await loop.close_mcp()
 
     @pytest.mark.asyncio
     async def test_new_archives_only_unconsolidated_messages_after_inflight_task(
@@ -781,13 +782,13 @@ class TestConsolidationDeduplicationGuard:
         new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
         pending_new = asyncio.create_task(loop._process_message(new_msg))
         await asyncio.sleep(0.02)
-        assert not pending_new.done()
-
-        release.set()
+        assert pending_new.done()
         response = await pending_new
 
         assert response is not None
         assert "new session started" in response.content.lower()
+        release.set()
+        await loop.close_mcp()
         assert archived_count == 3, (
             f"Expected only unconsolidated tail to archive, got {archived_count}"
         )
@@ -826,6 +827,50 @@ class TestConsolidationDeduplicationGuard:
         assert response is not None
         assert "new session started" in response.content.lower()
         assert loop.sessions.get_or_create("cli:test").messages == []
+        await loop.close_mcp()
+
+    @pytest.mark.asyncio
+    async def test_close_mcp_drains_background_new_archives(self, tmp_path: Path) -> None:
+        """close_mcp should wait for /new archival tasks before shutdown."""
+        from nanobot.agent.loop import AgentLoop
+        from nanobot.bus.events import InboundMessage
+        from nanobot.bus.queue import MessageBus
+        from nanobot.providers.base import LLMResponse
+
+        bus = MessageBus()
+        provider = MagicMock()
+        provider.get_default_model.return_value = "test-model"
+        loop = AgentLoop(
+            bus=bus, provider=provider, workspace=tmp_path, model="test-model", memory_window=10
+        )
+        loop.provider.chat = AsyncMock(return_value=LLMResponse(content="ok", tool_calls=[]))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        session = loop.sessions.get_or_create("cli:test")
+        for i in range(3):
+            session.add_message("user", f"msg{i}")
+            session.add_message("assistant", f"resp{i}")
+        loop.sessions.save(session)
+
+        archived = asyncio.Event()
+
+        async def _slow_consolidate(_sess, archive_all: bool = False) -> bool:
+            if archive_all:
+                await asyncio.sleep(0.1)
+                archived.set()
+            return True
+
+        loop._consolidate_memory = _slow_consolidate  # type: ignore[method-assign]
+
+        new_msg = InboundMessage(channel="cli", sender_id="user", chat_id="test", content="/new")
+        response = await loop._process_message(new_msg)
+
+        assert response is not None
+        assert "new session started" in response.content.lower()
+        assert not archived.is_set()
+
+        await loop.close_mcp()
+        assert archived.is_set()
 
 
 class TestConsolidationMemoryWorkspace:

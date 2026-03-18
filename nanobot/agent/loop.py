@@ -159,6 +159,7 @@ class AgentLoop:
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+        self._background_tasks: set[asyncio.Task] = set()  # Strong refs to auxiliary background work
         self._active_tasks: dict[str, list[asyncio.Task]] = {}  # session_key -> tasks
         self._processing_lock = asyncio.Lock()
         self._register_default_tools()
@@ -473,7 +474,10 @@ class AgentLoop:
                 ))
 
     async def close_mcp(self) -> None:
-        """Close MCP connections."""
+        """Drain background tasks, then close MCP connections."""
+        pending = list(self._consolidation_tasks | self._background_tasks)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         if self._mcp_stack:
             try:
                 await self._mcp_stack.aclose()
@@ -485,6 +489,12 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         logger.info("Agent loop stopping")
+
+    def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Keep a strong reference to non-primary background work until it finishes."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def _process_message(
         self,
@@ -541,34 +551,34 @@ class AgentLoop:
         # Slash commands
         cmd = msg.content.strip().lower()
         if cmd == "/new":
-            lock = self._consolidation_locks.setdefault(session.key, asyncio.Lock())
-            self._consolidating.add(session.key)
-            try:
-                async with lock:
-                    snapshot = session.messages[session.last_consolidated:]
-                    if snapshot:
-                        temp = Session(key=session.key)
-                        temp.messages = list(snapshot)
-                        if not await self._consolidate_memory(temp, archive_all=True):
-                            return OutboundMessage(
-                                channel=msg.channel, chat_id=msg.chat_id,
-                                content="Memory archival failed, session not cleared. Please try again.",
-                                metadata=_response_metadata("failed"),
-                            )
-            except Exception:
-                logger.exception("/new archival failed for {}", session.key)
-                return OutboundMessage(
-                    channel=msg.channel, chat_id=msg.chat_id,
-                    content="Memory archival failed, session not cleared. Please try again.",
-                    metadata=_response_metadata("failed"),
-                )
-            finally:
-                self._consolidating.discard(session.key)
+            archive_session = session
+            lock = self._consolidation_locks.setdefault(archive_session.key, asyncio.Lock())
+            replacement = Session(
+                key=archive_session.key,
+                created_at=archive_session.created_at,
+                metadata=dict(archive_session.metadata),
+            )
+            self.sessions.save(replacement)
 
-            session.clear()
-            self.sessions.save(session)
-            if hasattr(self.sessions, "invalidate"):
-                self.sessions.invalidate(session.key)
+            if archive_session.messages[archive_session.last_consolidated:]:
+
+                async def _archive_in_background(existing_session: Session) -> None:
+                    try:
+                        async with lock:
+                            snapshot = existing_session.messages[existing_session.last_consolidated:]
+                            if not snapshot:
+                                return
+                            temp = Session(key=existing_session.key)
+                            temp.messages = list(snapshot)
+                            if not await self._consolidate_memory(temp, archive_all=True):
+                                logger.warning("/new background archival failed for {}", existing_session.key)
+                    except Exception:
+                        logger.exception("/new background archival failed for {}", existing_session.key)
+
+                self._track_background_task(
+                    asyncio.create_task(_archive_in_background(archive_session))
+                )
+
             return OutboundMessage(channel=msg.channel, chat_id=msg.chat_id,
                                   content="New session started.",
                                   metadata=_response_metadata())

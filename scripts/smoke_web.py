@@ -12,6 +12,8 @@ This is intended for post-deploy verification (closed beta readiness):
 Notes:
   - A successful WS handshake does NOT guarantee the agent loop is running.
     Use --require-response if you want to fail when the agent doesn't reply.
+  - WS auth prefers subprotocol token (frontend behavior) and falls back
+    to query token for older deployments.
 """
 
 from __future__ import annotations
@@ -45,6 +47,38 @@ def _to_ws_url(base_url: str, path: str) -> str:
         raise ValueError(f"Invalid base url: {base_url!r}")
     ws_scheme = "wss" if parsed.scheme == "https" else "ws"
     return f"{ws_scheme}://{parsed.netloc}{path}"
+
+
+async def _connect_ws_with_fallback(
+    ws_base: str,
+    token: str,
+    timeout: float,
+) -> tuple[websockets.WebSocketClientProtocol, str]:
+    """
+    Connect websocket using frontend-compatible auth first, then fallback.
+
+    Returns:
+        (ws, mode) where mode is one of:
+        - "subprotocol": Sec-WebSocket-Protocol carries the token
+        - "query": token is passed in ?token=...
+    """
+    try:
+        ws = await websockets.connect(
+            ws_base,
+            subprotocols=["nanobot", token],
+            open_timeout=timeout,
+        )
+        return ws, "subprotocol"
+    except Exception as sub_err:
+        ws_uri = f"{ws_base}?token={token}"
+        try:
+            ws = await websockets.connect(ws_uri, open_timeout=timeout)
+            return ws, "query"
+        except Exception as query_err:
+            raise RuntimeError(
+                "WebSocket handshake failed with both auth modes. "
+                f"subprotocol={sub_err!r}; query={query_err!r}"
+            ) from query_err
 
 
 async def main() -> int:
@@ -140,12 +174,13 @@ async def main() -> int:
 
         # 4) WS handshake
         ws_base = _to_ws_url(base_url, "/ws/chat")
-        ws_uri = f"{ws_base}?token={token}"
         print("[4/5] WS /ws/chat handshake")
-        print(f"  uri={ws_base}?token=***")
+        print(f"  uri={ws_base}")
 
     # Close httpx client before WS (clean output / avoid long-lived connections).
-    async with websockets.connect(ws_uri, open_timeout=timeout) as ws:
+    ws, ws_mode = await _connect_ws_with_fallback(ws_base, token, timeout)
+    print(f"  auth_mode={ws_mode}")
+    try:
         first = await asyncio.wait_for(ws.recv(), timeout=timeout)
         meta = json.loads(first)
         if str(meta.get("type") or "") == "error":
@@ -180,6 +215,8 @@ async def main() -> int:
         print("  assistant:", msg)
         print("OK")
         return 0
+    finally:
+        await ws.close()
 
 
 if __name__ == "__main__":

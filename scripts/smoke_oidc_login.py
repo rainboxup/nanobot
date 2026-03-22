@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Smoke-test Nanobot web OIDC login path in staging/production-like environments.
+Smoke-test Nanobot web auth login path in staging/production-like environments.
 
 Checks:
   1) GET /api/health
   2) GET /api/ready (accepts 200 by default; optional degraded-allowed mode)
-  3) POST /api/auth/login with {"id_token": "..."}
+  3) POST /api/auth/login with one of:
+     - {"username": "...", "password": "..."} (local auth)
+     - {"id_token": "..."} (OIDC auth)
+     - preflight checks (no real credential)
   4) GET /api/auth/me with returned access token
 """
 
@@ -70,7 +73,7 @@ def _build_preflight_token() -> str:
 
 
 async def main() -> int:
-    ap = argparse.ArgumentParser(description="Nanobot OIDC login smoke test")
+    ap = argparse.ArgumentParser(description="Nanobot auth login smoke test")
     default_port = _env("NANOBOT_PORT", "18790")
     ap.add_argument(
         "--base-url",
@@ -81,6 +84,16 @@ async def main() -> int:
         "--id-token",
         default=_env("NANOBOT_SMOKE_OIDC_ID_TOKEN", ""),
         help="OIDC id_token (or set NANOBOT_SMOKE_OIDC_ID_TOKEN)",
+    )
+    ap.add_argument(
+        "--username",
+        default=_env("NANOBOT_SMOKE_USERNAME", ""),
+        help="Local auth username (or set NANOBOT_SMOKE_USERNAME)",
+    )
+    ap.add_argument(
+        "--password",
+        default=_env("NANOBOT_SMOKE_PASSWORD", ""),
+        help="Local auth password (or set NANOBOT_SMOKE_PASSWORD)",
     )
     ap.add_argument(
         "--oidc-preflight",
@@ -117,13 +130,19 @@ async def main() -> int:
 
     base_url = str(args.base_url or "").strip().rstrip("/")
     id_token = str(args.id_token or "").strip()
+    username = str(args.username or "").strip()
+    password = str(args.password or "")
+    local_mode = bool(username and password)
     preflight_mode = bool(args.oidc_preflight)
     if not base_url:
         print("base-url is required", file=sys.stderr)
         return 2
-    if not id_token and not preflight_mode:
+    if not local_mode and not id_token and not preflight_mode:
         print(
-            "id-token is required (or set NANOBOT_SMOKE_OIDC_ID_TOKEN, or use --oidc-preflight)",
+            (
+                "credentials required: provide username/password, or id-token, "
+                "or use --oidc-preflight"
+            ),
             file=sys.stderr,
         )
         return 2
@@ -161,6 +180,9 @@ async def main() -> int:
             print(f"  status={missing.status_code}")
             print(_json_dump(missing_body))
             missing_reason = str(missing_body.get("reason_code") or "").strip()
+            if missing_reason == "username_required":
+                print("Auth preflight passed (local provider detected)")
+                return 0
             if missing_reason != "oidc_id_token_required":
                 print(
                     "OIDC provider preflight failed: expected reason_code=oidc_id_token_required",
@@ -186,8 +208,17 @@ async def main() -> int:
             print("OIDC preflight failed: unexpected reason_code", file=sys.stderr)
             return 2
 
-        print("[3/4] POST /api/auth/login (oidc)")
-        login = await client.post("/api/auth/login", json={"id_token": id_token})
+        if local_mode:
+            print("[3/4] POST /api/auth/login (local)")
+            login = await client.post(
+                "/api/auth/login",
+                json={"username": username, "password": password},
+            )
+            login_mode_label = "Local"
+        else:
+            print("[3/4] POST /api/auth/login (oidc)")
+            login = await client.post("/api/auth/login", json={"id_token": id_token})
+            login_mode_label = "OIDC"
         login_body = _body_json(login)
         print(f"  status={login.status_code}")
         if int(login.status_code) != 200:
@@ -198,7 +229,7 @@ async def main() -> int:
             return 2
         token = str(login_body.get("access_token") or login_body.get("token") or "").strip()
         if not token:
-            print("OIDC login succeeded but no access token returned", file=sys.stderr)
+            print(f"{login_mode_label} login succeeded but no access token returned", file=sys.stderr)
             print(_json_dump(login_body), file=sys.stderr)
             return 2
         print(f"  token=*** ({len(token)} chars)")

@@ -1,6 +1,6 @@
 # OIDC Staging Smoke
 
-这份说明用于在 staging/预生产环境快速验证 Nanobot Web 的 OIDC 登录链路。
+这份说明用于在 staging/预生产环境快速验证 Nanobot Web 登录链路（含 OIDC）。
 
 ## 前置条件
 
@@ -18,6 +18,10 @@
 export NANOBOT_SMOKE_URL="https://your-staging-domain"
 export NANOBOT_SMOKE_OIDC_ID_TOKEN="<paste-id-token>"
 
+# 本地账号密码模式（可选，适用于 local provider）
+export NANOBOT_SMOKE_USERNAME="admin"
+export NANOBOT_SMOKE_PASSWORD="<password>"
+
 # 可选断言
 export NANOBOT_SMOKE_EXPECT_USERNAME="user@example.com"
 export NANOBOT_SMOKE_EXPECT_TENANT_ID="tenant-a"
@@ -34,7 +38,7 @@ python scripts/smoke_oidc_login.py --allow-ready-degraded
 
 1. `GET /api/health`
 2. `GET /api/ready`
-3. `POST /api/auth/login`（`id_token`）
+3. `POST /api/auth/login`（`username/password` 或 `id_token`）
 4. `GET /api/auth/me`
 
 无 token 预检模式（不验证真实用户身份，仅验证 OIDC provider/JWKS 链路）：
@@ -42,6 +46,8 @@ python scripts/smoke_oidc_login.py --allow-ready-degraded
 ```bash
 python scripts/smoke_oidc_login.py --allow-ready-degraded --oidc-preflight
 ```
+
+若当前是 local provider，预检会接受 `reason_code=username_required` 并判定为通过。
 
 ## 失败排障（reason_code）
 

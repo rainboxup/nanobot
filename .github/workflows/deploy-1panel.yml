@@ -137,10 +137,11 @@ jobs:
           envs: REMOTE_SMOKE_URL,REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
           script: |
             set -euo pipefail
+            DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
             if [ -z "${REMOTE_SMOKE_URL:-}" ]; then
               REMOTE_SMOKE_URL="http://127.0.0.1:8318"
             fi
-            export REMOTE_SMOKE_URL REMOTE_SMOKE_USERNAME REMOTE_SMOKE_PASSWORD REMOTE_SMOKE_OIDC_ID_TOKEN
+            cd "$DEPLOY_PATH"
 
             PYTHON_BIN="python3"
             if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
@@ -152,122 +153,33 @@ jobs:
               fi
             fi
 
-            "$PYTHON_BIN" - <<'PY'
-            import json
-            import os
-            import sys
-            import urllib.error
-            import urllib.request
+            if ! "$PYTHON_BIN" -c "import httpx" >/dev/null 2>&1; then
+              "$PYTHON_BIN" -m pip install --disable-pip-version-check --quiet httpx
+            fi
 
-            base_url = str(os.getenv("REMOTE_SMOKE_URL") or "http://127.0.0.1:8318").strip().rstrip("/")
-            username = str(os.getenv("REMOTE_SMOKE_USERNAME") or "").strip()
-            password = str(os.getenv("REMOTE_SMOKE_PASSWORD") or "")
-            id_token = str(os.getenv("REMOTE_SMOKE_OIDC_ID_TOKEN") or "").strip()
-
-            if not base_url:
-                print("REMOTE_SMOKE_URL is empty", file=sys.stderr)
-                raise SystemExit(2)
-
-            def request(method: str, path: str, payload=None, headers=None):
-                url = f"{base_url}{path}"
-                data = None
-                req_headers = {"Content-Type": "application/json"}
-                if headers:
-                    req_headers.update(headers)
-                if payload is not None:
-                    data = json.dumps(payload).encode("utf-8")
-                req = urllib.request.Request(url=url, data=data, headers=req_headers, method=method)
-                try:
-                    with urllib.request.urlopen(req, timeout=20) as resp:
-                        raw = resp.read().decode("utf-8", errors="replace")
-                        status = int(resp.getcode() or 0)
-                except urllib.error.HTTPError as exc:
-                    raw = exc.read().decode("utf-8", errors="replace")
-                    status = int(exc.code or 0)
-                except urllib.error.URLError as exc:
-                    print(f"request failed: {method} {path}: {exc}", file=sys.stderr)
-                    raise SystemExit(2)
-                try:
-                    body = json.loads(raw) if raw else {}
-                except Exception:
-                    body = {"raw": raw}
-                return status, body
-
-            status, body = request("GET", "/api/health")
-            print(f"[health] status={status}")
-            print(json.dumps(body, ensure_ascii=False))
-            if status != 200:
-                raise SystemExit(2)
-
-            status, body = request("GET", "/api/ready")
-            print(f"[ready] status={status}")
-            print(json.dumps(body, ensure_ascii=False))
-            if status not in (200, 503):
-                raise SystemExit(2)
-
-            if username and password:
-                status, body = request(
-                    "POST",
-                    "/api/auth/login",
-                    payload={"username": username, "password": password},
-                )
-                print(f"[login:local] status={status}")
-                print(json.dumps(body, ensure_ascii=False))
-                if status != 200:
-                    raise SystemExit(2)
-                token = str(body.get("access_token") or body.get("token") or "").strip()
-                if not token:
-                    print("local login succeeded but access token missing", file=sys.stderr)
-                    raise SystemExit(2)
-                status, body = request(
-                    "GET",
-                    "/api/auth/me",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                print(f"[me] status={status}")
-                print(json.dumps(body, ensure_ascii=False))
-                if status != 200:
-                    raise SystemExit(2)
-                print("Remote smoke passed via local credentials")
-                raise SystemExit(0)
-
-            if id_token:
-                status, body = request(
-                    "POST",
-                    "/api/auth/login",
-                    payload={"id_token": id_token},
-                )
-                print(f"[login:oidc] status={status}")
-                print(json.dumps(body, ensure_ascii=False))
-                if status != 200:
-                    raise SystemExit(2)
-                token = str(body.get("access_token") or body.get("token") or "").strip()
-                if not token:
-                    print("oidc login succeeded but access token missing", file=sys.stderr)
-                    raise SystemExit(2)
-                status, body = request(
-                    "GET",
-                    "/api/auth/me",
-                    headers={"Authorization": f"Bearer {token}"},
-                )
-                print(f"[me] status={status}")
-                print(json.dumps(body, ensure_ascii=False))
-                if status != 200:
-                    raise SystemExit(2)
-                print("Remote smoke passed via oidc id_token")
-                raise SystemExit(0)
-
-            status, body = request("POST", "/api/auth/login", payload={})
-            print(f"[login:preflight-empty] status={status}")
-            print(json.dumps(body, ensure_ascii=False))
-            reason = str(body.get("reason_code") or "").strip()
-            if reason in {"oidc_id_token_required", "username_required"}:
-                print("Remote smoke passed via preflight reason_code")
-                raise SystemExit(0)
-
-            print("remote smoke preflight failed: unexpected reason_code", file=sys.stderr)
-            raise SystemExit(2)
-            PY
+            if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
+              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
+              NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
+              "$PYTHON_BIN" scripts/smoke_oidc_login.py \
+                --allow-ready-degraded \
+                --timeout 20 \
+                --username "$REMOTE_SMOKE_USERNAME" \
+                --password "$REMOTE_SMOKE_PASSWORD"
+            elif [ -n "${REMOTE_SMOKE_OIDC_ID_TOKEN:-}" ]; then
+              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              NANOBOT_SMOKE_OIDC_ID_TOKEN="$REMOTE_SMOKE_OIDC_ID_TOKEN" \
+              "$PYTHON_BIN" scripts/smoke_oidc_login.py \
+                --allow-ready-degraded \
+                --timeout 20 \
+                --id-token "$REMOTE_SMOKE_OIDC_ID_TOKEN"
+            else
+              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              "$PYTHON_BIN" scripts/smoke_oidc_login.py \
+                --allow-ready-degraded \
+                --timeout 20 \
+                --oidc-preflight
+            fi
 
       - name: Checkout repository for smoke scripts
         uses: actions/checkout@v4

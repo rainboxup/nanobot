@@ -54,6 +54,9 @@ class ToolRegistry:
                 return result + hint_suffix
             return result
         except Exception as e:
+            reason_code = str(getattr(e, "reason_code", "") or "").strip()
+            if reason_code:
+                return f"Error [{reason_code}]: {str(e)}" + hint_suffix
             return f"Error executing {name}: {str(e)}" + hint_suffix
 
     @property

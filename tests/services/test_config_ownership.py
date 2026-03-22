@@ -19,6 +19,10 @@ def test_get_config_scope_workspace_keys() -> None:
     assert ConfigOwnershipService.get_config_scope("providers.openai.api_key") == ConfigScope.WORKSPACE
     assert ConfigOwnershipService.get_config_scope("workspace.channels.feishu.app_id") == ConfigScope.WORKSPACE
     assert (
+        ConfigOwnershipService.get_config_scope("workspace.integrations.connectors.crm.auth.mode")
+        == ConfigScope.WORKSPACE
+    )
+    assert (
         ConfigOwnershipService.get_config_scope("workspace.channels.dingtalk.client_secret")
         == ConfigScope.WORKSPACE
     )
@@ -187,3 +191,33 @@ def test_workspace_channel_credentials_ownership_rejects_unsupported_channel() -
     assert decision.allowed is False
     assert decision.scope == ConfigScope.WORKSPACE
     assert decision.reason_code == "unsupported_workspace_channel"
+
+
+def test_workspace_integration_credentials_ownership_allows_workspace_scope_in_multi() -> None:
+    decision = ConfigOwnershipService.check_workspace_integration_credentials_ownership(
+        runtime_mode="multi",
+        integration_name="crm_core",
+    )
+    assert decision.allowed is True
+    assert decision.scope == ConfigScope.WORKSPACE
+    assert decision.reason_code == "workspace_scope"
+
+
+def test_workspace_integration_credentials_ownership_rejects_invalid_name() -> None:
+    decision = ConfigOwnershipService.check_workspace_integration_credentials_ownership(
+        runtime_mode="multi",
+        integration_name="CRM/invalid",
+    )
+    assert decision.allowed is False
+    assert decision.scope == ConfigScope.WORKSPACE
+    assert decision.reason_code == "workspace_integration_name_invalid"
+
+
+def test_workspace_integration_credentials_ownership_rejects_single_tenant_runtime() -> None:
+    decision = ConfigOwnershipService.check_workspace_integration_credentials_ownership(
+        runtime_mode="single",
+        integration_name="crm_core",
+    )
+    assert decision.allowed is False
+    assert decision.scope == ConfigScope.WORKSPACE
+    assert decision.reason_code == "single_tenant_runtime_mode"

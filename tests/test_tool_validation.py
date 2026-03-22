@@ -1,14 +1,21 @@
+import json
 from pathlib import Path
 from typing import Any
 
 from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.agent.tools.base import Tool
+from nanobot.agent.tools.integration import IntegrationTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
+from nanobot.services.integration_runtime import (
+    ConnectorInvocation,
+    IntegrationRuntimeError,
+    IntegrationRuntimeService,
+)
 from nanobot.tenants.store import TenantStore
 
 
@@ -201,3 +208,85 @@ async def test_message_tool_web_override_is_fail_closed_for_invalid_target() -> 
     result = await tool.execute("hello", channel="web", chat_id="not-a-web-chat-id")
     assert result == "Error: Invalid web message target"
     assert sent == []
+
+
+async def test_registry_surfaces_reason_code_when_tool_raises_structured_error() -> None:
+    class FailingTool(Tool):
+        @property
+        def name(self) -> str:
+            return "failing_tool"
+
+        @property
+        def description(self) -> str:
+            return "fails with reason code"
+
+        @property
+        def parameters(self) -> dict[str, Any]:
+            return {"type": "object", "properties": {}}
+
+        async def execute(self, **kwargs: Any) -> str:
+            del kwargs
+            raise IntegrationRuntimeError("connector_execution_failed", "boom")
+
+    reg = ToolRegistry()
+    reg.register(FailingTool())
+    result = await reg.execute("failing_tool", {})
+    assert "Error [connector_execution_failed]: boom" in result
+
+
+async def test_integration_tool_returns_reason_code_for_missing_connector() -> None:
+    reg = ToolRegistry()
+    runtime = IntegrationRuntimeService(connectors={})
+    tool = IntegrationTool(runtime)
+    tool.set_context("web", "web:tenant-a:deadbeef")
+    reg.register(tool)
+
+    result = await reg.execute(
+        "integration",
+        {"connector": "crm_core", "operation": "sync_contacts", "payload": {"contact_id": "1"}},
+    )
+    assert "Error [connector_not_configured]" in result
+
+
+async def test_integration_tool_blocks_cross_tenant_context() -> None:
+    async def _mock_adapter(_request: ConnectorInvocation) -> dict[str, Any]:
+        return {"ok": True}
+
+    runtime = IntegrationRuntimeService(
+        connectors={"crm_core": {"enabled": True, "provider": "mock"}},
+        adapters={"mock": _mock_adapter},
+        tenant_id="tenant-a",
+    )
+    tool = IntegrationTool(runtime)
+    tool.set_context("web", "web:tenant-b:deadbeef")
+    reg = ToolRegistry()
+    reg.register(tool)
+
+    result = await reg.execute("integration", {"connector": "crm_core", "operation": "sync_contacts"})
+    assert "Error [connector_tenant_boundary_violation]" in result
+
+
+async def test_integration_tool_returns_structured_success_payload() -> None:
+    async def _mock_adapter(request: ConnectorInvocation) -> dict[str, Any]:
+        return {"received_operation": request.operation, "tenant_id": request.tenant_id}
+
+    runtime = IntegrationRuntimeService(
+        connectors={"crm_core": {"enabled": True, "provider": "mock"}},
+        adapters={"mock": _mock_adapter},
+        tenant_id="tenant-a",
+    )
+    tool = IntegrationTool(runtime)
+    tool.set_context("web", "web:tenant-a:deadbeef")
+    reg = ToolRegistry()
+    reg.register(tool)
+
+    result = await reg.execute(
+        "integration",
+        {"connector": "crm_core", "operation": "sync_contacts", "payload": {"contact_id": "1"}},
+    )
+    payload = json.loads(result)
+    assert payload["status"] == "succeeded"
+    assert payload["connector"] == "crm_core"
+    assert payload["provider"] == "mock"
+    assert payload["tenant_id"] == "tenant-a"
+    assert payload["output"]["received_operation"] == "sync_contacts"

@@ -113,6 +113,79 @@ def _demo_kit_help_text() -> str:
     return f"{base}. Available: {', '.join(kits)}"
 
 
+def _packaging_profile_help_text() -> str:
+    return (
+        "Optional packaging profile bootstrap (pilot/prod/enterprise). "
+        "When set, onboard updates packaging capabilities and may apply bundled workspace overlays."
+    )
+
+
+def _apply_packaging_profile_bootstrap(config, profile_name: str) -> bool:
+    from nanobot.config.schema import PackagingProfile
+
+    normalized = str(profile_name or "").strip().lower()
+    if normalized not in {"pilot", "prod", "enterprise"}:
+        raise ValueError("packaging profile must be one of: pilot, prod, enterprise")
+
+    changed = False
+    profile_defaults = {
+        "pilot": PackagingProfile(
+            name="pilot",
+            required_capabilities=[],
+            required_help_slugs=[],
+        ),
+        "prod": PackagingProfile(
+            name="prod",
+            required_capabilities=[
+                "integration_contract",
+                "auth_provider_abstraction",
+                "workflow_core",
+            ],
+            required_help_slugs=[
+                "config-ownership",
+                "effective-policy-and-soul",
+                "workspace-routing-and-binding",
+            ],
+        ),
+        "enterprise": PackagingProfile(
+            name="enterprise",
+            required_capabilities=[
+                "integration_contract",
+                "auth_provider_abstraction",
+                "workflow_core",
+                "enterprise_packaging",
+            ],
+            required_help_slugs=[
+                "config-ownership",
+                "effective-policy-and-soul",
+                "workspace-routing-and-binding",
+                "enterprise-bundle-bootstrap",
+            ],
+        ),
+    }
+
+    for key, default_profile in profile_defaults.items():
+        existing = config.packaging.profiles.get(key)
+        if not isinstance(existing, PackagingProfile):
+            config.packaging.profiles[key] = default_profile
+            changed = True
+
+    if str(config.packaging.active_profile or "") != normalized:
+        config.packaging.active_profile = normalized
+        changed = True
+
+    active = config.packaging.profiles.get(normalized)
+    required_capabilities = list(getattr(active, "required_capabilities", []) or [])
+    for capability_name in required_capabilities:
+        if not hasattr(config.packaging.capabilities, capability_name):
+            continue
+        if not bool(getattr(config.packaging.capabilities, capability_name, False)):
+            setattr(config.packaging.capabilities, capability_name, True)
+            changed = True
+
+    return changed
+
+
 app = typer.Typer(
     name="nanobot",
     help="nanobot - Personal AI Assistant",
@@ -185,6 +258,11 @@ def onboard(
         "--demo-kit",
         help=_demo_kit_help_text(),
     ),
+    packaging_profile: str | None = typer.Option(
+        None,
+        "--packaging-profile",
+        help=_packaging_profile_help_text(),
+    ),
 ):
     """Initialize nanobot configuration and workspace."""
     from nanobot.config.loader import get_config_path, load_config, save_config
@@ -213,6 +291,21 @@ def onboard(
         save_config(config)
         console.print(f"{_ok_text()} Config refreshed (existing values preserved)")
 
+    selected_packaging_profile = str(packaging_profile or "").strip().lower()
+    if selected_packaging_profile and selected_packaging_profile not in {"pilot", "prod", "enterprise"}:
+        console.print(
+            "[red]Error: --packaging-profile must be one of: pilot, prod, enterprise[/red]"
+        )
+        raise typer.Exit(1)
+
+    # Backward-compatible guard: materialize newly introduced packaging config if missing.
+    if getattr(config, "packaging", None) is None:
+        config.packaging = Config().packaging
+        save_config(config)
+    if selected_packaging_profile:
+        if _apply_packaging_profile_bootstrap(config, selected_packaging_profile):
+            save_config(config)
+
     # Create workspace
     workspace = get_workspace_path(config.workspace_path)
     workspace_existed = workspace.exists()
@@ -224,7 +317,11 @@ def onboard(
         console.print(f"{_ok_text()} Created workspace at {workspace}")
 
     # Create default bootstrap files
-    from nanobot.utils.workspace import apply_demo_kit_overlay, create_workspace_templates
+    from nanobot.utils.workspace import (
+        apply_demo_kit_overlay,
+        apply_packaging_bundle_overlay,
+        create_workspace_templates,
+    )
 
     created = create_workspace_templates(workspace)
     for p in created:
@@ -233,6 +330,25 @@ def onboard(
             console.print(f"  [dim]Created {rel.as_posix()}[/dim]")
         except Exception:
             console.print(f"  [dim]Created {p}[/dim]")
+
+    if selected_packaging_profile:
+        if workspace_had_content:
+            console.print(
+                "[yellow]"
+                f"Skipped packaging bundle '{selected_packaging_profile}' because the workspace already existed with content."
+                "[/yellow]"
+            )
+        else:
+            packaging_created = apply_packaging_bundle_overlay(workspace, selected_packaging_profile)
+            for p in packaging_created:
+                try:
+                    rel = p.relative_to(workspace)
+                    console.print(f"  [dim]Created {rel.as_posix()}[/dim]")
+                except Exception:
+                    console.print(f"  [dim]Created {p}[/dim]")
+            console.print(
+                f"{_ok_text()} Applied packaging profile '{selected_packaging_profile}' bootstrap"
+            )
 
     if demo_kit:
         if workspace_had_content:
@@ -630,6 +746,7 @@ def _gateway_impl(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         managed_skills_dir=get_skill_store_dir(),
+        integration_connectors=config.workspace.integrations.connectors,
     )
 
     # Set cron callback (needs agent)
@@ -921,6 +1038,7 @@ def _agent_impl(*, message: str | None, session_id: str, workspace: str | None) 
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,
         managed_skills_dir=get_skill_store_dir(),
+        integration_connectors=config.workspace.integrations.connectors,
     )
 
     if message:

@@ -612,6 +612,8 @@ class MultiTenantAgentLoop:
             enable_spawn=False,
             enable_exec=enable_exec,
             managed_skills_dir=self.skill_store_dir,
+            integration_connectors=tenant_cfg.workspace.integrations.connectors,
+            integration_tenant_id=tenant.tenant_id,
         )
 
         now = time.monotonic()

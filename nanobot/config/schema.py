@@ -1,7 +1,7 @@
 """Configuration schema using Pydantic."""
 
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
@@ -246,10 +246,41 @@ class WorkspaceChannelsConfig(Base):
     dingtalk: TenantChannelOverride = Field(default_factory=TenantChannelOverride)
 
 
+class IntegrationAuthConfig(Base):
+    """Workspace integration authentication configuration."""
+
+    mode: Literal["none", "api_key", "oauth2_client_credentials", "basic"] = "none"
+    api_key: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    token_url: str = ""
+    username: str = ""
+    password: str = ""
+    scopes: list[str] = Field(default_factory=list)
+
+
+class WorkspaceIntegrationConfig(Base):
+    """Workspace-scoped integration connector configuration."""
+
+    enabled: bool = True
+    provider: str = ""
+    base_url: str = ""
+    timeout_s: int = 30
+    auth: IntegrationAuthConfig = Field(default_factory=IntegrationAuthConfig)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class WorkspaceIntegrationsConfig(Base):
+    """Workspace-scoped integration connectors."""
+
+    connectors: dict[str, WorkspaceIntegrationConfig] = Field(default_factory=dict)
+
+
 class WorkspaceConfig(Base):
     """Workspace-scoped configuration persisted per tenant."""
 
     channels: WorkspaceChannelsConfig = Field(default_factory=WorkspaceChannelsConfig)
+    integrations: WorkspaceIntegrationsConfig = Field(default_factory=WorkspaceIntegrationsConfig)
 
 
 class ChannelsConfig(Base):
@@ -456,6 +487,31 @@ class TrafficConfig(Base):
     link_state_gc_every_calls: int = Field(default=64, ge=1)
 
 
+class CapabilityFlags(Base):
+    """Machine-checkable capability flags for packaging profiles."""
+
+    integration_contract: bool = False
+    auth_provider_abstraction: bool = False
+    workflow_core: bool = False
+    enterprise_packaging: bool = False
+
+
+class PackagingProfile(Base):
+    """Named packaging profile requirements."""
+
+    name: Literal["pilot", "prod", "enterprise"] = "pilot"
+    required_capabilities: list[str] = Field(default_factory=list)
+    required_help_slugs: list[str] = Field(default_factory=list)
+
+
+class PackagingConfig(Base):
+    """Packaging profile selection and capability declarations."""
+
+    active_profile: Literal["pilot", "prod", "enterprise"] = "pilot"
+    capabilities: CapabilityFlags = Field(default_factory=CapabilityFlags)
+    profiles: dict[str, PackagingProfile] = Field(default_factory=dict)
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
@@ -466,6 +522,7 @@ class Config(BaseSettings):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     traffic: TrafficConfig = Field(default_factory=TrafficConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    packaging: PackagingConfig = Field(default_factory=PackagingConfig)
 
     @property
     def workspace_path(self) -> Path:

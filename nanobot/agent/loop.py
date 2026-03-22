@@ -19,6 +19,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tenant_workspace import require_web_tenant_id, resolve_tenant_memory_workspace
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.integration import IntegrationTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.shell import ExecTool
@@ -36,8 +37,10 @@ if TYPE_CHECKING:
         FilesystemToolConfig,
         InputLimitsConfig,
         WebToolsConfig,
+        WorkspaceIntegrationConfig,
     )
     from nanobot.cron.service import CronService
+    from nanobot.services.protocols import IntegrationRuntimeProtocol
 
 
 class AgentLoop:
@@ -101,6 +104,9 @@ class AgentLoop:
         enable_spawn: bool = True,
         enable_exec: bool = True,
         managed_skills_dir: Path | None = None,
+        integration_runtime: IntegrationRuntimeProtocol | None = None,
+        integration_connectors: dict[str, WorkspaceIntegrationConfig] | None = None,
+        integration_tenant_id: str | None = None,
     ):
         from nanobot.config.schema import (
             ExecToolConfig,
@@ -131,6 +137,19 @@ class AgentLoop:
         self.managed_skills_dir = (
             Path(managed_skills_dir).expanduser() if managed_skills_dir is not None else None
         )
+        if integration_runtime is not None:
+            self._integration_runtime = integration_runtime
+        elif integration_connectors:
+            from nanobot.services.integration_native import build_default_integration_adapters
+            from nanobot.services.integration_runtime import IntegrationRuntimeService
+
+            self._integration_runtime = IntegrationRuntimeService(
+                connectors=integration_connectors,
+                adapters=build_default_integration_adapters(workspace=self.workspace),
+                tenant_id=integration_tenant_id,
+            )
+        else:
+            self._integration_runtime = None
         self._default_fs_allowed_dir = self.workspace if self.restrict_to_workspace else None
         self._filesystem_tools: list[ReadFileTool | WriteFileTool | EditFileTool | ListDirTool] = []
         self._exec_tool: ExecTool | None = None
@@ -256,6 +275,8 @@ class AgentLoop:
                     allow_private_network=self.web_config.fetch.allow_private_network,
                 )
             )
+        if self._integration_runtime is not None:
+            self.tools.register(IntegrationTool(self._integration_runtime))
         self.tools.register(
             MessageTool(send_callback=self.bus.publish_outbound, allow_target_override=True)
         )
@@ -301,7 +322,7 @@ class AgentLoop:
         session_key: str | None = None,
     ) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "spawn", "cron", "integration"):
             tool = self.tools.get(name)
             if not tool or not hasattr(tool, "set_context"):
                 continue

@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 # Tenant ID validation
 _TENANT_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_WORKSPACE_INTEGRATION_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _RESERVED_TENANT_IDS = {
     ".",
     "..",
@@ -76,6 +77,12 @@ WORKSPACE_ROUTING_CHANNEL_DISPLAY_NAMES = {
     "feishu": "Feishu",
     "dingtalk": "DingTalk",
 }
+ALLOWED_WORKSPACE_INTEGRATION_AUTH_MODES = {
+    "none",
+    "api_key",
+    "oauth2_client_credentials",
+    "basic",
+}
 
 
 def classify_config_scope(config_key: str) -> str:
@@ -119,6 +126,19 @@ def workspace_routing_channel_display_name(channel_name: str) -> str:
 def is_workspace_routing_channel(channel_name: str) -> bool:
     """Return whether a channel supports workspace-scoped routing."""
     return normalize_workspace_routing_channel_name(channel_name) in WORKSPACE_ROUTING_CHANNELS
+
+
+def normalize_workspace_integration_name(integration_name: str) -> str:
+    """Normalize a workspace integration connector name."""
+    return str(integration_name or "").strip().lower()
+
+
+def validate_workspace_integration_name(integration_name: str) -> str:
+    """Validate and normalize a workspace integration connector name."""
+    normalized = normalize_workspace_integration_name(integration_name)
+    if not normalized or not _WORKSPACE_INTEGRATION_NAME_RE.fullmatch(normalized):
+        raise ValueError("workspace_integration_name_invalid")
+    return normalized
 
 
 def normalize_tenant_id(value: str) -> str:
@@ -246,6 +266,74 @@ class ConfigOwnershipValidator:
             if isinstance(channel_cfg, dict)
         }
 
+    def _workspace_integration_overrides(
+        self, tenant_config_dict: dict[str, Any]
+    ) -> dict[str, Any]:
+        workspace_cfg = tenant_config_dict.get("workspace")
+        if not isinstance(workspace_cfg, dict):
+            return {}
+        integrations_cfg = workspace_cfg.get("integrations")
+        if not isinstance(integrations_cfg, dict):
+            return {}
+        connectors_cfg = integrations_cfg.get("connectors")
+        if not isinstance(connectors_cfg, dict):
+            return {}
+        return {str(integration_name): connector_cfg for integration_name, connector_cfg in connectors_cfg.items()}
+
+    def _validate_workspace_integration_contract(
+        self, tenant_config_dict: dict[str, Any], tenant_id: str
+    ) -> ValidationResult:
+        for raw_name, connector_cfg in self._workspace_integration_overrides(tenant_config_dict).items():
+            try:
+                normalized_name = validate_workspace_integration_name(raw_name)
+            except ValueError:
+                return ValidationResult(
+                    valid=False,
+                    reason_code="workspace_integration_name_invalid",
+                    message=f"Invalid workspace integration connector name: {raw_name}",
+                    details={"tenant_id": tenant_id, "integration_name": raw_name},
+                )
+
+            if not isinstance(connector_cfg, dict):
+                return ValidationResult(
+                    valid=False,
+                    reason_code="workspace_integration_invalid",
+                    message="Workspace integration connector configuration must be an object.",
+                    details={"tenant_id": tenant_id, "integration_name": normalized_name},
+                )
+
+            auth_cfg = connector_cfg.get("auth")
+            if auth_cfg is None:
+                continue
+            if not isinstance(auth_cfg, dict):
+                return ValidationResult(
+                    valid=False,
+                    reason_code="workspace_integration_auth_invalid",
+                    message="Workspace integration auth configuration must be an object.",
+                    details={"tenant_id": tenant_id, "integration_name": normalized_name},
+                )
+
+            auth_mode = auth_cfg.get("mode")
+            if auth_mode is None:
+                continue
+            normalized_mode = str(auth_mode).strip().lower()
+            if normalized_mode not in ALLOWED_WORKSPACE_INTEGRATION_AUTH_MODES:
+                return ValidationResult(
+                    valid=False,
+                    reason_code="workspace_integration_auth_invalid",
+                    message=(
+                        "Workspace integration auth mode is invalid. "
+                        f"Allowed modes: {', '.join(sorted(ALLOWED_WORKSPACE_INTEGRATION_AUTH_MODES))}"
+                    ),
+                    details={
+                        "tenant_id": tenant_id,
+                        "integration_name": normalized_name,
+                        "auth_mode": normalized_mode,
+                    },
+                )
+
+        return ValidationResult(valid=True)
+
     def _validate_subset_constraint(
         self, tenant_config_dict: dict[str, Any], tenant_id: str
     ) -> ValidationResult:
@@ -310,6 +398,12 @@ class ConfigOwnershipValidator:
                         "system_allow_from": sorted(system_allow_from),
                     },
                 )
+
+        integration_result = self._validate_workspace_integration_contract(
+            tenant_config_dict, tenant_id
+        )
+        if not integration_result.valid:
+            return integration_result
 
         return ValidationResult(valid=True)
 

@@ -1,20 +1,24 @@
-"""Service layer protocol interfaces for Policy/Soul/Skills architecture.
+"""Service layer protocol interfaces for Policy/Soul/Skills/Workflow architecture.
 
 These protocols define the contracts for the three-layer service architecture:
 - Policy Layer: Runtime constraints and capability gating
 - Soul Layer: Personality customization with precedence rules
 - Skills Layer: Capability packages with workspace quotas
+- Workflow Layer: Headless workflow listing and run contracts
+- Integration Layer: Tenant-safe connector runtime invocation
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
 if TYPE_CHECKING:
+    from nanobot.services.integration_runtime import ConnectorInvocation
     from nanobot.services.policy_evaluation import PolicyDecision
     from nanobot.services.skill_management import SkillInstallResult, SkillUninstallResult
     from nanobot.services.soul_layering import EffectiveSoul
+    from nanobot.workflow.types import WorkflowDefinition, WorkflowRunResult
 
 
 class PolicyServiceProtocol(Protocol):
@@ -135,4 +139,43 @@ class SkillServiceProtocol(Protocol):
         workspace: Path,
     ) -> "SkillUninstallResult":
         """Uninstall skill from workspace."""
+        ...
+
+
+class WorkflowServiceProtocol(Protocol):
+    """Workflow service contract for workflow listing and execution."""
+
+    def list_workflows(self) -> list["WorkflowDefinition"]:
+        """List available workflow definitions."""
+        ...
+
+    def run_workflow(self, workflow_id: str, *, force: bool = False) -> "WorkflowRunResult":
+        """Run workflow by id."""
+        ...
+
+
+class IntegrationRuntimeProtocol(Protocol):
+    """Integration runtime contract for tenant-safe connector invocation."""
+
+    def set_context(self, channel: str, chat_id: str) -> None:
+        """Set current routing context for boundary checks."""
+        ...
+
+    async def invoke(
+        self,
+        *,
+        connector: str,
+        operation: str,
+        payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Invoke a connector operation and return structured output."""
+        ...
+
+
+class IntegrationAdapterProtocol(Protocol):
+    """Connector provider adapter contract."""
+
+    async def execute(self, request: "ConnectorInvocation") -> dict[str, Any] | str | None:
+        """Execute a connector invocation request."""
         ...

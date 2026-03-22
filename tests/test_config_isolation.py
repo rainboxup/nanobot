@@ -10,7 +10,7 @@ from nanobot.config.loader import (
     load_config,
     migrate_config_data,
 )
-from nanobot.config.schema import Config
+from nanobot.config.schema import Config, WorkspaceIntegrationConfig
 from nanobot.tenants import store as tenant_store_module
 from nanobot.tenants.store import TenantConfigBusyError, TenantConfigConflictError, TenantStore
 from nanobot.tenants.validation import ConfigValidationError
@@ -148,6 +148,42 @@ def test_tenant_store_save_rejects_workspace_channel_allowlist_expansion(tmp_pat
     cfg.workspace.channels.feishu.allow_from = ["system-user", "rogue-user"]
 
     with pytest.raises(ConfigValidationError, match="subset_constraint"):
+        store.save_tenant_config(tenant_id, cfg)
+
+
+def test_tenant_store_save_preserves_workspace_integrations_unknown_metadata(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-int-1")
+
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.workspace.integrations.connectors["crm_core"] = WorkspaceIntegrationConfig(
+        provider="acme-crm",
+        base_url="https://crm.example.com",
+        metadata={"future_flag": True, "nested_payload": {"raw_key": "keep"}},
+    )
+    store.save_tenant_config(tenant_id, cfg)
+
+    reloaded = store.load_tenant_config(tenant_id)
+    reloaded.workspace.channels.feishu.enabled = False
+    store.save_tenant_config(tenant_id, reloaded)
+
+    final = store.load_tenant_config(tenant_id)
+    metadata = final.workspace.integrations.connectors["crm_core"].metadata
+    assert metadata["future_flag"] is True
+    assert metadata["nested_payload"]["raw_key"] == "keep"
+
+
+def test_tenant_store_save_rejects_invalid_workspace_integration_name(tmp_path) -> None:
+    store = TenantStore(base_dir=tmp_path / "tenants", system_config=Config())
+    tenant_id = store.ensure_tenant("telegram", "u-int-2")
+
+    cfg = store.load_tenant_config(tenant_id)
+    cfg.workspace.integrations.connectors["CRM/invalid"] = WorkspaceIntegrationConfig(
+        provider="acme-crm",
+        base_url="https://crm.example.com",
+    )
+
+    with pytest.raises(ConfigValidationError, match="workspace_integration_name_invalid"):
         store.save_tenant_config(tenant_id, cfg)
 
 

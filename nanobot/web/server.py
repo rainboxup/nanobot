@@ -20,9 +20,10 @@ from loguru import logger
 from nanobot import __version__
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
-from nanobot.web.audit import AuditLogger, request_ip, resolve_audit_log_path
+from nanobot.web.audit import AuditLogger, resolve_audit_log_path
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
 from nanobot.web.auth_cookie import set_refresh_cookie
+from nanobot.web.auth_providers import AuthProviderRegistry, LocalAuthProvider
 from nanobot.web.beta_access import (
     BetaAccessStore,
     is_beta_admin,
@@ -472,10 +473,35 @@ def _ops_runtime_attention(
 
 
 def _build_readiness_payload(app) -> dict[str, Any]:
+    from nanobot.services.capability_manifest import validate_packaging_profile
+    from nanobot.services.help_docs import HelpDocsRegistry
+
     runtime_mode = str(getattr(app.state, "runtime_mode", "multi") or "multi").strip().lower()
     if runtime_mode not in {"single", "multi"}:
         runtime_mode = "multi"
     runtime_scope = "global" if runtime_mode == "single" else "tenant"
+
+    packaging_profile = "pilot"
+    packaging_ready = True
+    packaging_reasons: list[str] = []
+    app_config = getattr(app.state, "config", None)
+    help_docs_registry = getattr(app.state, "help_docs_registry", None)
+    if isinstance(app_config, Config) and isinstance(help_docs_registry, HelpDocsRegistry):
+        try:
+            packaging_validation = validate_packaging_profile(app_config, help_docs_registry)
+        except Exception:
+            packaging_profile = str(
+                getattr(getattr(app_config, "packaging", None), "active_profile", "pilot") or "pilot"
+            ).strip().lower() or "pilot"
+            packaging_ready = False
+            packaging_reasons = ["packaging_validation_failed"]
+        else:
+            packaging_profile = str(packaging_validation.get("profile") or "pilot").strip().lower() or "pilot"
+            packaging_ready = bool(packaging_validation.get("ready", False))
+            for item in list(packaging_validation.get("reason_codes") or []):
+                code = str(item or "").strip()
+                if code and code not in packaging_reasons:
+                    packaging_reasons.append(code)
 
     checks = {
         "message_bus": isinstance(getattr(app.state, "bus", None), MessageBus),
@@ -483,6 +509,7 @@ def _build_readiness_payload(app) -> dict[str, Any]:
         "audit_logger": isinstance(getattr(app.state, "audit_logger", None), AuditLogger),
         "dashboard_assets": bool(getattr(app.state, "web_static_ready", False)),
         "web_channel": bool(getattr(app.state, "web_channel_ready", False)),
+        "packaging_profile": bool(packaging_ready),
     }
     warnings: list[str] = []
     if not bool(getattr(app.state, "jwt_secret_from_env", False)):
@@ -508,12 +535,22 @@ def _build_readiness_payload(app) -> dict[str, Any]:
         warnings.append(
             "Insecure placeholder secrets are allowed by configuration; production deployment is unsafe"
         )
+    if not bool(packaging_ready):
+        if packaging_reasons:
+            warnings.append(
+                f"Packaging profile '{packaging_profile}' is not ready: {', '.join(packaging_reasons)}"
+            )
+        else:
+            warnings.append(f"Packaging profile '{packaging_profile}' is not ready")
     return {
         "status": "ready" if all(bool(v) for v in checks.values()) else "degraded",
         "version": str(__version__),
         "runtime_mode": runtime_mode,
         "runtime_scope": runtime_scope,
         "checks": checks,
+        "packaging_profile": packaging_profile,
+        "packaging_ready": bool(packaging_ready),
+        "packaging_reasons": packaging_reasons,
         "warnings": warnings,
         "guides": _operator_guide_summaries(app),
     }
@@ -622,6 +659,11 @@ def create_app(
     )
     user_store = UserStore(auth_state_path)
     app.state.user_store = user_store
+    auth_provider_name = str(os.getenv("NANOBOT_WEB_AUTH_PROVIDER") or "local").strip().lower() or "local"
+    auth_provider_registry = AuthProviderRegistry(default=auth_provider_name)
+    auth_provider_registry.register(LocalAuthProvider())
+    app.state.auth_provider_registry = auth_provider_registry
+    app.state.auth_provider_name = auth_provider_name
     app.state.bootstrap_owner = _bootstrap_owner_username()
     app.state.cron_runtime_tenant_id = str(app.state.bootstrap_owner)
     bootstrap_password = _load_admin_password()
@@ -767,155 +809,54 @@ def create_app(
 
     @app.post("/api/auth/login")
     async def login(payload: dict[str, Any], request: Request) -> JSONResponse:
-        username = str(payload.get("username") or "").strip()
-        password = str(payload.get("password") or "")
-        source_ip = request_ip(request)
-        audit = getattr(app.state, "audit_logger", None)
-        login_guard = getattr(app.state, "login_guard", None)
-
-        def _audit_login(status_text: str, reason: str, *, extra: dict[str, Any] | None = None) -> None:
-            if isinstance(audit, AuditLogger):
-                meta = {"reason": reason}
-                if extra:
-                    meta.update(extra)
-                audit.log(
-                    event="auth.login",
-                    status=status_text,
-                    actor=username or None,
-                    tenant_id=username or None,
-                    ip=source_ip,
-                    metadata=meta,
-                )
-
-        def _reject_login(status_code: int, detail: str, reason: str) -> None:
-            locked = False
-            retry_after = 0
-            if isinstance(login_guard, LoginAttemptGuard) and username:
-                locked, retry_after = login_guard.record_failure(username, source_ip)
-            _audit_login(
-                "failed",
-                reason,
-                extra={"locked": bool(locked), "retry_after_s": int(retry_after)},
-            )
-            if locked:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many failed login attempts",
-                    headers={"Retry-After": str(retry_after or 1)},
-                )
-            raise HTTPException(status_code=status_code, detail=detail)
-
-        if not username:
-            _audit_login("failed", "username_required")
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="username required")
-
-        if isinstance(login_guard, LoginAttemptGuard):
-            locked, retry_after = login_guard.check_locked(username, source_ip)
-            if locked:
-                _audit_login("blocked", "rate_limited", extra={"retry_after_s": int(retry_after)})
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many failed login attempts",
-                    headers={"Retry-After": str(retry_after or 1)},
-                )
-
-        beta_closed = bool(getattr(app.state, "beta_closed_beta", False))
-        beta_store = getattr(app.state, "beta_access_store", None)
-        invite_code = str(payload.get("invite_code") or "").strip()
-        beta_allowlisted = True
-        if beta_closed:
-            beta_allowlisted = False
-            if isinstance(beta_store, BetaAccessStore):
-                if beta_store.has_user(username):
-                    beta_allowlisted = True
+        configured_provider_name = str(getattr(app.state, "auth_provider_name", "") or "").strip().lower()
+        registry = getattr(app.state, "auth_provider_registry", None)
+        provider = None
+        if isinstance(registry, AuthProviderRegistry):
+            if configured_provider_name:
+                provider = registry.get(configured_provider_name)
             else:
-                fallback_allowlist = parse_allowlist_env(os.getenv("NANOBOT_WEB_ALLOWED_USERS")) or {"admin"}
-                beta_allowlisted = username.lower() in fallback_allowlist
-            if not beta_allowlisted and not invite_code:
-                _reject_login(status.HTTP_403_FORBIDDEN, "Beta access not granted", "beta_not_allowlisted")
+                provider = registry.resolve_default()
+
+        if provider is None:
+            missing_provider = configured_provider_name or "local"
+            logger.error(f"Configured auth provider is unavailable: {missing_provider}")
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={
+                    "detail": "Auth provider unavailable",
+                    "reason_code": "auth_provider_unavailable",
+                    "provider": missing_provider,
+                },
+            )
+
+        identity = await provider.authenticate(request=request, payload=payload, app_state=app.state)
+        username = str(identity.username or "").strip()
+        tenant_id = str(identity.tenant_id or username)
+        role = str(identity.role or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+        token_version = int(identity.token_version or 1)
 
         user_store = getattr(app.state, "user_store", None)
         if not isinstance(user_store, UserStore):
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Auth store not configured")
 
-        existing_user = user_store.get_user(username)
-        user_rec = user_store.verify_user_password(username, password)
-        invite_consumed = False
-
-        if user_rec is None and existing_user is not None:
-            bootstrap_owner = str(getattr(app.state, "bootstrap_owner", "admin") or "admin").strip().lower()
-            bootstrap_password = _load_admin_password()
-            is_owner_recovery = (
-                username.lower() == bootstrap_owner and bool(bootstrap_password) and password == bootstrap_password
-            )
-            if not is_owner_recovery:
-                _reject_login(status.HTTP_401_UNAUTHORIZED, "Invalid credentials", "invalid_credentials")
-            # Recovery path for bootstrap owner.
-            user_store.set_password(username, bootstrap_password)
-            user_rec = user_store.verify_user_password(username, bootstrap_password)
-            if user_rec is None:
-                _reject_login(status.HTTP_401_UNAUTHORIZED, "Invalid credentials", "invalid_credentials")
-
-        if user_rec is None and existing_user is None:
-            bootstrap_password = _load_admin_password()
-            bootstrap_owner = str(getattr(app.state, "bootstrap_owner", "admin") or "admin").strip().lower()
-            if username.lower() == bootstrap_owner and bootstrap_password and password == bootstrap_password:
-                user_rec = user_store.ensure_user(
-                    username=username,
-                    password=password,
-                    role=ROLE_OWNER,
-                    tenant_id=username,
-                )
-            elif beta_closed:
-                if len(password) < 6:
-                    _audit_login("failed", "password_too_short")
-                    raise HTTPException(
-                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                        detail="password must be at least 6 characters",
-                    )
-                if not beta_allowlisted:
-                    if not isinstance(beta_store, BetaAccessStore):
-                        _reject_login(status.HTTP_403_FORBIDDEN, "Beta access not granted", "beta_not_allowlisted")
-                    consumed, _reason = beta_store.consume_invite(invite_code, username)
-                    if not consumed:
-                        _reject_login(status.HTTP_403_FORBIDDEN, "Beta access not granted", "invite_invalid")
-                    invite_consumed = True
-                user_rec = user_store.ensure_user(
-                    username=username,
-                    password=password,
-                    role=ROLE_MEMBER,
-                    tenant_id=username,
-                )
-            else:
-                _reject_login(status.HTTP_401_UNAUTHORIZED, "Invalid credentials", "invalid_credentials")
-
-        if beta_closed and not beta_allowlisted and not invite_consumed:
-            if not isinstance(beta_store, BetaAccessStore):
-                _reject_login(status.HTTP_403_FORBIDDEN, "Beta access not granted", "beta_not_allowlisted")
-            consumed, _reason = beta_store.consume_invite(invite_code, username)
-            if not consumed:
-                _reject_login(status.HTTP_403_FORBIDDEN, "Beta access not granted", "invite_invalid")
-
         access_ttl = _parse_positive_seconds_env("NANOBOT_WEB_ACCESS_TOKEN_EXPIRES_S", 3600)
         refresh_ttl = _parse_positive_seconds_env("NANOBOT_WEB_REFRESH_TOKEN_EXPIRES_S", 30 * 24 * 3600)
         access_token = generate_token(
-            username=str(user_rec.get("username") or username),
+            username=username,
             secret=jwt_secret,
-            tenant_id=str(user_rec.get("tenant_id") or username),
-            role=str(user_rec.get("role") or ROLE_MEMBER),
-            token_version=int(user_rec.get("token_version") or 1),
+            tenant_id=tenant_id,
+            role=role,
+            token_version=token_version,
             token_type="access",
             expires_in_s=access_ttl,
         )
         refresh_token = user_store.issue_refresh_token(
-            str(user_rec.get("username") or username),
+            username,
             expires_in_s=refresh_ttl,
         )
-        if isinstance(login_guard, LoginAttemptGuard):
-            login_guard.record_success(username, source_ip)
-        _audit_login("succeeded", "ok")
-        username_out = normalize_username(str(user_rec.get("username") or username))
-        role_out = str(user_rec.get("role") or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+        username_out = normalize_username(username)
+        role_out = role
         response_payload = {
             "token": access_token,
             "access_token": access_token,
@@ -923,7 +864,7 @@ def create_app(
             "token_type": "bearer",
             "expires_in": access_ttl,
             "role": role_out,
-            "tenant_id": str(user_rec.get("tenant_id") or username),
+            "tenant_id": tenant_id,
             "username": username_out,
             "account_id": username_out,
             "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
@@ -941,6 +882,7 @@ def create_app(
     from nanobot.web.api.chat import router as chat_router
     from nanobot.web.api.cron import router as cron_router
     from nanobot.web.api.help import router as help_router
+    from nanobot.web.api.integrations import router as integrations_router
     from nanobot.web.api.providers import router as providers_router
     from nanobot.web.api.security import router as security_router
     from nanobot.web.api.skills import router as skills_router
@@ -955,6 +897,7 @@ def create_app(
     app.include_router(cron_router)
     app.include_router(beta_router)
     app.include_router(skills_router)
+    app.include_router(integrations_router)
     app.include_router(security_router)
     app.include_router(help_router)
     app.include_router(chat_router)

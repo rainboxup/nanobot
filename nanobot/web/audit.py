@@ -9,6 +9,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from nanobot.services.integration_runtime import explain_connector_failure_reason
+
 SENSITIVE_KEYS = {
     "password",
     "old_password",
@@ -63,6 +65,16 @@ def _parse_non_negative_int_env(name: str, default: int) -> int:
         return max(0, int(raw))
     except Exception:
         return int(default)
+
+
+def _normalize_connector_audit_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(metadata or {})
+    reason_code = str(payload.get("reason_code") or "").strip()
+    if reason_code and not str(payload.get("reason_summary") or "").strip():
+        summary = explain_connector_failure_reason(reason_code)
+        if summary:
+            payload["reason_summary"] = summary
+    return _sanitize(payload)
 
 
 def _parse_event_ts(value: Any) -> datetime | None:
@@ -136,14 +148,20 @@ class AuditLogger:
     ) -> None:
         if not self.enabled:
             return
+        event_name = str(event or "").strip()
+        metadata_payload = dict(metadata or {})
+        if event_name.startswith("integration.connector."):
+            sanitized_metadata = _normalize_connector_audit_metadata(metadata_payload)
+        else:
+            sanitized_metadata = _sanitize(metadata_payload)
         rec: dict[str, Any] = {
             "ts": _utc_iso_now(),
-            "event": str(event or "").strip(),
+            "event": event_name,
             "status": str(status or "").strip(),
             "actor": str(actor or "").strip() or None,
             "tenant_id": str(tenant_id or "").strip() or None,
             "ip": str(ip or "").strip() or None,
-            "metadata": _sanitize(metadata or {}),
+            "metadata": sanitized_metadata,
         }
         line = json.dumps(rec, ensure_ascii=False)
         with self._lock:

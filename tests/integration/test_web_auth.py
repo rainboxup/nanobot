@@ -53,6 +53,37 @@ async def test_login_success(http_client) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_login_uses_local_provider_by_default(http_client, web_ctx) -> None:
+    assert str(getattr(web_ctx.app.state, "auth_provider_name", "")) == "local"
+    r = await http_client.post(
+        "/api/auth/login",
+        json={"username": "admin", "password": "test-password"},
+    )
+    assert r.status_code == 200
+    assert r.json().get("token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_login_returns_500_when_configured_provider_is_missing(http_client, web_ctx) -> None:
+    original_provider_name = str(getattr(web_ctx.app.state, "auth_provider_name", "") or "")
+    web_ctx.app.state.auth_provider_name = "missing-provider"
+    try:
+        r = await http_client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "test-password"},
+        )
+    finally:
+        web_ctx.app.state.auth_provider_name = original_provider_name
+
+    assert r.status_code == 500
+    body = r.json()
+    assert body.get("reason_code") == "auth_provider_unavailable"
+    assert body.get("provider") == "missing-provider"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_auth_me_reports_role_capabilities_and_operator_guides(
     http_client, auth_headers, auth_headers_for
 ) -> None:

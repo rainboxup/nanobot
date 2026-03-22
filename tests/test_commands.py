@@ -1,4 +1,5 @@
 import asyncio
+import json
 import shutil
 from importlib.resources import files as pkg_files
 from io import BytesIO, TextIOWrapper
@@ -154,6 +155,113 @@ def test_onboard_uses_configured_workspace_path(monkeypatch, tmp_path):
 
     assert result.exit_code == 0
     assert captured["workspace"] == config.workspace_path
+
+
+def test_onboard_initializes_packaging_defaults_without_breaking_existing_workspace(
+    monkeypatch,
+    tmp_path,
+):
+    config_file = tmp_path / "config.json"
+    workspace_dir = tmp_path / "existing-workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(
+        json.dumps(
+            {
+                "agents": {"defaults": {"workspace": str(workspace_dir)}},
+                "channels": {"send_progress": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: config_file)
+    monkeypatch.setattr(
+        "nanobot.utils.helpers.get_workspace_path",
+        lambda workspace=None: Path(str(workspace or workspace_dir)).expanduser(),
+    )
+    monkeypatch.setattr(
+        "nanobot.utils.workspace.create_workspace_templates",
+        lambda _workspace: [],
+    )
+
+    result = runner.invoke(app, ["onboard"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "existing values preserved" in result.stdout
+
+    refreshed = Config.model_validate(json.loads(config_file.read_text(encoding="utf-8")))
+    assert refreshed.workspace_path == workspace_dir
+    assert refreshed.packaging.active_profile == "pilot"
+    assert refreshed.packaging.capabilities.integration_contract is False
+    assert refreshed.packaging.capabilities.auth_provider_abstraction is False
+    assert refreshed.packaging.capabilities.workflow_core is False
+    assert refreshed.packaging.capabilities.enterprise_packaging is False
+
+
+def test_onboard_packaging_profile_enterprise_applies_bundle_and_updates_config(
+    monkeypatch,
+    tmp_path,
+):
+    workspace_dir = tmp_path / "enterprise-workspace"
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({"agents": {"defaults": {"workspace": str(workspace_dir)}}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: config_file)
+    monkeypatch.setattr(
+        "nanobot.utils.helpers.get_workspace_path",
+        lambda workspace=None: Path(str(workspace_dir)).expanduser(),
+    )
+    monkeypatch.setattr("nanobot.utils.workspace.create_workspace_templates", lambda _workspace: [])
+
+    result = runner.invoke(app, ["onboard", "--packaging-profile", "enterprise"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "Applied packaging profile 'enterprise' bootstrap" in result.stdout
+
+    refreshed = Config.model_validate(json.loads(config_file.read_text(encoding="utf-8")))
+    assert refreshed.packaging.active_profile == "enterprise"
+    assert refreshed.packaging.capabilities.integration_contract is True
+    assert refreshed.packaging.capabilities.auth_provider_abstraction is True
+    assert refreshed.packaging.capabilities.workflow_core is True
+    assert refreshed.packaging.capabilities.enterprise_packaging is True
+    assert "enterprise-bundle-bootstrap" in (
+        refreshed.packaging.profiles["enterprise"].required_help_slugs
+    )
+
+    assert (workspace_dir / "bootstrap" / "enterprise" / "README.md").exists()
+    assert (workspace_dir / "PACKAGING_PROFILE.md").read_text(encoding="utf-8").strip() == "enterprise"
+    assert (workspace_dir / ".nanobot-packaging-profile").read_text(encoding="utf-8").strip() == "enterprise"
+
+
+def test_onboard_packaging_profile_skips_overlay_when_workspace_not_empty(monkeypatch, tmp_path):
+    workspace_dir = tmp_path / "existing-enterprise-workspace"
+    config_file = tmp_path / "config.json"
+    config_file.write_text(
+        json.dumps({"agents": {"defaults": {"workspace": str(workspace_dir)}}}),
+        encoding="utf-8",
+    )
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    (workspace_dir / "custom.md").write_text("keep\n", encoding="utf-8")
+
+    monkeypatch.setattr("nanobot.config.loader.get_config_path", lambda: config_file)
+    monkeypatch.setattr(
+        "nanobot.utils.helpers.get_workspace_path",
+        lambda workspace=None: Path(str(workspace_dir)).expanduser(),
+    )
+    monkeypatch.setattr("nanobot.utils.workspace.create_workspace_templates", lambda _workspace: [])
+
+    result = runner.invoke(app, ["onboard", "--packaging-profile", "enterprise"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "Skipped packaging bundle 'enterprise'" in result.stdout
+    assert (workspace_dir / "custom.md").read_text(encoding="utf-8") == "keep\n"
+    assert not (workspace_dir / "bootstrap" / "enterprise" / "README.md").exists()
+
+    refreshed = Config.model_validate(json.loads(config_file.read_text(encoding="utf-8")))
+    assert refreshed.packaging.active_profile == "enterprise"
 
 
 def test_onboard_existing_workspace_safe_create(mock_paths):

@@ -76,3 +76,56 @@ def apply_demo_kit_overlay(workspace: Path, demo_kit: str) -> list[Path]:
         created.append(marker)
 
     return created
+
+
+def available_packaging_bundles() -> list[str]:
+    root = _templates_root().joinpath("packaging")
+    if not root.is_dir():
+        return []
+    return sorted(item.name for item in root.iterdir() if item.is_dir())
+
+
+def apply_packaging_bundle_overlay(workspace: Path, profile: str) -> list[Path]:
+    """Apply optional packaging profile overlay to workspace.
+
+    This is best-effort by design:
+    - If profile has a bundled overlay, copy missing files.
+    - If profile has no bundled overlay, still write profile marker files.
+    """
+    root = _templates_root().joinpath("packaging")
+    profile_name = str(profile or "").strip()
+    if not profile_name:
+        raise ValueError("packaging profile name is required")
+
+    created: list[Path] = []
+
+    def _copy_tree(src: Any, rel: Path = Path()) -> None:
+        for item in src.iterdir():
+            target_rel = rel / item.name
+            target = workspace / target_rel
+            if item.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                _copy_tree(item, target_rel)
+                continue
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(item.read_bytes())
+            created.append(target)
+
+    if root.is_dir():
+        profile_dir = root.joinpath(profile_name)
+        if profile_dir.is_dir():
+            _copy_tree(profile_dir)
+
+    visible_marker = workspace / "PACKAGING_PROFILE.md"
+    if not visible_marker.exists():
+        visible_marker.write_text(f"{profile_name}\n", encoding="utf-8")
+        created.append(visible_marker)
+
+    marker = workspace / ".nanobot-packaging-profile"
+    if not marker.exists():
+        marker.write_text(f"{profile_name}\n", encoding="utf-8")
+        created.append(marker)
+
+    return created

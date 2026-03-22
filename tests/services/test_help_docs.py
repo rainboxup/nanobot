@@ -99,6 +99,7 @@ def test_default_registry_registers_demo_kit_help_docs() -> None:
     for slug, repo_path in (
         ("private-domain-demo-kit", "docs/howto/private-domain-demo-kit.md"),
         ("internal-knowledge-demo-kit", "docs/howto/internal-knowledge-demo-kit.md"),
+        ("enterprise-bundle-bootstrap", "docs/howto/enterprise-bundle-bootstrap.md"),
     ):
         spec = registry.get_spec(slug)
         assert spec is not None
@@ -111,6 +112,14 @@ def test_default_registry_registers_demo_kit_help_docs() -> None:
         assert doc is not None
         assert doc.source.path == repo_path
         assert doc.markdown == repo_markdown
+
+
+def test_enterprise_bundle_help_doc_includes_onboard_packaging_profile() -> None:
+    registry = HelpDocsRegistry.default()
+    doc = registry.get_doc("enterprise-bundle-bootstrap")
+    assert doc is not None
+    assert "nanobot onboard --packaging-profile enterprise" in doc.markdown
+    assert "packaging_profile=enterprise" in doc.markdown
 
 
 def test_operator_help_docs_reference_ops_security_and_users_surfaces() -> None:

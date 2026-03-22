@@ -4,6 +4,7 @@ import pytest
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.channels.base import BaseChannel
+from nanobot.config.schema import PackagingProfile
 
 
 @pytest.mark.integration
@@ -18,6 +19,9 @@ async def test_web_health_and_ready_endpoints(http_client) -> None:
     assert ready.status_code == 200
     ready_body = ready.json()
     assert str(ready_body.get("status") or "") == "ready"
+    assert str(ready_body.get("packaging_profile") or "") == "pilot"
+    assert isinstance(ready_body.get("packaging_ready"), bool)
+    assert isinstance(ready_body.get("packaging_reasons"), list)
     checks = ready_body.get("checks") or {}
     assert bool(checks.get("message_bus")) is True
     assert bool(checks.get("auth_store")) is True
@@ -59,6 +63,13 @@ async def test_web_index_serves_html(http_client) -> None:
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_web_ready_reports_degraded_when_key_runtime_parts_unavailable(http_client, web_ctx) -> None:
+    web_ctx.app.state.config.packaging.active_profile = "enterprise"
+    web_ctx.app.state.config.packaging.profiles["enterprise"] = PackagingProfile(
+        name="enterprise",
+        required_capabilities=["enterprise_packaging"],
+        required_help_slugs=[],
+    )
+    web_ctx.app.state.config.packaging.capabilities.enterprise_packaging = False
     web_ctx.app.state.web_static_ready = False
     web_ctx.app.state.web_static_error = "dashboard assets missing for test"
     web_ctx.app.state.web_channel_ready = False
@@ -68,12 +79,17 @@ async def test_web_ready_reports_degraded_when_key_runtime_parts_unavailable(htt
     assert response.status_code == 503
     body = response.json()
     assert str(body.get("status") or "") == "degraded"
+    assert str(body.get("packaging_profile") or "") == "enterprise"
+    assert bool(body.get("packaging_ready")) is False
+    assert "packaging_missing_capabilities" in list(body.get("packaging_reasons") or [])
     checks = body.get("checks") or {}
     assert bool(checks.get("dashboard_assets")) is False
     assert bool(checks.get("web_channel")) is False
+    assert bool(checks.get("packaging_profile")) is False
     warnings = [str(item).lower() for item in (body.get("warnings") or [])]
     assert any("dashboard assets missing for test" in item for item in warnings)
     assert any("web channel init failed for test" in item for item in warnings)
+    assert any("packaging profile" in item for item in warnings)
 
 
 @pytest.mark.integration

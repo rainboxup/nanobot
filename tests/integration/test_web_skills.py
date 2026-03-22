@@ -7,6 +7,7 @@ import pytest
 from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
+from nanobot.config.schema import WorkspaceIntegrationConfig
 from nanobot.services.workspace_skill_installs import WorkspaceSkillInstallService
 from nanobot.web.api import skills as skills_api
 
@@ -1147,6 +1148,46 @@ async def test_tools_policy_effective_contract_matches_runtime_resolver(
     assert bool(((body.get("effective") or {}).get("web") or {}).get("enabled")) is bool(
         observed.get("web")
     )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_multi_tenant_runtime_integration_tool_enforces_web_tenant_boundary(web_ctx) -> None:
+    tenant_id = "tenant-integration-tool"
+    tenant_ctx = web_ctx.tenant_store.ensure_tenant_files(tenant_id)
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.workspace.integrations.connectors = {
+        "crm_core": WorkspaceIntegrationConfig.model_validate(
+            {"enabled": True, "provider": "crm_mock"}
+        )
+    }
+
+    runtime_loop = MultiTenantAgentLoop(
+        bus=MessageBus(),
+        system_config=web_ctx.app.state.config,
+        store=web_ctx.tenant_store,
+    )
+    runtime = runtime_loop._get_or_create_runtime(
+        tenant_ctx,
+        tenant_cfg,
+        enable_exec=False,
+        enable_web=True,
+    )
+    assert runtime.agent.tools.has("integration")
+
+    integration_tool = runtime.agent.tools.get("integration")
+    assert integration_tool is not None
+    assert hasattr(integration_tool, "set_context")
+    integration_tool.set_context("web", "web:other-tenant:deadbeef")
+    result = await runtime.agent.tools.execute(
+        "integration",
+        {
+            "connector": "crm_core",
+            "operation": "sync_contacts",
+            "payload": {"contact_id": "42"},
+        },
+    )
+    assert "Error [connector_tenant_boundary_violation]" in result
 
 
 @pytest.mark.integration

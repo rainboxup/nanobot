@@ -20,6 +20,7 @@ from nanobot.config.schema import (
     ChannelsConfig,
     Config,
     GatewayConfig,
+    PackagingConfig,
     ProvidersConfig,
     ToolsConfig,
     TrafficConfig,
@@ -52,6 +53,7 @@ def build_config_without_env(data: dict[str, Any], *, strict_section_types: bool
         tools=_section("tools", ToolsConfig),
         traffic=_section("traffic", TrafficConfig),
         workspace=_section("workspace", WorkspaceConfig),
+        packaging=_section("packaging", PackagingConfig),
     )
 
 

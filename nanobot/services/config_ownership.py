@@ -12,7 +12,9 @@ from enum import StrEnum
 from nanobot.tenants.validation import (
     classify_config_scope,
     is_workspace_routing_channel,
+    normalize_workspace_integration_name,
     normalize_workspace_routing_channel_name,
+    validate_workspace_integration_name,
 )
 
 
@@ -114,6 +116,32 @@ class ConfigOwnershipService:
             runtime_mode=runtime_mode,
             config_key=f"workspace.channels.{normalized}.credentials",
         )
+
+    @classmethod
+    def check_workspace_integration_credentials_ownership(
+        cls, *, runtime_mode: str, integration_name: str
+    ) -> OwnershipDecision:
+        normalized = normalize_workspace_integration_name(integration_name)
+        try:
+            validate_workspace_integration_name(normalized)
+        except ValueError:
+            return OwnershipDecision(
+                allowed=False,
+                scope=ConfigScope.WORKSPACE,
+                reason_code="workspace_integration_name_invalid",
+            )
+
+        decision = cls.check_workspace_config_ownership(
+            runtime_mode=runtime_mode,
+            config_key=f"workspace.integrations.connectors.{normalized}.auth",
+        )
+        if decision.allowed:
+            return OwnershipDecision(
+                allowed=True,
+                scope=ConfigScope.WORKSPACE,
+                reason_code="workspace_scope",
+            )
+        return decision
 
     @classmethod
     def validate_config_change(

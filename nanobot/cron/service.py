@@ -6,7 +6,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Literal
 
 from loguru import logger
 
@@ -17,8 +17,18 @@ class CronStoreCorruptionError(RuntimeError):
     """Raised when cron store cannot be parsed safely."""
 
 
+_CRON_PAYLOAD_KINDS = {"system_event", "agent_turn", "workflow_run"}
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _normalize_payload_kind(value: Any) -> str:
+    text = str(value or "").strip().lower() or "agent_turn"
+    if text in _CRON_PAYLOAD_KINDS:
+        return text
+    return "agent_turn"
 
 
 def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
@@ -141,7 +151,7 @@ class CronService:
                             tz=j["schedule"].get("tz"),
                         ),
                         payload=CronPayload(
-                            kind=j["payload"].get("kind", "agent_turn"),
+                            kind=_normalize_payload_kind(j["payload"].get("kind", "agent_turn")),
                             message=j["payload"].get("message", ""),
                             deliver=j["payload"].get("deliver", False),
                             channel=j["payload"].get("channel"),
@@ -330,6 +340,7 @@ class CronService:
         name: str,
         schedule: CronSchedule,
         message: str,
+        payload_kind: Literal["agent_turn", "system_event", "workflow_run"] = "agent_turn",
         deliver: bool = False,
         channel: str | None = None,
         to: str | None = None,
@@ -339,6 +350,7 @@ class CronService:
         store = self._load_store()
         _validate_schedule_for_add(schedule)
         now = _now_ms()
+        normalized_payload_kind = _normalize_payload_kind(payload_kind)
 
         job = CronJob(
             id=str(uuid.uuid4())[:8],
@@ -346,7 +358,7 @@ class CronService:
             enabled=True,
             schedule=schedule,
             payload=CronPayload(
-                kind="agent_turn",
+                kind=normalized_payload_kind,
                 message=message,
                 deliver=deliver,
                 channel=channel,
@@ -364,6 +376,29 @@ class CronService:
 
         logger.info("Cron: added job '{}' ({})", name, job.id)
         return job
+
+    def add_workflow_job(
+        self,
+        *,
+        name: str,
+        schedule: CronSchedule,
+        workflow_id: str,
+        delete_after_run: bool = False,
+    ) -> CronJob:
+        """Add workflow-run cron job (workflow_id is stored in payload.message)."""
+        workflow_key = str(workflow_id or "").strip()
+        if not workflow_key:
+            raise ValueError("workflow_id is required")
+        return self.add_job(
+            name=name,
+            schedule=schedule,
+            message=workflow_key,
+            payload_kind="workflow_run",
+            deliver=False,
+            channel=None,
+            to=None,
+            delete_after_run=delete_after_run,
+        )
 
     def remove_job(self, job_id: str) -> bool:
         """Remove a job by ID."""

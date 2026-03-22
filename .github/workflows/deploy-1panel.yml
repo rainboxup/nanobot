@@ -149,6 +149,19 @@ jobs:
               fi
             fi
 
+            health_ready=0
+            for i in $(seq 1 45); do
+              if curl -fsS --max-time 3 "${REMOTE_SMOKE_URL}/api/health" >/dev/null 2>&1; then
+                health_ready=1
+                break
+              fi
+              sleep 2
+            done
+            if [ "$health_ready" -ne 1 ]; then
+              echo "::error::service health endpoint not reachable after warmup wait"
+              exit 1
+            fi
+
             if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
               NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
               NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \

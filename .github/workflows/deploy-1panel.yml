@@ -10,12 +10,14 @@ concurrency:
   group: deploy-saas-main
   cancel-in-progress: true
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
       SMOKE_OIDC_ID_TOKEN: ${{ secrets.SMOKE_OIDC_ID_TOKEN }}
       SMOKE_URL: ${{ secrets.SMOKE_URL }}
       SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}

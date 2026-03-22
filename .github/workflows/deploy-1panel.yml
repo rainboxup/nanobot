@@ -45,7 +45,7 @@ jobs:
           fi
 
       - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@v1.2.4
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
@@ -121,7 +121,7 @@ jobs:
             fi
 
       - name: Post-deploy remote smoke (SSH localhost)
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@v1.2.4
         env:
           REMOTE_SMOKE_USERNAME: ${{ env.SMOKE_USERNAME }}
           REMOTE_SMOKE_PASSWORD: ${{ env.SMOKE_PASSWORD }}

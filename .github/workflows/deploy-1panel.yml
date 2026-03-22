@@ -122,21 +122,17 @@ jobs:
       - name: Post-deploy remote smoke (SSH localhost)
         uses: appleboy/ssh-action@v1.2.4
         env:
-          REMOTE_SMOKE_URL: ${{ env.SMOKE_URL }}
-          REMOTE_SMOKE_USERNAME: ${{ env.SMOKE_USERNAME }}
-          REMOTE_SMOKE_PASSWORD: ${{ env.SMOKE_PASSWORD }}
           REMOTE_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
-          envs: REMOTE_SMOKE_URL,REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
+          envs: REMOTE_SMOKE_OIDC_ID_TOKEN
           script: |
             set -euo pipefail
             DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
             LOCAL_SMOKE_URL="http://127.0.0.1:8318"
-            PRIMARY_SMOKE_URL="${REMOTE_SMOKE_URL:-$LOCAL_SMOKE_URL}"
             cd "$DEPLOY_PATH"
 
             PYTHON_BIN="python3"
@@ -162,36 +158,8 @@ jobs:
               exit 1
             fi
 
-            if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
-              if NANOBOT_SMOKE_URL="$PRIMARY_SMOKE_URL" \
-                NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
-                NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
-                "$PYTHON_BIN" scripts/smoke_oidc_login.py \
-                  --allow-ready-degraded \
-                  --timeout 20 \
-                  --username "$REMOTE_SMOKE_USERNAME" \
-                  --password "$REMOTE_SMOKE_PASSWORD"; then
-                exit 0
-              fi
-              if [ "$PRIMARY_SMOKE_URL" != "$LOCAL_SMOKE_URL" ] && \
-                NANOBOT_SMOKE_URL="$LOCAL_SMOKE_URL" \
-                NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
-                NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
-                "$PYTHON_BIN" scripts/smoke_oidc_login.py \
-                  --allow-ready-degraded \
-                  --timeout 20 \
-                  --username "$REMOTE_SMOKE_USERNAME" \
-                  --password "$REMOTE_SMOKE_PASSWORD"; then
-                exit 0
-              fi
-              echo "::notice::Credential smoke failed; running localhost preflight as gate"
+            if [ -n "${REMOTE_SMOKE_OIDC_ID_TOKEN:-}" ]; then
               NANOBOT_SMOKE_URL="$LOCAL_SMOKE_URL" \
-              "$PYTHON_BIN" scripts/smoke_oidc_login.py \
-                --allow-ready-degraded \
-                --timeout 20 \
-                --oidc-preflight
-            elif [ -n "${REMOTE_SMOKE_OIDC_ID_TOKEN:-}" ]; then
-              NANOBOT_SMOKE_URL="$PRIMARY_SMOKE_URL" \
               NANOBOT_SMOKE_OIDC_ID_TOKEN="$REMOTE_SMOKE_OIDC_ID_TOKEN" \
               "$PYTHON_BIN" scripts/smoke_oidc_login.py \
                 --allow-ready-degraded \
@@ -217,6 +185,8 @@ jobs:
         env:
           NANOBOT_SMOKE_URL: ${{ env.SMOKE_URL }}
           NANOBOT_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
+          NANOBOT_SMOKE_USERNAME: ${{ env.SMOKE_USERNAME }}
+          NANOBOT_SMOKE_PASSWORD: ${{ env.SMOKE_PASSWORD }}
           NANOBOT_SMOKE_EXPECT_USERNAME: ${{ env.SMOKE_EXPECT_USERNAME }}
           NANOBOT_SMOKE_EXPECT_TENANT_ID: ${{ env.SMOKE_EXPECT_TENANT_ID }}
           NANOBOT_SMOKE_EXPECT_ROLE: ${{ env.SMOKE_EXPECT_ROLE }}
@@ -230,8 +200,12 @@ jobs:
             if ! python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20; then
               echo "::warning::External smoke failed (network/path issue likely); remote smoke already executed on target host"
             fi
+          elif [ -n "${NANOBOT_SMOKE_USERNAME:-}" ] && [ -n "${NANOBOT_SMOKE_PASSWORD:-}" ]; then
+            if ! python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --username "$NANOBOT_SMOKE_USERNAME" --password "$NANOBOT_SMOKE_PASSWORD"; then
+              echo "::warning::External credential smoke failed; remote localhost preflight already passed"
+            fi
           else
-            echo "::notice::SMOKE_OIDC_ID_TOKEN not set; running OIDC preflight mode"
+            echo "::notice::SMOKE_OIDC_ID_TOKEN/SMOKE_USERNAME not set; running OIDC preflight mode"
             if ! python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --oidc-preflight; then
               echo "::warning::External smoke failed (network/path issue likely); remote smoke already executed on target host"
             fi

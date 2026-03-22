@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import time
 from urllib.parse import urlsplit
@@ -6,6 +7,8 @@ from urllib.parse import urlsplit
 import jwt
 import pytest
 import websockets
+
+from nanobot.web.auth_providers import OidcAuthProvider
 
 _TEST_JWT_SECRET = "test-jwt-secret-32-bytes-minimum-0001"
 
@@ -38,6 +41,15 @@ def _forwarded_only_origin_headers(origin: str) -> dict[str, str]:
 
 def _ws_uri_with_token(ws_url: str, token: str) -> str:
     return f"{ws_url}?token={token}"
+
+
+def _oidc_hs256_jwk(secret: str, *, kid: str = "oidc-hs") -> dict[str, str]:
+    key = base64.urlsafe_b64encode(secret.encode("utf-8")).decode("ascii").rstrip("=")
+    return {"kty": "oct", "k": key, "alg": "HS256", "use": "sig", "kid": kid}
+
+
+def _oidc_token(secret: str, *, kid: str, payload: dict[str, object]) -> str:
+    return jwt.encode(payload, secret, algorithm="HS256", headers={"kid": kid})
 
 
 @pytest.mark.integration
@@ -80,6 +92,84 @@ async def test_login_returns_500_when_configured_provider_is_missing(http_client
     body = r.json()
     assert body.get("reason_code") == "auth_provider_unavailable"
     assert body.get("provider") == "missing-provider"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_login_with_oidc_provider_uses_static_jwks(http_client, web_ctx) -> None:
+    secret = "integration-oidc-secret-0001-32-bytes"
+    provider = OidcAuthProvider(
+        issuer="https://issuer.example.com",
+        audience=("nanobot-web",),
+        static_jwks={"keys": [_oidc_hs256_jwk(secret, kid="oidc-kid-1")]},
+        algorithms=("HS256",),
+        username_claim="email",
+        tenant_claim="tenant",
+        role_claim="role",
+    )
+    web_ctx.app.state.auth_provider_registry.register(provider)
+    original_provider_name = str(getattr(web_ctx.app.state, "auth_provider_name", "") or "local")
+    web_ctx.app.state.auth_provider_name = "oidc"
+    now = int(time.time())
+    id_token = _oidc_token(
+        secret,
+        kid="oidc-kid-1",
+        payload={
+            "sub": "oidc-user-sub",
+            "email": "oidc-user@example.com",
+            "tenant": "oidc-tenant",
+            "role": "admin",
+            "iss": "https://issuer.example.com",
+            "aud": "nanobot-web",
+            "iat": now,
+            "exp": now + 300,
+        },
+    )
+    try:
+        r = await http_client.post("/api/auth/login", json={"id_token": id_token})
+    finally:
+        web_ctx.app.state.auth_provider_name = original_provider_name
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("username") == "oidc-user@example.com"
+    assert body.get("tenant_id") == "oidc-tenant"
+    assert body.get("role") == "admin"
+    assert body.get("token")
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_login_with_oidc_provider_rejects_invalid_claims(http_client, web_ctx) -> None:
+    secret = "integration-oidc-secret-0002-32-bytes"
+    provider = OidcAuthProvider(
+        issuer="https://issuer.example.com",
+        audience=("nanobot-web",),
+        static_jwks={"keys": [_oidc_hs256_jwk(secret, kid="oidc-kid-2")]},
+        algorithms=("HS256",),
+    )
+    web_ctx.app.state.auth_provider_registry.register(provider)
+    original_provider_name = str(getattr(web_ctx.app.state, "auth_provider_name", "") or "local")
+    web_ctx.app.state.auth_provider_name = "oidc"
+    now = int(time.time())
+    id_token = _oidc_token(
+        secret,
+        kid="oidc-kid-2",
+        payload={
+            "sub": "oidc-user-sub",
+            "iss": "https://issuer.example.com",
+            "aud": "unexpected-audience",
+            "iat": now,
+            "exp": now + 300,
+        },
+    )
+    try:
+        r = await http_client.post("/api/auth/login", json={"id_token": id_token})
+    finally:
+        web_ctx.app.state.auth_provider_name = original_provider_name
+
+    assert r.status_code == 401
+    assert "oidc token" in str(r.json().get("detail") or "").lower()
 
 
 @pytest.mark.integration

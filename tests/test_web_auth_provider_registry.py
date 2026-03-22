@@ -6,7 +6,7 @@ from starlette.requests import Request
 
 from nanobot.bus.queue import MessageBus
 from nanobot.config.schema import Config
-from nanobot.web.auth_providers import AuthProviderRegistry, LocalAuthProvider
+from nanobot.web.auth_providers import AuthProviderRegistry, LocalAuthProvider, OidcAuthProvider
 from nanobot.web.server import create_app
 from nanobot.web.user_store import ROLE_MEMBER, UserStore
 
@@ -46,9 +46,11 @@ def test_create_app_registers_local_auth_provider_by_default(
     assert str(getattr(app.state, "auth_provider_name", "")) == "local"
     registry = getattr(app.state, "auth_provider_registry", None)
     assert isinstance(registry, AuthProviderRegistry)
-    assert registry.names() == ("local",)
+    assert registry.names() == ("local", "oidc")
     resolved = registry.get("local")
     assert isinstance(resolved, LocalAuthProvider)
+    oidc = registry.get("oidc")
+    assert isinstance(oidc, OidcAuthProvider)
 
 
 def test_auth_provider_registry_returns_none_for_unknown_provider() -> None:

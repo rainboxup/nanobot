@@ -23,7 +23,7 @@ from nanobot.config.schema import Config
 from nanobot.web.audit import AuditLogger, resolve_audit_log_path
 from nanobot.web.auth import generate_token, get_current_user, require_min_role
 from nanobot.web.auth_cookie import set_refresh_cookie
-from nanobot.web.auth_providers import AuthProviderRegistry, LocalAuthProvider
+from nanobot.web.auth_providers import AuthProviderRegistry, LocalAuthProvider, OidcAuthProvider
 from nanobot.web.beta_access import (
     BetaAccessStore,
     is_beta_admin,
@@ -662,6 +662,7 @@ def create_app(
     auth_provider_name = str(os.getenv("NANOBOT_WEB_AUTH_PROVIDER") or "local").strip().lower() or "local"
     auth_provider_registry = AuthProviderRegistry(default=auth_provider_name)
     auth_provider_registry.register(LocalAuthProvider())
+    auth_provider_registry.register(OidcAuthProvider.from_env())
     app.state.auth_provider_registry = auth_provider_registry
     app.state.auth_provider_name = auth_provider_name
     app.state.bootstrap_owner = _bootstrap_owner_username()

@@ -13,6 +13,7 @@ import { Providers } from "./pages/settings/Providers"
 import { Channels } from "./pages/settings/Channels"
 import { ChannelsAdmin } from "./pages/settings/ChannelsAdmin"
 import { ChannelsWorkspace } from "./pages/settings/ChannelsWorkspace"
+import { Integrations } from "./pages/settings/Integrations"
 import { Soul } from "./pages/settings/Soul"
 import { ToolsPolicy } from "./pages/settings/ToolsPolicy"
 import { Cron } from "./pages/settings/Cron"
@@ -143,6 +144,7 @@ export default function App() {
               <Route path="workspace" element={<ChannelsWorkspace />} />
               <Route path="admin" element={<OwnerRouteGuard fallbackTo="/settings/channels/workspace"><ChannelsAdmin /></OwnerRouteGuard>} />
             </Route>
+            <Route path="integrations" element={<SettingsRouteGuard tab="integrations"><Integrations /></SettingsRouteGuard>} />
             <Route path="soul" element={<SettingsRouteGuard tab="soul"><Soul /></SettingsRouteGuard>} />
             <Route path="tools" element={<SettingsRouteGuard tab="tools"><ToolsPolicy /></SettingsRouteGuard>} />
             <Route path="cron" element={<SettingsRouteGuard tab="cron"><Cron /></SettingsRouteGuard>} />

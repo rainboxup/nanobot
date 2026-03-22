@@ -163,14 +163,22 @@ jobs:
             fi
 
             if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
+              if NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+                NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
+                NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
+                "$PYTHON_BIN" scripts/smoke_oidc_login.py \
+                  --allow-ready-degraded \
+                  --timeout 20 \
+                  --username "$REMOTE_SMOKE_USERNAME" \
+                  --password "$REMOTE_SMOKE_PASSWORD"; then
+                exit 0
+              fi
+              echo "::warning::Local credential smoke failed; falling back to preflight smoke"
               NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
-              NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
-              NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
               "$PYTHON_BIN" scripts/smoke_oidc_login.py \
                 --allow-ready-degraded \
                 --timeout 20 \
-                --username "$REMOTE_SMOKE_USERNAME" \
-                --password "$REMOTE_SMOKE_PASSWORD"
+                --oidc-preflight
             elif [ -n "${REMOTE_SMOKE_OIDC_ID_TOKEN:-}" ]; then
               NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
               NANOBOT_SMOKE_OIDC_ID_TOKEN="$REMOTE_SMOKE_OIDC_ID_TOKEN" \

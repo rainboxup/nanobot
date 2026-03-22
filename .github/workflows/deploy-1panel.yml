@@ -10,9 +10,6 @@ concurrency:
   group: deploy-saas-main
   cancel-in-progress: true
 
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -209,10 +206,10 @@ jobs:
             fi
 
       - name: Checkout repository for smoke scripts
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup Python for smoke checks
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 

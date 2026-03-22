@@ -51,7 +51,6 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
-          script_stop: true
           script: |
             set -euo pipefail
 
@@ -131,7 +130,6 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
-          script_stop: true
           envs: REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
           script: |
             set -euo pipefail

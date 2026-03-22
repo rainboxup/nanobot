@@ -15,15 +15,14 @@ Checks:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import json
 import os
 import sys
 import time
+import urllib.error
+import urllib.request
 from typing import Any
-
-import httpx
 
 
 def _env(name: str, default: str = "") -> str:
@@ -37,11 +36,11 @@ def _json_dump(obj: Any) -> str:
         return str(obj)
 
 
-def _body_json(response: httpx.Response) -> dict[str, Any]:
+def _loads_json(raw: str) -> dict[str, Any]:
     try:
-        payload = response.json()
+        payload = json.loads(raw)
     except Exception:
-        return {"raw": response.text}
+        return {"raw": raw}
     if isinstance(payload, dict):
         return payload
     return {"raw": payload}
@@ -72,7 +71,43 @@ def _build_preflight_token() -> str:
     return f"{_b64url_json(header)}.{_b64url_json(payload)}.{signature}"
 
 
-async def main() -> int:
+def _http_json(
+    *,
+    base_url: str,
+    path: str,
+    timeout: float,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    url = f"{base_url}{path}"
+    body_bytes: bytes | None = None
+    req_headers: dict[str, str] = {}
+    if payload is not None:
+        req_headers["Content-Type"] = "application/json"
+        body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if headers:
+        req_headers.update({str(k): str(v) for k, v in headers.items()})
+    req = urllib.request.Request(url=url, data=body_bytes, headers=req_headers, method=method.upper())
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    last_err: str | None = None
+    for attempt in range(1, 4):
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+                return int(resp.getcode() or 0), _loads_json(raw)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            return int(exc.code or 0), _loads_json(raw)
+        except urllib.error.URLError as exc:
+            last_err = str(exc)
+            if attempt < 3:
+                time.sleep(0.5)
+                continue
+    return 0, {"detail": f"request_failed: {method.upper()} {path}: {last_err or 'unknown'}"}
+
+
+def main() -> int:
     ap = argparse.ArgumentParser(description="Nanobot auth login smoke test")
     default_port = _env("NANOBOT_PORT", "18790")
     ap.add_argument(
@@ -154,120 +189,146 @@ async def main() -> int:
 
     print(f"Base URL: {base_url}")
 
-    async with httpx.AsyncClient(base_url=base_url, timeout=timeout, trust_env=False) as client:
-        print("[1/4] GET /api/health")
-        health = await client.get("/api/health")
-        print(f"  status={health.status_code}")
-        print(_json_dump(_body_json(health)))
-        if int(health.status_code) != 200:
-            return 2
+    print("[1/4] GET /api/health")
+    health_status, health_body = _http_json(
+        base_url=base_url,
+        path="/api/health",
+        timeout=timeout,
+    )
+    print(f"  status={health_status}")
+    print(_json_dump(health_body))
+    if int(health_status) != 200:
+        return 2
 
-        print("[2/4] GET /api/ready")
-        ready = await client.get("/api/ready")
-        ready_body = _body_json(ready)
-        print(f"  status={ready.status_code}")
-        print(_json_dump(ready_body))
-        if int(ready.status_code) != 200 and not (
-            bool(args.allow_ready_degraded) and int(ready.status_code) == 503
-        ):
-            print("Ready check failed", file=sys.stderr)
-            return 2
+    print("[2/4] GET /api/ready")
+    ready_status, ready_body = _http_json(
+        base_url=base_url,
+        path="/api/ready",
+        timeout=timeout,
+    )
+    print(f"  status={ready_status}")
+    print(_json_dump(ready_body))
+    if int(ready_status) != 200 and not (bool(args.allow_ready_degraded) and int(ready_status) == 503):
+        print("Ready check failed", file=sys.stderr)
+        return 2
 
-        if preflight_mode and not id_token:
-            print("[3/4] POST /api/auth/login (preflight: missing id_token)")
-            missing = await client.post("/api/auth/login", json={})
-            missing_body = _body_json(missing)
-            print(f"  status={missing.status_code}")
-            print(_json_dump(missing_body))
-            missing_reason = str(missing_body.get("reason_code") or "").strip()
-            if missing_reason == "username_required":
-                print("Auth preflight passed (local provider detected)")
-                return 0
-            if missing_reason != "oidc_id_token_required":
-                print(
-                    "OIDC provider preflight failed: expected reason_code=oidc_id_token_required",
-                    file=sys.stderr,
-                )
-                return 2
-
-            print("[4/4] POST /api/auth/login (preflight: synthetic invalid token)")
-            probe = await client.post("/api/auth/login", json={"id_token": _build_preflight_token()})
-            probe_body = _body_json(probe)
-            print(f"  status={probe.status_code}")
-            print(_json_dump(probe_body))
-            reason_code = str(probe_body.get("reason_code") or "").strip()
-            if reason_code in {
-                "oidc_token_invalid",
-                "oidc_token_expired",
-                "oidc_token_kid_unknown",
-                "oidc_token_kid_missing",
-                "oidc_token_algorithm_not_allowed",
-            }:
-                print("OIDC preflight passed")
-                return 0
-            print("OIDC preflight failed: unexpected reason_code", file=sys.stderr)
-            return 2
-
-        if local_mode:
-            print("[3/4] POST /api/auth/login (local)")
-            login = await client.post(
-                "/api/auth/login",
-                json={"username": username, "password": password},
-            )
-            login_mode_label = "Local"
-        else:
-            print("[3/4] POST /api/auth/login (oidc)")
-            login = await client.post("/api/auth/login", json={"id_token": id_token})
-            login_mode_label = "OIDC"
-        login_body = _body_json(login)
-        print(f"  status={login.status_code}")
-        if int(login.status_code) != 200:
-            print(_json_dump(login_body), file=sys.stderr)
-            reason_code = str(login_body.get("reason_code") or "").strip()
-            if reason_code:
-                print(f"  reason_code={reason_code}", file=sys.stderr)
-            return 2
-        token = str(login_body.get("access_token") or login_body.get("token") or "").strip()
-        if not token:
-            print(f"{login_mode_label} login succeeded but no access token returned", file=sys.stderr)
-            print(_json_dump(login_body), file=sys.stderr)
-            return 2
-        print(f"  token=*** ({len(token)} chars)")
-
-        print("[4/4] GET /api/auth/me")
-        me = await client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"})
-        me_body = _body_json(me)
-        print(f"  status={me.status_code}")
-        print(_json_dump(me_body))
-        if int(me.status_code) != 200:
-            return 2
-
-        actual_username = str(me_body.get("username") or "").strip()
-        actual_tenant_id = str(me_body.get("tenant_id") or "").strip()
-        actual_role = str(me_body.get("role") or "").strip()
-
-        if not _matches_expected(actual_username, expected_username):
+    if preflight_mode and not id_token:
+        print("[3/4] POST /api/auth/login (preflight: missing id_token)")
+        missing_status, missing_body = _http_json(
+            base_url=base_url,
+            path="/api/auth/login",
+            timeout=timeout,
+            method="POST",
+            payload={},
+        )
+        print(f"  status={missing_status}")
+        print(_json_dump(missing_body))
+        missing_reason = str(missing_body.get("reason_code") or "").strip()
+        if missing_reason == "username_required":
+            print("Auth preflight passed (local provider detected)")
+            return 0
+        if missing_reason != "oidc_id_token_required":
             print(
-                f"username mismatch: expected={expected_username!r}, actual={actual_username!r}",
+                "OIDC provider preflight failed: expected reason_code=oidc_id_token_required",
                 file=sys.stderr,
             )
-            return 1
-        if not _matches_expected(actual_tenant_id, expected_tenant_id):
-            print(
-                f"tenant_id mismatch: expected={expected_tenant_id!r}, actual={actual_tenant_id!r}",
-                file=sys.stderr,
-            )
-            return 1
-        if not _matches_expected(actual_role, expected_role):
-            print(
-                f"role mismatch: expected={expected_role!r}, actual={actual_role!r}",
-                file=sys.stderr,
-            )
-            return 1
+            return 2
+
+        print("[4/4] POST /api/auth/login (preflight: synthetic invalid token)")
+        probe_status, probe_body = _http_json(
+            base_url=base_url,
+            path="/api/auth/login",
+            timeout=timeout,
+            method="POST",
+            payload={"id_token": _build_preflight_token()},
+        )
+        print(f"  status={probe_status}")
+        print(_json_dump(probe_body))
+        reason_code = str(probe_body.get("reason_code") or "").strip()
+        if reason_code in {
+            "oidc_token_invalid",
+            "oidc_token_expired",
+            "oidc_token_kid_unknown",
+            "oidc_token_kid_missing",
+            "oidc_token_algorithm_not_allowed",
+        }:
+            print("OIDC preflight passed")
+            return 0
+        print("OIDC preflight failed: unexpected reason_code", file=sys.stderr)
+        return 2
+
+    if local_mode:
+        print("[3/4] POST /api/auth/login (local)")
+        login_status, login_body = _http_json(
+            base_url=base_url,
+            path="/api/auth/login",
+            timeout=timeout,
+            method="POST",
+            payload={"username": username, "password": password},
+        )
+        login_mode_label = "Local"
+    else:
+        print("[3/4] POST /api/auth/login (oidc)")
+        login_status, login_body = _http_json(
+            base_url=base_url,
+            path="/api/auth/login",
+            timeout=timeout,
+            method="POST",
+            payload={"id_token": id_token},
+        )
+        login_mode_label = "OIDC"
+    print(f"  status={login_status}")
+    if int(login_status) != 200:
+        print(_json_dump(login_body), file=sys.stderr)
+        reason_code = str(login_body.get("reason_code") or "").strip()
+        if reason_code:
+            print(f"  reason_code={reason_code}", file=sys.stderr)
+        return 2
+    token = str(login_body.get("access_token") or login_body.get("token") or "").strip()
+    if not token:
+        print(f"{login_mode_label} login succeeded but no access token returned", file=sys.stderr)
+        print(_json_dump(login_body), file=sys.stderr)
+        return 2
+    print(f"  token=*** ({len(token)} chars)")
+
+    print("[4/4] GET /api/auth/me")
+    me_status, me_body = _http_json(
+        base_url=base_url,
+        path="/api/auth/me",
+        timeout=timeout,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    print(f"  status={me_status}")
+    print(_json_dump(me_body))
+    if int(me_status) != 200:
+        return 2
+
+    actual_username = str(me_body.get("username") or "").strip()
+    actual_tenant_id = str(me_body.get("tenant_id") or "").strip()
+    actual_role = str(me_body.get("role") or "").strip()
+
+    if not _matches_expected(actual_username, expected_username):
+        print(
+            f"username mismatch: expected={expected_username!r}, actual={actual_username!r}",
+            file=sys.stderr,
+        )
+        return 1
+    if not _matches_expected(actual_tenant_id, expected_tenant_id):
+        print(
+            f"tenant_id mismatch: expected={expected_tenant_id!r}, actual={actual_tenant_id!r}",
+            file=sys.stderr,
+        )
+        return 1
+    if not _matches_expected(actual_role, expected_role):
+        print(
+            f"role mismatch: expected={expected_role!r}, actual={actual_role!r}",
+            file=sys.stderr,
+        )
+        return 1
 
     print("OK")
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(asyncio.run(main()))
+    raise SystemExit(main())

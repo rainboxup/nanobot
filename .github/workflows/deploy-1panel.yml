@@ -153,10 +153,6 @@ jobs:
               fi
             fi
 
-            if ! "$PYTHON_BIN" -c "import httpx" >/dev/null 2>&1; then
-              "$PYTHON_BIN" -m pip install --disable-pip-version-check --quiet httpx
-            fi
-
             if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
               NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
               NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
@@ -188,12 +184,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install smoke dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install httpx
 
       - name: Post-deploy external smoke (best effort)
         env:

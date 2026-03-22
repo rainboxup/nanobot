@@ -91,7 +91,7 @@ def _http_json(
     req = urllib.request.Request(url=url, data=body_bytes, headers=req_headers, method=method.upper())
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     last_err: str | None = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 7):
         try:
             with opener.open(req, timeout=timeout) as resp:
                 raw = resp.read().decode("utf-8", errors="replace")
@@ -101,8 +101,13 @@ def _http_json(
             return int(exc.code or 0), _loads_json(raw)
         except urllib.error.URLError as exc:
             last_err = str(exc)
-            if attempt < 3:
-                time.sleep(0.5)
+            if attempt < 6:
+                time.sleep(1.0)
+                continue
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}: {exc}"
+            if attempt < 6:
+                time.sleep(1.0)
                 continue
     return 0, {"detail": f"request_failed: {method.upper()} {path}: {last_err or 'unknown'}"}
 

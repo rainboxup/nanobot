@@ -181,7 +181,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Post-deploy external smoke (best effort)
+      - name: Post-deploy external smoke
         env:
           NANOBOT_SMOKE_URL: ${{ env.SMOKE_URL }}
           NANOBOT_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
@@ -201,9 +201,7 @@ jobs:
               echo "::warning::External smoke failed (network/path issue likely); remote smoke already executed on target host"
             fi
           elif [ -n "${NANOBOT_SMOKE_USERNAME:-}" ] && [ -n "${NANOBOT_SMOKE_PASSWORD:-}" ]; then
-            if ! python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --username "$NANOBOT_SMOKE_USERNAME" --password "$NANOBOT_SMOKE_PASSWORD"; then
-              echo "::warning::External credential smoke failed; remote localhost preflight already passed"
-            fi
+            python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --username "$NANOBOT_SMOKE_USERNAME" --password "$NANOBOT_SMOKE_PASSWORD"
           else
             echo "::notice::SMOKE_OIDC_ID_TOKEN/SMOKE_USERNAME not set; running OIDC preflight mode"
             if ! python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --oidc-preflight; then

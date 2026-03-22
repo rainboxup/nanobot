@@ -9,7 +9,8 @@
 2. OIDC 基础配置可用（至少满足其一）：
    - `NANOBOT_WEB_OIDC_JWKS_URL`
    - `NANOBOT_WEB_OIDC_JWKS_JSON`
-3. 具备一个可用 `id_token`（建议短时效测试令牌）。
+3. 建议具备一个可用 `id_token`（短时效测试令牌）。
+   - 没有 token 时也可执行 `--oidc-preflight` 预检模式。
 
 ## 推荐环境变量
 
@@ -36,6 +37,12 @@ python scripts/smoke_oidc_login.py --allow-ready-degraded
 3. `POST /api/auth/login`（`id_token`）
 4. `GET /api/auth/me`
 
+无 token 预检模式（不验证真实用户身份，仅验证 OIDC provider/JWKS 链路）：
+
+```bash
+python scripts/smoke_oidc_login.py --allow-ready-degraded --oidc-preflight
+```
+
 ## 失败排障（reason_code）
 
 `/api/auth/login` 失败时会返回 `reason_code`。常见值：
@@ -52,8 +59,9 @@ python scripts/smoke_oidc_login.py --allow-ready-degraded
 
 ## CI / 自动化建议
 
-1. 用短期测试令牌执行脚本，不要使用长期敏感令牌。
-2. 将脚本退出码纳入部署门禁：
+1. 优先使用短期测试令牌执行完整 smoke，不要使用长期敏感令牌。
+2. 没有 token 时使用 `--oidc-preflight`，至少保证 provider 选择和 OIDC 失败码行为正确。
+3. 将脚本退出码纳入部署门禁：
    - `0`: 通过
    - `1`: 业务断言不匹配（如用户名/租户/角色）
    - `2`: 接口或登录链路失败

@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sys
+import time
 from typing import Any
 
 import httpx
@@ -48,6 +50,25 @@ def _matches_expected(actual: str, expected: str | None) -> bool:
     return actual.strip().lower() == expected.strip().lower()
 
 
+def _b64url_json(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _build_preflight_token() -> str:
+    now = int(time.time())
+    header = {"alg": "RS256", "typ": "JWT", "kid": "smoke-kid"}
+    payload = {
+        "sub": "oidc-smoke-preflight",
+        "iss": "https://smoke.invalid",
+        "aud": "nanobot-web",
+        "iat": now,
+        "exp": now + 300,
+    }
+    signature = base64.urlsafe_b64encode(b"invalid-signature").decode("ascii").rstrip("=")
+    return f"{_b64url_json(header)}.{_b64url_json(payload)}.{signature}"
+
+
 async def main() -> int:
     ap = argparse.ArgumentParser(description="Nanobot OIDC login smoke test")
     default_port = _env("NANOBOT_PORT", "18790")
@@ -60,6 +81,11 @@ async def main() -> int:
         "--id-token",
         default=_env("NANOBOT_SMOKE_OIDC_ID_TOKEN", ""),
         help="OIDC id_token (or set NANOBOT_SMOKE_OIDC_ID_TOKEN)",
+    )
+    ap.add_argument(
+        "--oidc-preflight",
+        action="store_true",
+        help="Run OIDC preflight without a real id_token",
     )
     ap.add_argument(
         "--timeout",
@@ -91,11 +117,15 @@ async def main() -> int:
 
     base_url = str(args.base_url or "").strip().rstrip("/")
     id_token = str(args.id_token or "").strip()
+    preflight_mode = bool(args.oidc_preflight)
     if not base_url:
         print("base-url is required", file=sys.stderr)
         return 2
-    if not id_token:
-        print("id-token is required (or set NANOBOT_SMOKE_OIDC_ID_TOKEN)", file=sys.stderr)
+    if not id_token and not preflight_mode:
+        print(
+            "id-token is required (or set NANOBOT_SMOKE_OIDC_ID_TOKEN, or use --oidc-preflight)",
+            file=sys.stderr,
+        )
         return 2
 
     timeout = max(1.0, float(args.timeout))
@@ -122,6 +152,38 @@ async def main() -> int:
             bool(args.allow_ready_degraded) and int(ready.status_code) == 503
         ):
             print("Ready check failed", file=sys.stderr)
+            return 2
+
+        if preflight_mode and not id_token:
+            print("[3/4] POST /api/auth/login (preflight: missing id_token)")
+            missing = await client.post("/api/auth/login", json={})
+            missing_body = _body_json(missing)
+            print(f"  status={missing.status_code}")
+            print(_json_dump(missing_body))
+            missing_reason = str(missing_body.get("reason_code") or "").strip()
+            if missing_reason != "oidc_id_token_required":
+                print(
+                    "OIDC provider preflight failed: expected reason_code=oidc_id_token_required",
+                    file=sys.stderr,
+                )
+                return 2
+
+            print("[4/4] POST /api/auth/login (preflight: synthetic invalid token)")
+            probe = await client.post("/api/auth/login", json={"id_token": _build_preflight_token()})
+            probe_body = _body_json(probe)
+            print(f"  status={probe.status_code}")
+            print(_json_dump(probe_body))
+            reason_code = str(probe_body.get("reason_code") or "").strip()
+            if reason_code in {
+                "oidc_token_invalid",
+                "oidc_token_expired",
+                "oidc_token_kid_unknown",
+                "oidc_token_kid_missing",
+                "oidc_token_algorithm_not_allowed",
+            }:
+                print("OIDC preflight passed")
+                return 0
+            print("OIDC preflight failed: unexpected reason_code", file=sys.stderr)
             return 2
 
         print("[3/4] POST /api/auth/login (oidc)")
@@ -178,4 +240,3 @@ async def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-

@@ -101,24 +101,20 @@ jobs:
             fi
 
       - name: Checkout repository for smoke scripts
-        if: ${{ env.SMOKE_OIDC_ID_TOKEN != '' }}
         uses: actions/checkout@v4
 
       - name: Setup Python for smoke checks
-        if: ${{ env.SMOKE_OIDC_ID_TOKEN != '' }}
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
       - name: Install smoke dependencies
-        if: ${{ env.SMOKE_OIDC_ID_TOKEN != '' }}
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install httpx
 
       - name: Post-deploy OIDC smoke
-        if: ${{ env.SMOKE_OIDC_ID_TOKEN != '' }}
         env:
           NANOBOT_SMOKE_URL: ${{ env.SMOKE_URL }}
           NANOBOT_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
@@ -128,12 +124,12 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${NANOBOT_SMOKE_URL:-}" ]; then
-            echo "::error::Missing required secret for OIDC smoke: SMOKE_URL"
-            exit 1
+            echo "::notice::SMOKE_URL not set; skipping post-deploy OIDC smoke"
+            exit 0
           fi
-          python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20
-
-      - name: OIDC smoke skipped
-        if: ${{ env.SMOKE_OIDC_ID_TOKEN == '' }}
-        run: |
-          echo "::notice::Skipping OIDC smoke (set SMOKE_OIDC_ID_TOKEN and SMOKE_URL to enable)"
+          if [ -n "${NANOBOT_SMOKE_OIDC_ID_TOKEN:-}" ]; then
+            python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20
+          else
+            echo "::notice::SMOKE_OIDC_ID_TOKEN not set; running OIDC preflight mode"
+            python scripts/smoke_oidc_login.py --allow-ready-degraded --timeout 20 --oidc-preflight
+          fi

@@ -72,8 +72,8 @@
 - Optional Secrets:
   - `DEPLOY_BRANCH`: defaults to `saas-main`
   - `DEPLOY_COMMAND`: custom restart command for 1Panel/docker (example: `docker compose up -d --build`)
-  - `SMOKE_OIDC_ID_TOKEN`: enable post-deploy OIDC smoke when set
-  - `SMOKE_URL`: target base URL for OIDC smoke (required when `SMOKE_OIDC_ID_TOKEN` is set)
+  - `SMOKE_URL`: target base URL for post-deploy OIDC smoke (when missing, smoke step is skipped)
+  - `SMOKE_OIDC_ID_TOKEN`: optional full OIDC login token; when missing, workflow runs OIDC preflight mode
   - `SMOKE_EXPECT_USERNAME`: optional `/api/auth/me` username assertion
   - `SMOKE_EXPECT_TENANT_ID`: optional `/api/auth/me` tenant assertion
   - `SMOKE_EXPECT_ROLE`: optional `/api/auth/me` role assertion

@@ -48,7 +48,7 @@ describe("Integrations", () => {
     } as any)
   })
 
-  it("renders connector health summary and disables manual sync for degraded connectors", async () => {
+  it("renders connector health summary and exposes ERP operation options", async () => {
     mockedApiGet.mockImplementation(async (path: string) => {
       if (path === "/api/integrations") {
         return [
@@ -75,7 +75,7 @@ describe("Integrations", () => {
             provider: "erp_native",
             base_url: "",
             timeout_s: 30,
-            health: { ready: false, provider_available: false, last_sync_status: null },
+            health: { ready: true, provider_available: true, last_sync_status: "succeeded" },
             latest_status: null,
           },
         ] as any
@@ -84,9 +84,9 @@ describe("Integrations", () => {
         return {
           tenant_id: "tenant-alpha",
           configured_connectors: 2,
-          ready_connectors: 1,
-          degraded_connectors: ["erp_core"],
-          available_providers: ["crm_native", "order_native"],
+          ready_connectors: 2,
+          degraded_connectors: [],
+          available_providers: ["crm_native", "order_native", "erp_native"],
         } as any
       }
       throw new Error(`Unhandled api.get mock for: ${path}`)
@@ -96,10 +96,11 @@ describe("Integrations", () => {
 
     expect(await screen.findByText("连接器健康总览")).toBeInTheDocument()
     expect(screen.getByText(/configured: 2/i)).toBeInTheDocument()
-    expect(screen.getByText(/ready: 1/i)).toBeInTheDocument()
-    expect(screen.getByText(/degraded connectors: erp_core/i)).toBeInTheDocument()
+    expect(screen.getByText(/ready: 2/i)).toBeInTheDocument()
     expect(screen.getByRole("button", { name: "sync-crm_core" })).toBeEnabled()
-    expect(screen.getByRole("button", { name: "sync-erp_core" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "sync-erp_core" })).toBeEnabled()
+    expect(screen.getByRole("option", { name: "sync_products" })).toBeInTheDocument()
+    expect(screen.getByRole("option", { name: "sync_inventory" })).toBeInTheDocument()
   })
 
   it("submits manual sync and updates latest status in place", async () => {

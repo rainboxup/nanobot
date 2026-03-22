@@ -77,6 +77,8 @@ function detectOperationOptions(
   let options: string[]
   if (normalized.includes("crm")) {
     options = ["sync_contacts", "sync_accounts"]
+  } else if (normalized.includes("erp")) {
+    options = ["sync_products", "sync_inventory"]
   } else if (normalized.includes("order")) {
     options = ["sync_orders", "sync_fulfillment"]
   } else {
@@ -278,7 +280,7 @@ export function Integrations() {
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">业务集成</h2>
-          <p className="text-muted-foreground">查看连接器健康状态，并按连接器手动触发 CRM / 订单同步。</p>
+          <p className="text-muted-foreground">查看连接器健康状态，并按连接器手动触发 CRM / 订单 / ERP 同步。</p>
         </div>
         <Button variant="outline" onClick={() => load().catch(() => {})} disabled={loading || Boolean(syncingConnector)}>
           刷新

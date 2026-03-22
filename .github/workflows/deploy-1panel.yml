@@ -122,6 +122,7 @@ jobs:
       - name: Post-deploy remote smoke (SSH localhost)
         uses: appleboy/ssh-action@v1.2.4
         env:
+          REMOTE_SMOKE_URL: ${{ env.SMOKE_URL }}
           REMOTE_SMOKE_USERNAME: ${{ env.SMOKE_USERNAME }}
           REMOTE_SMOKE_PASSWORD: ${{ env.SMOKE_PASSWORD }}
           REMOTE_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
@@ -130,11 +131,12 @@ jobs:
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
-          envs: REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
+          envs: REMOTE_SMOKE_URL,REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
           script: |
             set -euo pipefail
             DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
-            REMOTE_SMOKE_URL="http://127.0.0.1:8318"
+            LOCAL_SMOKE_URL="http://127.0.0.1:8318"
+            PRIMARY_SMOKE_URL="${REMOTE_SMOKE_URL:-$LOCAL_SMOKE_URL}"
             cd "$DEPLOY_PATH"
 
             PYTHON_BIN="python3"
@@ -149,7 +151,7 @@ jobs:
 
             health_ready=0
             for i in $(seq 1 45); do
-              if curl -fsS --max-time 3 "${REMOTE_SMOKE_URL}/api/health" >/dev/null 2>&1; then
+              if curl -fsS --max-time 3 "${LOCAL_SMOKE_URL}/api/health" >/dev/null 2>&1; then
                 health_ready=1
                 break
               fi
@@ -161,7 +163,7 @@ jobs:
             fi
 
             if [ -n "${REMOTE_SMOKE_USERNAME:-}" ] && [ -n "${REMOTE_SMOKE_PASSWORD:-}" ]; then
-              if NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              if NANOBOT_SMOKE_URL="$PRIMARY_SMOKE_URL" \
                 NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
                 NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
                 "$PYTHON_BIN" scripts/smoke_oidc_login.py \
@@ -171,21 +173,32 @@ jobs:
                   --password "$REMOTE_SMOKE_PASSWORD"; then
                 exit 0
               fi
-              echo "::warning::Local credential smoke failed; falling back to preflight smoke"
-              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              if [ "$PRIMARY_SMOKE_URL" != "$LOCAL_SMOKE_URL" ] && \
+                NANOBOT_SMOKE_URL="$LOCAL_SMOKE_URL" \
+                NANOBOT_SMOKE_USERNAME="$REMOTE_SMOKE_USERNAME" \
+                NANOBOT_SMOKE_PASSWORD="$REMOTE_SMOKE_PASSWORD" \
+                "$PYTHON_BIN" scripts/smoke_oidc_login.py \
+                  --allow-ready-degraded \
+                  --timeout 20 \
+                  --username "$REMOTE_SMOKE_USERNAME" \
+                  --password "$REMOTE_SMOKE_PASSWORD"; then
+                exit 0
+              fi
+              echo "::notice::Credential smoke failed; running localhost preflight as gate"
+              NANOBOT_SMOKE_URL="$LOCAL_SMOKE_URL" \
               "$PYTHON_BIN" scripts/smoke_oidc_login.py \
                 --allow-ready-degraded \
                 --timeout 20 \
                 --oidc-preflight
             elif [ -n "${REMOTE_SMOKE_OIDC_ID_TOKEN:-}" ]; then
-              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              NANOBOT_SMOKE_URL="$PRIMARY_SMOKE_URL" \
               NANOBOT_SMOKE_OIDC_ID_TOKEN="$REMOTE_SMOKE_OIDC_ID_TOKEN" \
               "$PYTHON_BIN" scripts/smoke_oidc_login.py \
                 --allow-ready-degraded \
                 --timeout 20 \
                 --id-token "$REMOTE_SMOKE_OIDC_ID_TOKEN"
             else
-              NANOBOT_SMOKE_URL="$REMOTE_SMOKE_URL" \
+              NANOBOT_SMOKE_URL="$LOCAL_SMOKE_URL" \
               "$PYTHON_BIN" scripts/smoke_oidc_login.py \
                 --allow-ready-degraded \
                 --timeout 20 \

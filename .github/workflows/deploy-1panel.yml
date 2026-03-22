@@ -17,7 +17,6 @@ jobs:
     env:
       SMOKE_OIDC_ID_TOKEN: ${{ secrets.SMOKE_OIDC_ID_TOKEN }}
       SMOKE_URL: ${{ secrets.SMOKE_URL }}
-      SMOKE_INTERNAL_URL: ${{ secrets.SMOKE_INTERNAL_URL }}
       SMOKE_USERNAME: ${{ secrets.SMOKE_USERNAME }}
       SMOKE_PASSWORD: ${{ secrets.SMOKE_PASSWORD }}
       SMOKE_EXPECT_USERNAME: ${{ secrets.SMOKE_EXPECT_USERNAME }}
@@ -124,7 +123,6 @@ jobs:
       - name: Post-deploy remote smoke (SSH localhost)
         uses: appleboy/ssh-action@v1.2.0
         env:
-          REMOTE_SMOKE_URL: ${{ env.SMOKE_INTERNAL_URL }}
           REMOTE_SMOKE_USERNAME: ${{ env.SMOKE_USERNAME }}
           REMOTE_SMOKE_PASSWORD: ${{ env.SMOKE_PASSWORD }}
           REMOTE_SMOKE_OIDC_ID_TOKEN: ${{ env.SMOKE_OIDC_ID_TOKEN }}
@@ -134,13 +132,11 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: 22
           script_stop: true
-          envs: REMOTE_SMOKE_URL,REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
+          envs: REMOTE_SMOKE_USERNAME,REMOTE_SMOKE_PASSWORD,REMOTE_SMOKE_OIDC_ID_TOKEN
           script: |
             set -euo pipefail
             DEPLOY_PATH='${{ secrets.DEPLOY_PATH }}'
-            if [ -z "${REMOTE_SMOKE_URL:-}" ]; then
-              REMOTE_SMOKE_URL="http://127.0.0.1:8318"
-            fi
+            REMOTE_SMOKE_URL="http://127.0.0.1:8318"
             cd "$DEPLOY_PATH"
 
             PYTHON_BIN="python3"

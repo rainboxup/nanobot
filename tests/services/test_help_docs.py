@@ -122,6 +122,18 @@ def test_enterprise_bundle_help_doc_includes_onboard_packaging_profile() -> None
     assert "packaging_profile=enterprise" in doc.markdown
 
 
+def test_oidc_staging_smoke_help_doc_is_registered() -> None:
+    registry = HelpDocsRegistry.default()
+    spec = registry.get_spec("oidc-staging-smoke")
+    assert spec is not None
+    assert spec.source.path == "nanobot/help_docs/oidc-staging-smoke.md"
+
+    doc = registry.get_doc("oidc-staging-smoke")
+    assert doc is not None
+    assert "scripts/smoke_oidc_login.py" in doc.markdown
+    assert "oidc_jwks_fetch_failed" in doc.markdown
+
+
 def test_operator_help_docs_reference_ops_security_and_users_surfaces() -> None:
     registry = HelpDocsRegistry.default()
 

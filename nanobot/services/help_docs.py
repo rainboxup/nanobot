@@ -109,6 +109,12 @@ def _default_specs() -> tuple[HelpDocSpec, ...]:
             Path("enterprise-bundle-bootstrap.md"),
             HelpDocSource(kind="repo_docs", path="docs/howto/enterprise-bundle-bootstrap.md"),
         ),
+        (
+            "oidc-staging-smoke",
+            "OIDC Staging Smoke",
+            Path("oidc-staging-smoke.md"),
+            HelpDocSource(kind="repo_docs", path="nanobot/help_docs/oidc-staging-smoke.md"),
+        ),
     )
     return tuple(
         HelpDocSpec(slug=slug, title=title, relative_path=relative_path, source=source)

@@ -4,6 +4,7 @@ import json
 import time
 from urllib.parse import urlsplit
 
+import httpx
 import jwt
 import pytest
 import websockets
@@ -169,7 +170,74 @@ async def test_login_with_oidc_provider_rejects_invalid_claims(http_client, web_
         web_ctx.app.state.auth_provider_name = original_provider_name
 
     assert r.status_code == 401
-    assert "oidc token" in str(r.json().get("detail") or "").lower()
+    body = r.json()
+    assert "oidc token" in str(body.get("detail") or "").lower()
+    assert body.get("reason_code") == "oidc_token_invalid"
+    assert body.get("provider") == "oidc"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_login_with_oidc_provider_fetches_remote_jwks(
+    http_client,
+    web_ctx,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "integration-oidc-secret-0003-32-bytes"
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            _ = exc_type, exc, tb
+            return False
+
+        async def get(self, url: str) -> httpx.Response:
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                200,
+                request=request,
+                json={"keys": [_oidc_hs256_jwk(secret, kid="oidc-kid-remote")]},
+            )
+
+    monkeypatch.setattr("nanobot.web.auth_providers.oidc.httpx.AsyncClient", _FakeAsyncClient)
+
+    provider = OidcAuthProvider(
+        issuer="https://issuer.example.com",
+        audience=("nanobot-web",),
+        jwks_url="https://issuer.example.com/.well-known/jwks.json",
+        algorithms=("HS256",),
+        username_claim="email",
+    )
+    web_ctx.app.state.auth_provider_registry.register(provider)
+    original_provider_name = str(getattr(web_ctx.app.state, "auth_provider_name", "") or "local")
+    web_ctx.app.state.auth_provider_name = "oidc"
+    now = int(time.time())
+    id_token = _oidc_token(
+        secret,
+        kid="oidc-kid-remote",
+        payload={
+            "sub": "oidc-remote-sub",
+            "email": "oidc-remote@example.com",
+            "iss": "https://issuer.example.com",
+            "aud": "nanobot-web",
+            "iat": now,
+            "exp": now + 300,
+        },
+    )
+    try:
+        r = await http_client.post("/api/auth/login", json={"id_token": id_token})
+    finally:
+        web_ctx.app.state.auth_provider_name = original_provider_name
+
+    assert r.status_code == 200
+    body = r.json()
+    assert body.get("username") == "oidc-remote@example.com"
+    assert body.get("provider") is None
 
 
 @pytest.mark.integration
@@ -313,6 +381,9 @@ async def test_login_failure(http_client) -> None:
         json={"username": "admin", "password": "wrong"},
     )
     assert r.status_code == 401
+    body = r.json()
+    assert body.get("reason_code") == "invalid_credentials"
+    assert body.get("provider") == "local"
 
 
 @pytest.mark.integration

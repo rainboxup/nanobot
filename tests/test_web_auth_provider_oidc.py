@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import jwt
 import pytest
 from fastapi import HTTPException
@@ -166,3 +167,59 @@ async def test_oidc_provider_rejects_invalid_audience(tmp_path: Path) -> None:
         )
 
     assert int(exc_info.value.status_code) == 401
+
+
+@pytest.mark.asyncio
+async def test_oidc_provider_fetches_remote_jwks(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    secret = "oidc-provider-secret-0004-32-bytes"
+
+    class _FakeAsyncClient:
+        def __init__(self, *args, **kwargs) -> None:
+            _ = args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            _ = exc_type, exc, tb
+            return False
+
+        async def get(self, url: str) -> httpx.Response:
+            request = httpx.Request("GET", url)
+            return httpx.Response(
+                200,
+                request=request,
+                json={"keys": [_hs256_jwk(secret, kid="remote-hs")]},
+            )
+
+    monkeypatch.setattr("nanobot.web.auth_providers.oidc.httpx.AsyncClient", _FakeAsyncClient)
+    provider = OidcAuthProvider(
+        issuer="https://issuer.example.com",
+        audience=("nanobot-web",),
+        jwks_url="https://issuer.example.com/.well-known/jwks.json",
+        algorithms=("HS256",),
+        username_claim="email",
+    )
+    now = int(time.time())
+    id_token = jwt.encode(
+        {
+            "sub": "remote-user",
+            "email": "remote@example.com",
+            "iss": "https://issuer.example.com",
+            "aud": "nanobot-web",
+            "iat": now,
+            "exp": now + 300,
+        },
+        secret,
+        algorithm="HS256",
+        headers={"kid": "remote-hs"},
+    )
+
+    identity = await provider.authenticate(
+        request=_login_request(),
+        payload={"id_token": id_token},
+        app_state=_state(tmp_path),
+    )
+
+    assert identity.username == "remote@example.com"
+    assert identity.role == ROLE_MEMBER

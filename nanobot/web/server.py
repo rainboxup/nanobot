@@ -326,6 +326,85 @@ def _build_dashboard_unavailable_html(reason: str) -> str:
     )
 
 
+def _error_detail_text(detail: Any, *, fallback: str = "Authentication failed") -> str:
+    if isinstance(detail, str):
+        text = detail.strip()
+        return text or fallback
+    if isinstance(detail, dict):
+        text = str(detail.get("detail") or detail.get("message") or "").strip()
+        return text or fallback
+    if isinstance(detail, list):
+        for item in detail:
+            text = _error_detail_text(item, fallback="")
+            if text:
+                return text
+    text = str(detail or "").strip()
+    return text or fallback
+
+
+def _error_reason_code(detail: Any) -> str:
+    if isinstance(detail, dict):
+        code = str(detail.get("reason_code") or "").strip().lower()
+        if code:
+            return code
+    return ""
+
+
+def _auth_provider_failure_reason_code(provider: str, status_code: int, detail: Any) -> str:
+    explicit = _error_reason_code(detail)
+    if explicit:
+        return explicit
+
+    normalized_provider = str(provider or "local").strip().lower() or "local"
+    text = _error_detail_text(detail).strip().lower()
+
+    if status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        return "auth_rate_limited"
+    if status_code == status.HTTP_401_UNAUTHORIZED and text == "invalid credentials":
+        return "invalid_credentials"
+    if status_code == status.HTTP_403_FORBIDDEN and text == "beta access not granted":
+        return "beta_access_denied"
+    if status_code == status.HTTP_400_BAD_REQUEST and text == "username required":
+        return "username_required"
+    if status_code == status.HTTP_500_INTERNAL_SERVER_ERROR and text == "auth store not configured":
+        return "auth_store_not_configured"
+    if status_code == status.HTTP_422_UNPROCESSABLE_CONTENT and "password must be at least" in text:
+        return "password_too_short"
+    if status_code == status.HTTP_401_UNAUTHORIZED and text == "account disabled":
+        return "account_disabled"
+
+    if normalized_provider == "oidc":
+        oidc_exact_map = {
+            "id_token required": "oidc_id_token_required",
+            "oidc static jwks json is invalid": "oidc_static_jwks_invalid",
+            "oidc static jwks json must be an object": "oidc_static_jwks_invalid",
+            "oidc token missing usable username claim": "oidc_username_claim_missing",
+            "oidc token header invalid": "oidc_token_header_invalid",
+            "oidc token algorithm is not allowed": "oidc_token_algorithm_not_allowed",
+            "oidc token expired": "oidc_token_expired",
+            "oidc token invalid": "oidc_token_invalid",
+            "oidc token key id is not recognized": "oidc_token_kid_unknown",
+            "oidc token key id missing": "oidc_token_kid_missing",
+            "oidc signing key is invalid": "oidc_signing_key_invalid",
+            "oidc jwks not configured": "oidc_jwks_not_configured",
+            "oidc jwks request timed out": "oidc_jwks_timeout",
+            "failed to fetch oidc jwks": "oidc_jwks_fetch_failed",
+            "oidc jwks endpoint returned an error": "oidc_jwks_endpoint_error",
+            "oidc jwks response is not valid json": "oidc_jwks_invalid_json",
+            "oidc jwks response has no keys": "oidc_jwks_no_keys",
+            "failed to provision oidc account": "oidc_account_provision_failed",
+        }
+        mapped = oidc_exact_map.get(text)
+        if mapped:
+            return mapped
+        if "oidc token" in text:
+            return "oidc_token_invalid"
+        if "oidc jwks" in text:
+            return "oidc_jwks_error"
+
+    return "auth_provider_rejected"
+
+
 _OPERATOR_GUIDE_SLUGS = (
     "config-ownership",
     "workspace-routing-and-binding",
@@ -831,48 +910,65 @@ def create_app(
                 },
             )
 
-        identity = await provider.authenticate(request=request, payload=payload, app_state=app.state)
-        username = str(identity.username or "").strip()
-        tenant_id = str(identity.tenant_id or username)
-        role = str(identity.role or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
-        token_version = int(identity.token_version or 1)
+        provider_name = str(getattr(provider, "name", "") or configured_provider_name or "local").strip().lower()
+        try:
+            identity = await provider.authenticate(request=request, payload=payload, app_state=app.state)
+            username = str(identity.username or "").strip()
+            tenant_id = str(identity.tenant_id or username)
+            role = str(identity.role or ROLE_MEMBER).strip().lower() or ROLE_MEMBER
+            token_version = int(identity.token_version or 1)
 
-        user_store = getattr(app.state, "user_store", None)
-        if not isinstance(user_store, UserStore):
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Auth store not configured")
+            user_store = getattr(app.state, "user_store", None)
+            if not isinstance(user_store, UserStore):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Auth store not configured",
+                )
 
-        access_ttl = _parse_positive_seconds_env("NANOBOT_WEB_ACCESS_TOKEN_EXPIRES_S", 3600)
-        refresh_ttl = _parse_positive_seconds_env("NANOBOT_WEB_REFRESH_TOKEN_EXPIRES_S", 30 * 24 * 3600)
-        access_token = generate_token(
-            username=username,
-            secret=jwt_secret,
-            tenant_id=tenant_id,
-            role=role,
-            token_version=token_version,
-            token_type="access",
-            expires_in_s=access_ttl,
-        )
-        refresh_token = user_store.issue_refresh_token(
-            username,
-            expires_in_s=refresh_ttl,
-        )
-        username_out = normalize_username(username)
-        role_out = role
-        response_payload = {
-            "token": access_token,
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "token_type": "bearer",
-            "expires_in": access_ttl,
-            "role": role_out,
-            "tenant_id": tenant_id,
-            "username": username_out,
-            "account_id": username_out,
-            "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
-        }
-        response = JSONResponse(content=response_payload)
-        set_refresh_cookie(response, refresh_token, request=request, max_age=refresh_ttl)
-        return response
+            access_ttl = _parse_positive_seconds_env("NANOBOT_WEB_ACCESS_TOKEN_EXPIRES_S", 3600)
+            refresh_ttl = _parse_positive_seconds_env("NANOBOT_WEB_REFRESH_TOKEN_EXPIRES_S", 30 * 24 * 3600)
+            access_token = generate_token(
+                username=username,
+                secret=jwt_secret,
+                tenant_id=tenant_id,
+                role=role,
+                token_version=token_version,
+                token_type="access",
+                expires_in_s=access_ttl,
+            )
+            refresh_token = user_store.issue_refresh_token(
+                username,
+                expires_in_s=refresh_ttl,
+            )
+            username_out = normalize_username(username)
+            role_out = role
+            response_payload = {
+                "token": access_token,
+                "access_token": access_token,
+                "refresh_token": refresh_token,
+                "token_type": "bearer",
+                "expires_in": access_ttl,
+                "role": role_out,
+                "tenant_id": tenant_id,
+                "username": username_out,
+                "account_id": username_out,
+                "is_beta_admin": bool(role_out == ROLE_OWNER and is_beta_admin(username_out)),
+            }
+            response = JSONResponse(content=response_payload)
+            set_refresh_cookie(response, refresh_token, request=request, max_age=refresh_ttl)
+            return response
+        except HTTPException as exc:
+            detail_text = _error_detail_text(exc.detail)
+            reason_code = _auth_provider_failure_reason_code(provider_name, int(exc.status_code), exc.detail)
+            return JSONResponse(
+                status_code=int(exc.status_code),
+                content={
+                    "detail": detail_text,
+                    "reason_code": reason_code,
+                    "provider": provider_name,
+                },
+                headers=exc.headers,
+            )
 
     # Routers
     from nanobot.web.api.audit import router as audit_router

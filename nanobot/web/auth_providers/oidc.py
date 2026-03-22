@@ -226,7 +226,7 @@ class OidcAuthProvider:
                     username=username,
                     password=bootstrap_password,
                     role=claim_role,
-                    tenant_id=username,
+                    tenant_id=None,
                 )
             record = user_store.get_user(username)
 

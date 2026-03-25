@@ -22,3 +22,5 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `summarize` | Summarize URLs, files, and YouTube videos |
 | `tmux` | Remote-control tmux sessions |
 | `skill-creator` | Create new skills |
+| `skill-discovery` | Discover reusable skills from OpenSpace |
+| `delegate-task` | Delegate complex tasks to OpenSpace MCP |

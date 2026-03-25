@@ -102,3 +102,36 @@ def test_load_config_reads_input_limits_from_camel_case(tmp_path) -> None:
 
     assert cfg.tools.input_limits.max_input_images == 1
     assert cfg.tools.input_limits.max_input_image_bytes == 2048
+
+
+def test_load_config_reads_openspace_mcp_server_with_env_keys_preserved(tmp_path) -> None:
+    path = tmp_path / "openspace-mcp.json"
+    path.write_text(
+        json.dumps(
+            {
+                "tools": {
+                    "mcpServers": {
+                        "openspace": {
+                            "command": "openspace-mcp",
+                            "toolTimeout": 1200,
+                            "env": {
+                                "OPENSPACE_HOST_SKILL_DIRS": "/opt/nanobot/skills",
+                                "OPENSPACE_WORKSPACE": "/opt/openspace",
+                                "OPENSPACE_API_KEY": "sk-test",
+                            },
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cfg = load_config(config_path=path, allow_env_override=False, strict=True)
+
+    assert "openspace" in cfg.tools.mcp_servers
+    server = cfg.tools.mcp_servers["openspace"]
+    assert server.command == "openspace-mcp"
+    assert server.tool_timeout == 1200
+    assert server.env["OPENSPACE_HOST_SKILL_DIRS"] == "/opt/nanobot/skills"
+    assert server.env["OPENSPACE_WORKSPACE"] == "/opt/openspace"

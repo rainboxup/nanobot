@@ -1,6 +1,7 @@
 """Shared test fixtures for nanobot tests."""
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,11 @@ from nanobot.config.loader import save_config
 from nanobot.config.schema import Config
 from nanobot.tenants.store import TenantStore
 from nanobot.tenants.types import TenantContext
+
+if os.name == "nt" and "PYTEST_DEBUG_TEMPROOT" not in os.environ:
+    _pytest_temproot = Path.cwd() / ".pytest-temproot" / f"pid-{os.getpid()}"
+    _pytest_temproot.mkdir(parents=True, exist_ok=True)
+    os.environ["PYTEST_DEBUG_TEMPROOT"] = str(_pytest_temproot)
 
 
 @dataclass

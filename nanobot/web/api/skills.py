@@ -40,6 +40,8 @@ _SINGLE_TENANT_WRITE_BLOCK_DETAIL = (
 _SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _CATALOG_SOURCES = {"local", "clawhub", "all"}
 _CATALOG_CURSOR_PREFIX = "nbc1:"
+_OPENSPACE_SERVER_NAME = "openspace"
+_OPENSPACE_API_KEY_ENV_NAME = "OPENSPACE_API_KEY"
 
 
 def _normalize_runtime_skill_source(source: Any) -> str | None:
@@ -81,6 +83,12 @@ class ToolPolicyUpdateRequest(BaseModel):
 
     exec_enabled: bool | None = None
     web_enabled: bool | None = None
+
+
+class OpenSpaceApiKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: str | None = None
 
 
 class SkillStoreIntegrityModel(BaseModel):
@@ -172,6 +180,19 @@ class SkillInstallResponseModel(BaseModel):
 class ReadErrorResponseModel(BaseModel):
     detail: str
     reason_code: str | None = None
+
+
+class OpenSpaceApiKeyStatusModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    server: str
+    installed: bool
+    configured: bool
+    masked_api_key: str | None = None
+    takes_effect: str
+    writable: bool
+    write_block_reason_code: str | None = None
+    write_block_reason: str | None = None
 
 
 def _tenant_skills_loader(
@@ -419,6 +440,31 @@ def _ensure_tenant_scoped_writes_allowed(request: Request) -> None:
                 _SINGLE_TENANT_WRITE_BLOCK_DETAIL,
             ),
         )
+
+
+def _mcp_server(cfg: Any, name: str) -> Any | None:
+    servers = getattr(getattr(cfg, "tools", None), "mcp_servers", {}) or {}
+    return servers.get(str(name or "").strip())
+
+
+def _openspace_api_key_status_payload(request: Request, cfg: Any) -> dict[str, Any]:
+    runtime_mode = _runtime_mode(request)
+    write_status = _write_status(runtime_mode)
+    server = _mcp_server(cfg, _OPENSPACE_SERVER_NAME)
+    raw_value = ""
+    if server is not None:
+        env = getattr(server, "env", {}) or {}
+        raw_value = str(env.get(_OPENSPACE_API_KEY_ENV_NAME, "") or "").strip()
+    configured = bool(raw_value)
+    payload: dict[str, Any] = {
+        "server": _OPENSPACE_SERVER_NAME,
+        "installed": server is not None,
+        "configured": configured,
+        "masked_api_key": "********" if configured else None,
+        "takes_effect": "next message (runtime reload)",
+        **write_status,
+    }
+    return payload
 
 
 def _web_identities(user: dict[str, Any], tenant_id: str) -> list[str]:
@@ -1106,6 +1152,62 @@ async def list_mcp_servers(
 ) -> list[dict[str, Any]]:
     _tenant_id, _store, cfg = load_tenant_config(request, user)
     return _MCP_SERVICE.list_servers(cfg=cfg)
+
+
+@router.get(
+    "/api/mcp/openspace/key",
+    response_model=OpenSpaceApiKeyStatusModel,
+    response_model_exclude_none=True,
+)
+async def get_openspace_api_key_status(
+    request: Request,
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    _tenant_id, _store, cfg = load_tenant_config(request, user)
+    return _openspace_api_key_status_payload(request, cfg)
+
+
+@router.put(
+    "/api/mcp/openspace/key",
+    response_model=OpenSpaceApiKeyStatusModel,
+    response_model_exclude_none=True,
+)
+async def update_openspace_api_key(
+    request: Request,
+    payload: Any = Body(default=None),
+    user: dict[str, Any] = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_min_role(user, "admin")
+    _ensure_tenant_scoped_writes_allowed(request)
+    validated = _validate_request_model(
+        OpenSpaceApiKeyUpdateRequest,
+        payload,
+        reason_code="invalid_openspace_api_key_request",
+    )
+
+    tenant_id, store, cfg = load_tenant_config(request, user)
+    server = _mcp_server(cfg, _OPENSPACE_SERVER_NAME)
+    if server is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=_api_error_detail(
+                "mcp_server_not_found",
+                "MCP server not found",
+                details={"name": _OPENSPACE_SERVER_NAME},
+            ),
+        )
+
+    raw_api_key = str(validated.api_key or "").strip()
+    env = dict(getattr(server, "env", {}) or {})
+    if raw_api_key:
+        env[_OPENSPACE_API_KEY_ENV_NAME] = raw_api_key
+    else:
+        env.pop(_OPENSPACE_API_KEY_ENV_NAME, None)
+    server.env = env
+    cfg.tools.mcp_servers[_OPENSPACE_SERVER_NAME] = server
+    await save_tenant_config(request, tenant_id, store, cfg)
+    return _openspace_api_key_status_payload(request, cfg)
 
 
 @router.get("/api/tools/policy")

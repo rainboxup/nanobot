@@ -7,7 +7,7 @@ import pytest
 from nanobot.agent.multi_tenant import MultiTenantAgentLoop
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.config.schema import WorkspaceIntegrationConfig
+from nanobot.config.schema import MCPServerConfig, WorkspaceIntegrationConfig
 from nanobot.services.workspace_skill_installs import WorkspaceSkillInstallService
 from nanobot.web.api import skills as skills_api
 
@@ -927,6 +927,100 @@ async def test_mcp_uninstall_success_and_404(http_client, auth_headers) -> None:
 
 @pytest.mark.integration
 @pytest.mark.asyncio
+async def test_openspace_api_key_endpoints_enforce_admin(
+    http_client, auth_headers_for
+) -> None:
+    member_headers = await auth_headers_for(
+        "member-openspace-key", role="member", tenant_id="member-openspace-key"
+    )
+    denied_get = await http_client.get("/api/mcp/openspace/key", headers=member_headers)
+    assert denied_get.status_code == 403
+    denied_put = await http_client.put(
+        "/api/mcp/openspace/key",
+        headers=member_headers,
+        json={"api_key": "sk-demo"},
+    )
+    assert denied_put.status_code == 403
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_openspace_api_key_update_requires_installed_server(
+    http_client, auth_headers_for
+) -> None:
+    admin_headers = await auth_headers_for(
+        "openspace-missing-admin", role="admin", tenant_id="openspace-missing-admin"
+    )
+    status_resp = await http_client.get("/api/mcp/openspace/key", headers=admin_headers)
+    assert status_resp.status_code == 200
+    status_body = status_resp.json()
+    assert bool(status_body.get("installed")) is False
+    assert bool(status_body.get("configured")) is False
+
+    missing = await http_client.put(
+        "/api/mcp/openspace/key",
+        headers=admin_headers,
+        json={"api_key": "sk-demo"},
+    )
+    assert missing.status_code == 404
+    detail = dict(missing.json().get("detail") or {})
+    assert detail.get("reason_code") == "mcp_server_not_found"
+    assert dict(detail.get("details") or {}).get("name") == "openspace"
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_openspace_api_key_update_persists_and_masks_response(
+    http_client, auth_headers_for, web_ctx
+) -> None:
+    tenant_id = "openspace-admin"
+    admin_headers = await auth_headers_for("openspace-admin", role="admin", tenant_id=tenant_id)
+    tenant_cfg = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    tenant_cfg.tools.mcp_servers["openspace"] = MCPServerConfig(
+        command="openspace-mcp",
+        env={"OPENSPACE_WORKSPACE": "/tmp/openspace"},
+    )
+    web_ctx.tenant_store.save_tenant_config(tenant_id, tenant_cfg)
+
+    initial = await http_client.get("/api/mcp/openspace/key", headers=admin_headers)
+    assert initial.status_code == 200
+    initial_body = initial.json()
+    assert bool(initial_body.get("installed")) is True
+    assert bool(initial_body.get("configured")) is False
+    assert initial_body.get("masked_api_key") in (None, "")
+
+    updated = await http_client.put(
+        "/api/mcp/openspace/key",
+        headers=admin_headers,
+        json={"api_key": "  sk-openspace-tenant-a  "},
+    )
+    assert updated.status_code == 200
+    updated_body = updated.json()
+    assert bool(updated_body.get("installed")) is True
+    assert bool(updated_body.get("configured")) is True
+    assert updated_body.get("masked_api_key") == "********"
+
+    persisted = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    server = persisted.tools.mcp_servers["openspace"]
+    assert server.env["OPENSPACE_API_KEY"] == "sk-openspace-tenant-a"
+
+    cleared = await http_client.put(
+        "/api/mcp/openspace/key",
+        headers=admin_headers,
+        json={"api_key": "   "},
+    )
+    assert cleared.status_code == 200
+    cleared_body = cleared.json()
+    assert bool(cleared_body.get("configured")) is False
+    assert cleared_body.get("masked_api_key") in (None, "")
+
+    persisted_after_clear = web_ctx.tenant_store.load_tenant_config(tenant_id)
+    server_after_clear = persisted_after_clear.tools.mcp_servers["openspace"]
+    assert "OPENSPACE_API_KEY" not in server_after_clear.env
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
 async def test_tools_policy_layering_can_be_more_restrictive(
     http_client, auth_headers, web_ctx
 ) -> None:
@@ -1501,3 +1595,12 @@ async def test_skill_and_mcp_writes_are_blocked_in_single_mode(
     assert blocked_mcp_delete.status_code == 409
     blocked_mcp_delete_detail = dict(blocked_mcp_delete.json().get("detail") or {})
     assert blocked_mcp_delete_detail.get("reason_code") == "single_tenant_runtime_mode"
+
+    blocked_openspace_key = await http_client.put(
+        "/api/mcp/openspace/key",
+        headers=admin_headers,
+        json={"api_key": "sk-demo"},
+    )
+    assert blocked_openspace_key.status_code == 409
+    blocked_openspace_key_detail = dict(blocked_openspace_key.json().get("detail") or {})
+    assert blocked_openspace_key_detail.get("reason_code") == "single_tenant_runtime_mode"

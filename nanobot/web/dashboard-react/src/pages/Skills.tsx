@@ -63,6 +63,17 @@ interface MCPServerItem {
   tool_timeout?: number
 }
 
+interface OpenSpaceApiKeyStatus {
+  server: string
+  installed: boolean
+  configured: boolean
+  masked_api_key?: string | null
+  takes_effect?: string
+  writable: boolean
+  write_block_reason_code?: string | null
+  write_block_reason?: string | null
+}
+
 function groupByCategory<T extends { category?: string }>(items: T[]): Array<{ category: string; items: T[] }> {
   const map = new Map<string, T[]>()
   for (const item of items) {
@@ -235,11 +246,15 @@ export function Skills() {
   const { addToast, user } = useStore()
   const role = String(user?.role || "member").trim().toLowerCase()
   const canSeeTechnicalSourceDetails = role === "owner" || role === "admin"
+  const canManageOpenSpaceKey = role === "owner" || role === "admin"
 
   const [skills, setSkills] = useState<SkillListItem[]>([])
   const [skillCatalog, setSkillCatalog] = useState<SkillCatalogItem[]>([])
   const [mcpCatalog, setMcpCatalog] = useState<MCPPresetItem[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServerItem[]>([])
+  const [openSpaceKeyStatus, setOpenSpaceKeyStatus] = useState<OpenSpaceApiKeyStatus | null>(null)
+  const [openSpaceKeyInput, setOpenSpaceKeyInput] = useState("")
+  const [openSpaceKeySaving, setOpenSpaceKeySaving] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState("")
   const [searchQuery, setSearchQuery] = useState("")
@@ -286,6 +301,10 @@ export function Skills() {
       return Array.isArray(list) ? list : []
     }
 
+    async function fetchOpenSpaceApiKeyStatus() {
+      return await api.get<OpenSpaceApiKeyStatus>("/api/mcp/openspace/key")
+    }
+
     async function load() {
       setLoading(true)
       setError("")
@@ -319,7 +338,24 @@ export function Skills() {
           loadErrors.push(getErrorMessage(mcpServerResult.reason, "MCP服务器加载失败"))
         }
 
-        if (loadErrors.length === 4) {
+        if (canManageOpenSpaceKey) {
+          try {
+            const status = await fetchOpenSpaceApiKeyStatus()
+            if (!cancelled) setOpenSpaceKeyStatus(status)
+          } catch (err) {
+            loadErrors.push(getErrorMessage(err, "OpenSpace key load failed"))
+          }
+        } else {
+          setOpenSpaceKeyStatus(null)
+        }
+
+        const coreLoadFailed =
+          installedResult.status !== "fulfilled" &&
+          catalogResult.status !== "fulfilled" &&
+          mcpCatalogResult.status !== "fulfilled" &&
+          mcpServerResult.status !== "fulfilled"
+
+        if (coreLoadFailed) {
           setError(loadErrors[0] || "加载失败")
         } else if (loadErrors.length > 0) {
           addToast({ type: "warning", message: `部分数据加载失败：${loadErrors[0]}` })
@@ -517,6 +553,34 @@ export function Skills() {
     ])
     setMcpCatalog(Array.isArray(catalogList) ? catalogList : [])
     setMcpServers(Array.isArray(serverList) ? serverList : [])
+    if (canManageOpenSpaceKey) {
+      const status = await api.get<OpenSpaceApiKeyStatus>("/api/mcp/openspace/key")
+      setOpenSpaceKeyStatus(status)
+    } else {
+      setOpenSpaceKeyStatus(null)
+    }
+  }
+
+  async function saveOpenSpaceApiKey(clearExisting = false) {
+    if (!canManageOpenSpaceKey || openSpaceKeySaving) return
+    const normalized = String(openSpaceKeyInput || "").trim()
+    if (!clearExisting && !normalized) {
+      addToast({ type: "warning", message: "Please enter an OpenSpace API key." })
+      return
+    }
+    setOpenSpaceKeySaving(true)
+    try {
+      const status = await api.put<OpenSpaceApiKeyStatus>("/api/mcp/openspace/key", {
+        api_key: clearExisting ? null : normalized,
+      })
+      setOpenSpaceKeyStatus(status)
+      setOpenSpaceKeyInput("")
+      addToast({ type: "success", message: clearExisting ? "OpenSpace API key cleared" : "OpenSpace API key saved" })
+    } catch (err) {
+      addToast({ type: "error", message: getErrorMessage(err, "OpenSpace API key update failed") })
+    } finally {
+      setOpenSpaceKeySaving(false)
+    }
   }
 
   async function installSkill(item: SkillCatalogItem) {
@@ -887,6 +951,72 @@ export function Skills() {
                     <HardDrive className="h-4 w-4 text-primary" />
                     <h4 className="text-sm font-semibold">已配置 MCP 服务器（支持卸载）</h4>
                   </div>
+                  {canManageOpenSpaceKey ? (
+                    <Card className={INSTALL_CENTER_CARD_CLASS}>
+                      <CardHeader className="pb-2">
+                        <div className="flex items-start justify-between gap-2">
+                          <CardTitle className="text-sm">OpenSpace Cloud API Key</CardTitle>
+                          <Badge
+                            variant={openSpaceKeyStatus?.configured ? "default" : "secondary"}
+                            className="text-[10px]"
+                          >
+                            {openSpaceKeyStatus?.configured ? "Configured" : "Not configured"}
+                          </Badge>
+                        </div>
+                      </CardHeader>
+                      <CardContent className="space-y-2 text-xs text-muted-foreground">
+                        <div>
+                          {openSpaceKeyStatus?.installed
+                            ? "Tenant-scoped OpenSpace key. Local mode still works when key is empty."
+                            : "MCP server 'openspace' is not installed for this tenant."}
+                        </div>
+                        {openSpaceKeyStatus?.configured ? (
+                          <div>Stored key: {openSpaceKeyStatus.masked_api_key || "********"}</div>
+                        ) : null}
+                        {openSpaceKeyStatus?.write_block_reason ? (
+                          <div className="text-destructive">{openSpaceKeyStatus.write_block_reason}</div>
+                        ) : null}
+                        <Input
+                          type="password"
+                          placeholder="sk-..."
+                          value={openSpaceKeyInput}
+                          onChange={(e) => setOpenSpaceKeyInput(e.target.value)}
+                          disabled={
+                            !openSpaceKeyStatus?.installed ||
+                            !openSpaceKeyStatus?.writable ||
+                            openSpaceKeySaving
+                          }
+                        />
+                      </CardContent>
+                      <CardFooter className={`${INSTALL_CENTER_FOOTER_CLASS} justify-end`}>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={
+                            !openSpaceKeyStatus?.installed ||
+                            !openSpaceKeyStatus?.writable ||
+                            openSpaceKeySaving ||
+                            !openSpaceKeyStatus?.configured
+                          }
+                          onClick={() => saveOpenSpaceApiKey(true).catch(() => {})}
+                        >
+                          {openSpaceKeySaving ? "Clearing..." : "Clear"}
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={
+                            !openSpaceKeyStatus?.installed ||
+                            !openSpaceKeyStatus?.writable ||
+                            openSpaceKeySaving ||
+                            !String(openSpaceKeyInput || "").trim()
+                          }
+                          onClick={() => saveOpenSpaceApiKey(false).catch(() => {})}
+                        >
+                          {openSpaceKeySaving ? "Saving..." : "Save key"}
+                        </Button>
+                      </CardFooter>
+                    </Card>
+                  ) : null}
                   {mcpServers.length === 0 ? (
                     <div className="rounded-md border border-dashed p-3 text-sm text-muted-foreground">
                       暂无已安装 MCP 服务器

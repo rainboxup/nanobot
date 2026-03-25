@@ -115,6 +115,15 @@ function mockApi() {
     if (path === '/api/mcp/catalog' || path === '/api/mcp/servers') {
       return [] as any;
     }
+    if (path === '/api/mcp/openspace/key') {
+      return {
+        server: 'openspace',
+        installed: true,
+        configured: false,
+        takes_effect: 'next message (runtime reload)',
+        writable: true,
+      } as any;
+    }
     if (path === '/api/skills/managed-catalog-skill' || path === '/api/skills/managed-installed-skill') {
       return managedSkillDetail as any;
     }
@@ -197,4 +206,15 @@ describe('Skills', () => {
     });
     expect(within(installedCard as HTMLElement).queryByText(/^managed$/i)).not.toBeInTheDocument();
   });
+  it('shows OpenSpace key manager for admins', async () => {
+    mockStore('admin');
+    render(<Skills />);
+
+    const toggleButtons = await screen.findAllByRole('button');
+    const mcpToggle = toggleButtons.find((btn) => String(btn.textContent || '').includes('MCP'));
+    expect(mcpToggle).toBeTruthy();
+    fireEvent.click(mcpToggle as HTMLButtonElement);
+    expect(await screen.findByText('OpenSpace Cloud API Key')).toBeInTheDocument();
+  });
 });
+
